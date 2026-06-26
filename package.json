@@ -1,0 +1,28 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "~/.nvm/versions/node/v20.20.2/bin/node src/index.js",
+    "dev": "~/.nvm/versions/node/v20.20.2/bin/node ~/.nvm/versions/node/v20.20.2/bin/nodemon src/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "apple-signin-auth": "^2.0.0",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "google-auth-library": "^10.9.0",
+    "helmet": "^8.2.0",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.22.0",
+    "stripe": "^22.3.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
