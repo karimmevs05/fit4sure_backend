@@ -51,6 +51,7 @@ VALUES
     1290
   );
 
--- Seed current week's menu (week of 2026-06-23)
+-- Seed current week's menu (week of 2026-06-22, Monday)
+-- week_start must always be a Monday to match the mobile app's getWeekStart() calculation
 INSERT INTO weekly_menus (week_start, meal_id, is_available)
-SELECT '2026-06-23', meal_id, true FROM meals;
+SELECT '2026-06-22', meal_id, true FROM meals;
