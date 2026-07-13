@@ -102,7 +102,26 @@ router.post('/', optionalAuth, async (req, res) => {
 router.get('/', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM boxes WHERE user_id = $1 ORDER BY created_at DESC',
+      `SELECT b.box_id, b.user_id, b.guest_email,
+        to_char(b.week_start, 'YYYY-MM-DD') AS week_start,
+        b.delivery_day, b.delivery_window,
+        b.delivery_address_line1, b.delivery_address_line2,
+        b.delivery_city, b.delivery_state, b.delivery_postal_code,
+        b.status, b.subtotal_cents, b.bulk_discount_cents, b.total_cents,
+        b.created_at,
+        COALESCE(SUM(bi.quantity), 0)::int AS total_meals,
+        COALESCE(
+          json_agg(
+            json_build_object('meal_name', m.name, 'quantity', bi.quantity, 'price_cents', bi.price_cents)
+          ) FILTER (WHERE bi.box_item_id IS NOT NULL),
+          '[]'
+        ) AS items
+       FROM boxes b
+       LEFT JOIN box_items bi ON bi.box_id = b.box_id
+       LEFT JOIN meals m ON bi.meal_id = m.meal_id
+       WHERE b.user_id = $1
+       GROUP BY b.box_id
+       ORDER BY b.created_at DESC`,
       [req.userId]
     )
     res.json(result.rows)
