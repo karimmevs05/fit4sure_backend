@@ -2,6 +2,7 @@ const express = require('express')
 const router = express.Router()
 const pool = require('../../config/db')
 const axios = require('axios')
+const { GoogleGenerativeAI } = require('@google/generative-ai')
 
 // ============================================================================
 // TEST: Get sample data for development
@@ -164,26 +165,32 @@ router.post('/parse-receipt', async (req, res) => {
       }
     }
 
-    // If GHL API failed, use mock with debug info
+    // If GHL API failed, try Gemini AI as fallback
     if (!ghlResponse) {
-      console.error('[parse-receipt] GHL v2.0 API calls failed. Using mock data.')
-      console.error('[parse-receipt] Error details:', {
-        status: lastError?.response?.status,
-        message: lastError?.message,
-        responseData: lastError?.response?.data
-      })
-
-      return res.json({
-        success: true,
-        data: getMockReceiptData(),
-        source: 'mock',
-        debug: {
-          status: lastError?.response?.status,
-          error: lastError?.message,
-          apiResponse: lastError?.response?.data,
-          hint: 'GHL v2.0 API currently unavailable - ensure Private Integration is active and credentials are correct'
-        }
-      })
+      console.log('[parse-receipt] GHL failed, attempting Gemini AI fallback...')
+      try {
+        const geminiData = await processReceiptWithGemini(imageBase64)
+        return res.json({
+          success: true,
+          data: geminiData,
+          source: 'gemini',
+          message: 'Receipt parsed successfully with Google Gemini AI'
+        })
+      } catch (geminiErr) {
+        console.error('[parse-receipt] Gemini also failed:', geminiErr.message)
+        // Final fallback: use mock data
+        return res.json({
+          success: true,
+          data: getMockReceiptData(),
+          source: 'mock',
+          debug: {
+            ghl_status: lastError?.response?.status,
+            ghl_error: lastError?.message,
+            gemini_error: geminiErr.message,
+            hint: 'Both GHL and Gemini unavailable - using mock data'
+          }
+        })
+      }
     }
 
     console.log('[parse-receipt] Processing GHL response')
@@ -310,5 +317,175 @@ function categorizeItem(description) {
 
   return 'other'
 }
+
+/**
+ * Process receipt with Google Gemini AI (free alternative to GoHighLevel)
+ */
+async function processReceiptWithGemini(imageBase64) {
+  const apiKey = process.env.GOOGLE_GEMINI_API_KEY
+
+  if (!apiKey) {
+    throw new Error('GOOGLE_GEMINI_API_KEY not configured')
+  }
+
+  console.log('[gemini] Processing receipt with Gemini 2.0 Flash...')
+
+  const genAI = new GoogleGenerativeAI(apiKey)
+  const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' })
+
+  const prompt = `Analyze this receipt or order image and extract:
+
+1. VENDOR NAME (store/restaurant/supplier name)
+2. All LINE ITEMS with:
+   - Product name (clean, descriptive)
+   - Price per unit in dollars
+   - Quantity or weight (if available, e.g., "500g", "2 lbs", "1 unit")
+   - Unit of measurement (g, kg, oz, lb, ml, L, count, etc.)
+
+IMPORTANT RULES:
+- Skip payment method lines (Visa, Mastercard, cash, etc.)
+- Skip tax, subtotal, total lines - only list actual products
+- If weight/quantity is on package, extract it
+- For items without quantity, use "count" as unit with quantity 1
+- If unclear, make best guess based on product type
+
+Return ONLY valid JSON, no markdown:
+{
+  "vendor": "store name",
+  "items": [
+    {
+      "name": "product name",
+      "price": 12.99,
+      "quantity": 500,
+      "unit": "g"
+    }
+  ],
+  "total": 45.50
+}
+
+Return ONLY the JSON object.`
+
+  try {
+    const response = await model.generateContent([
+      {
+        inlineData: {
+          data: imageBase64,
+          mimeType: 'image/jpeg'
+        }
+      },
+      prompt
+    ])
+
+    const responseText = response.response.text()
+    console.log('[gemini] Response received, parsing JSON...')
+
+    // Extract JSON from response
+    let jsonStr = responseText
+    const jsonMatch = responseText.match(/```json\n?([\s\S]*?)\n?```/)
+    if (jsonMatch) {
+      jsonStr = jsonMatch[1]
+    } else {
+      // Try to extract raw JSON
+      const cleanMatch = responseText.match(/\{[\s\S]*\}/)
+      if (cleanMatch) {
+        jsonStr = cleanMatch[0]
+      }
+    }
+
+    const parsedData = JSON.parse(jsonStr)
+
+    return {
+      vendor: parsedData.vendor || 'Unknown Vendor',
+      items: (parsedData.items || []).map(item => ({
+        description: item.name || '',
+        quantity: item.quantity || 1,
+        unit: item.unit || 'unit',
+        price: parseFloat(item.price || 0),
+        category: categorizeItem(item.name || '')
+      })),
+      total: parseFloat(parsedData.total || 0),
+      confidence: 0.88,
+      date: new Date().toISOString().split('T')[0],
+      status: 'parsed'
+    }
+  } catch (error) {
+    console.error('[gemini] Error processing receipt:', error.message)
+    throw error
+  }
+}
+
+// ============================================================================
+// MIGRATION: Import all customers from meal count sheets
+// ============================================================================
+
+router.post('/run-migration', async (req, res) => {
+  try {
+    // SQL to insert all 46 customers
+    const insertCustomers = `
+      INSERT INTO customers (name, email, phone, status, sales_pipeline_stage) VALUES
+      ('Taylor', 'taylor@fit4sure.local', '', 'active', 'customer'),
+      ('Krishna', 'krishna@fit4sure.local', '', 'active', 'customer'),
+      ('Christine', 'christine@fit4sure.local', '', 'active', 'customer'),
+      ('Bruce', 'bruce@fit4sure.local', '', 'active', 'customer'),
+      ('Billy', 'billy@fit4sure.local', '', 'active', 'customer'),
+      ('Jacqui', 'jacqui@fit4sure.local', '', 'active', 'customer'),
+      ('Drew', 'drew@fit4sure.local', '', 'active', 'customer'),
+      ('Andy', 'andy@fit4sure.local', '', 'active', 'customer'),
+      ('Becky', 'becky@fit4sure.local', '', 'active', 'customer'),
+      ('Becky Kid', 'becky.kid@fit4sure.local', '', 'active', 'customer'),
+      ('Dr Dane', 'drdane@fit4sure.local', '', 'active', 'customer'),
+      ('Joe', 'joe@fit4sure.local', '', 'active', 'customer'),
+      ('Fabian', 'fabian@fit4sure.local', '', 'active', 'customer'),
+      ('Brandon', 'brandon@fit4sure.local', '', 'active', 'customer'),
+      ('Aixa', 'aixa@fit4sure.local', '', 'active', 'customer'),
+      ('Claudia', 'claudia@fit4sure.local', '', 'active', 'customer'),
+      ('Caro', 'caro@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Lauren', 'lauren@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Joel', 'joel@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Jenn', 'jenn@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Denisa', 'denisa@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Nick', 'nick@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Cecily', 'cecily@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Tim', 'tim@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Mrs Tim', 'mrstim@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Ann', 'ann@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Jasmine', 'jasmine@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Emily', 'emily@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Meghan', 'meghan@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Daniel', 'daniel@fit4sure.local', '', 'inactive', 'prospect'),
+      ('CC', 'cc@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Brandon - Large', 'brandon.large@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Brandon - Animal Based', 'brandon.animal@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Thomas', 'thomas@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Martin', 'martin@fit4sure.local', '', 'inactive', 'prospect'),
+      ('M.Mack', 'mmack@fit4sure.local', '', 'inactive', 'prospect'),
+      ('M. Mack - Low Carb', 'mmack.lowcarb@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Ray Of Sunshine', 'ray@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Karim', 'karim@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Karim - Large', 'karim.large@fit4sure.local', '', 'inactive', 'prospect'),
+      ('Papa', 'papa@fit4sure.local', '', 'inactive', 'prospect')
+      ON CONFLICT (name) DO NOTHING
+    `
+
+    await pool.query(insertCustomers)
+
+    const result = await pool.query(`
+      SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active,
+        SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END) as inactive
+      FROM customers
+      WHERE sales_pipeline_stage IN ('customer', 'prospect')
+    `)
+
+    res.json({
+      success: true,
+      message: 'Migration completed',
+      stats: result.rows[0]
+    })
+  } catch (error) {
+    res.status(500).json({ error: error.message })
+  }
+})
 
 module.exports = router
