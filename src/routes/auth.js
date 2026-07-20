@@ -11,7 +11,7 @@ const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID)
 
 function signToken(user) {
   return jwt.sign(
-    { userId: user.user_id, email: user.email },
+    { userId: user.user_id, email: user.email, role: user.role },
     process.env.JWT_SECRET,
     { expiresIn: '30d' }
   )

@@ -1,0 +1,62 @@
+        name        |  status  | dietary_restrictions | sales_pipeline_stage | engagement_score |                          notes                          
+--------------------+----------+----------------------+----------------------+------------------+---------------------------------------------------------
+ Airea              | Inactive |                      | prospect_lost        |                0 | High protein non allergies
+ Aixa               | Active   |                      | prospect             |                0 | 
+ Alejandro          | Inactive |                      | prospect_lost        |                0 | 3 lbs of Chicken only
+ Alejandro Large    | Active   |                      | prospect             |                0 | 
+ Andy               | Active   |                      | active               |               90 | 
+ Ann                | Active   |                      | active               |               90 | No beans, no gluten, no dairy
+ Becky              | Active   |                      | prospect             |                0 | 
+ Becky Kid          | Active   |                      | prospect             |                0 | 
+ Billy              | Active   |                      | prospect             |                0 | 
+ Brandon            | Active   |                      | prospect             |                0 | 
+ Brooke             | Inactive |                      | prospect_lost        |                0 | No beef no pork
+ Bruce              | Inactive |                      | prospect_lost        |                0 | No Quinoa, broccoli, tomatoes, corn, no porc, no turkey
+ CC                 | Active   |                      | prospect             |                0 | 
+ Caro               | Active   |                      | prospect             |                0 | 
+ Cecily             | Active   |                      | prospect             |                0 | 
+ Chris              | Inactive |                      | prospect_lost        |                0 | 
+ Christine          | Active   |                      | prospect             |                0 | 
+ Claudia            | Active   |                      | prospect             |                0 | 
+ Daniel K           | Active   |                      | active               |               90 | no broccoli
+ Daniel M           | Active   |                      | prospect             |                0 | 
+ Denisa             | Active   |                      | prospect             |                0 | 
+ Dr Andy            | Active   |                      | prospect             |                0 | 
+ Dr Dane            | Active   |                      | prospect             |                0 | 
+ Drew               | Active   |                      | active               |               90 | No Quinoa
+ Emily              | Active   |                      | prospect             |                0 | 
+ Fabian             | Active   |                      | prospect             |                0 | 
+ Felicia - No Carbs | Active   |                      | active               |               90 | 4oz
+ Felicia - Normal   | Active   |                      | active               |               90 | 5oz of protein / 200 g potatoes
+ Felicia NoCarbs    | Active   |                      | prospect             |                0 | 
+ Felicia Normal     | Active   |                      | prospect             |                0 | 
+ Henning            | Active   |                      | active               |               90 | Trying to eat more proteine
+ Jacqui             | Active   |                      | prospect             |                0 | 
+ Jane Doe           | Inactive |                      | prospect_lost        |                0 | 
+ Jasmine            | Active   |                      | prospect             |                0 | 
+ Jason              | Active   |                      | prospect             |                0 | 
+ Jenn               | Active   |                      | prospect             |                0 | 
+ Joe                | Inactive |                      | prospect_lost        |                0 | 
+ Karim              | Active   |                      | prospect             |                0 | 
+ Kelly              | Active   |                      | active               |               90 | 
+ Kelly Large        | Active   |                      | prospect             |                0 | 
+ Krishna            | Active   |                      | prospect             |                0 | 
+ Lauren             | Active   |                      | prospect             |                0 | 
+ M. Mack            | Active   |                      | prospect             |                0 | 
+ Martin             | Active   |                      | prospect             |                0 | 
+ Meghan             | Active   |                      | prospect             |                0 | 
+ Mr. Kelly LARGE    | Active   |                      | active               |               90 | 
+ Mrs Tim            | Active   |                      | prospect             |                0 | 
+ Nick               | Active   |                      | prospect             |                0 | 
+ Papa               | Active   |                      | prospect             |                0 | 
+ Phillipe           | Active   |                      | prospect             |                0 | 
+ Robert             | Inactive |                      | prospect_lost        |                0 | Trying to eat more proteine
+ Sira/Rayan         | Active   |                      | prospect             |                0 | 
+ Sydney             | Inactive |                      | prospect_lost        |                0 | No Zucchini
+ Taylor             | Active   |                      | prospect             |                0 | 
+ Thomas             | Active   |                      | prospect             |                0 | 
+ Tim                | Active   |                      | prospect             |                0 | 
+ Tonya              | Active   |                      | prospect             |                0 | 
+ Zoey               | Active   |                      | lead                 |                0 | High protein non allergies
+(58 rows)
+

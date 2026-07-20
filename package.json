@@ -4,21 +4,27 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "~/.nvm/versions/node/v20.20.2/bin/node src/index.js",
-    "dev": "~/.nvm/versions/node/v20.20.2/bin/node ~/.nvm/versions/node/v20.20.2/bin/nodemon src/index.js"
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.112.3",
+    "@google-cloud/vision": "^5.3.7",
+    "@google/generative-ai": "^0.24.1",
     "apple-signin-auth": "^2.0.0",
+    "axios": "^1.18.1",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "google-auth-library": "^10.9.0",
+    "googleapis": "^173.0.0",
     "helmet": "^8.2.0",
     "jsonwebtoken": "^9.0.3",
+    "node-fetch": "^2.7.0",
     "pg": "^8.22.0",
     "stripe": "^22.3.0"
   },

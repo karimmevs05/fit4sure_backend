@@ -153,3 +153,81 @@ CREATE TABLE xp_logs (
   reason VARCHAR(100),
   earned_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- ─────────────────────────────────────────
+-- INVENTORY & RECIPES
+-- ─────────────────────────────────────────
+
+CREATE TABLE inventory (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  category VARCHAR(100) NOT NULL,
+  unit_price_cents INTEGER NOT NULL,
+  serving_size_g INTEGER NOT NULL,
+  current_stock_g INTEGER DEFAULT 0,
+  store VARCHAR(100),
+  grade VARCHAR(100),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE recipes (
+  recipe_id SERIAL PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  category VARCHAR(50),
+  description TEXT,
+  image_url TEXT,
+  instructions TEXT,
+  calories NUMERIC(10,2),
+  protein_g NUMERIC(10,2),
+  carbs_g NUMERIC(10,2),
+  fat_g NUMERIC(10,2),
+  servings INTEGER DEFAULT 1,
+  prep_time_minutes INTEGER,
+  cost_per_serving_cents INTEGER,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE recipe_ingredients (
+  id SERIAL PRIMARY KEY,
+  recipe_id INTEGER REFERENCES recipes(recipe_id) ON DELETE CASCADE,
+  inventory_id INTEGER REFERENCES inventory(id),
+  quantity_g INTEGER NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- RECEIPTS & PURCHASES
+CREATE TABLE receipts (
+  id SERIAL PRIMARY KEY,
+  date DATE NOT NULL,
+  store VARCHAR(255),
+  total_amount_cents INTEGER NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE receipt_items (
+  id SERIAL PRIMARY KEY,
+  receipt_id INTEGER REFERENCES receipts(id) ON DELETE CASCADE,
+  inventory_id INTEGER REFERENCES inventory(id),
+  inventory_name VARCHAR(255),
+  quantity_grams DECIMAL(10,2) NOT NULL,
+  unit VARCHAR(50),
+  quantity DECIMAL(10,2),
+  unit_price_cents INTEGER NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- FINANCIAL ENTRIES (for accounting/GL)
+CREATE TABLE financial_entries (
+  id SERIAL PRIMARY KEY,
+  entry_type VARCHAR(50) NOT NULL, -- 'purchase', 'expense', 'inventory_adjustment'
+  description TEXT,
+  receipt_id INTEGER REFERENCES receipts(id),
+  inventory_id INTEGER REFERENCES inventory(id),
+  quantity_grams DECIMAL(10,2),
+  amount_cents INTEGER NOT NULL,
+  entry_date DATE NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
