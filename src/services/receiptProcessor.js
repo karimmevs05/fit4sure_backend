@@ -25,26 +25,38 @@ async function processReceiptWithAI(imageBase64, imageSource = 'unknown') {
     const prompt = `Analyze this receipt or order screenshot and extract:
 
 1. VENDOR NAME (store/restaurant/online service name)
-2. All LINE ITEMS with:
+2. RECEIPT TOTAL (the final total amount actually charged, as printed on the receipt)
+3. All LINE ITEMS with:
    - Product name (clean, descriptive)
-   - Price per unit in dollars
+   - "amount": the ACTUAL dollar amount charged for this line item, exactly as printed
+     (this is the number on the right-hand side of the line, e.g. "$15.63" -- NOT
+     a per-pound or per-unit rate like "$10.78/lb". If an item is priced per weight,
+     "amount" must be the final charged total for that line, already accounting for
+     the weight -- never the per-unit rate by itself)
+   - "unit_rate": if the item shows a separate per-unit or per-pound price (e.g.
+     "$10.78/lb"), record that rate here for reference. Leave null if not shown.
    - Quantity or weight (if available, e.g., "500g", "2 lbs", "1 unit")
    - Unit of measurement (g, kg, oz, lb, ml, L, count, etc.)
 
 IMPORTANT RULES:
 - Skip payment method lines (Visa, Mastercard, cash, etc.)
-- Skip tax, subtotal, total lines - only list actual products
+- Skip tax, subtotal, total lines from the LINE ITEMS list -- only list actual products
+- Read decimal points carefully -- do not drop or misplace decimal points (e.g. $10.78 must never become 1078)
 - If weight/quantity is on package (e.g., "2lb bag of chicken"), extract it
 - For items without quantity, use "count" as unit with quantity 1
 - If unclear, make best guess based on product type
+- The sum of all "amount" values should be close to the receipt total (before tax).
+  Double check any line item whose amount looks unusually large or doesn't fit this pattern.
 
 Return ONLY valid JSON, no markdown:
 {
   "vendor": "store name",
+  "receipt_total": 99.27,
   "items": [
     {
       "name": "product name",
-      "price": 12.99,
+      "amount": 12.99,
+      "unit_rate": null,
       "quantity": 500,
       "unit": "g",
       "category": "food_cogs"
@@ -90,17 +102,33 @@ Auto-categorize based on keywords:
 
     console.log(`✓ Extracted ${receiptData.items.length} items from ${receiptData.vendor}`);
 
+    // Validation: flag if the sum of line items is way off from the printed receipt total.
+    // This catches misreads (e.g. a per-pound rate mistaken for a charged amount)
+    // before they get saved as expenses.
+    const itemSum = receiptData.items.reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
+    let lowConfidence = false;
+    if (receiptData.receipt_total && receiptData.receipt_total > 0) {
+      const diff = Math.abs(itemSum - receiptData.receipt_total);
+      const pctDiff = diff / receiptData.receipt_total;
+      if (pctDiff > 0.15) {
+        lowConfidence = true;
+        console.warn(`⚠ Item sum ($${itemSum.toFixed(2)}) doesn't match receipt total ($${receiptData.receipt_total}) for ${receiptData.vendor} -- flagging for review`);
+      }
+    }
+
     return {
       vendor: receiptData.vendor,
+      receiptTotal: receiptData.receipt_total || null,
+      lowConfidence,
       items: receiptData.items.map(item => ({
         productName: item.name || 'Unknown Product',
-        price: parseFloat(item.price) || 0,
+        price: parseFloat(item.amount) || 0,
         quantity: item.quantity || 1,
         unit: item.unit || 'count',
         category: item.category || 'other',
         description: item.name || 'Unknown',
-        amount: parseFloat(item.price) || 0,
-        confidence: 0.95,
+        amount: parseFloat(item.amount) || 0,
+        confidence: lowConfidence ? 0.5 : 0.95,
       })),
     };
   } catch (error) {
@@ -163,7 +191,7 @@ async function saveReceiptToDB(receiptData) {
           vendor || 'Online Order',
           item.category || 'other',
           descriptionWithQty,
-          Math.round(item.amount * 100), // Store in cents
+          item.amount, // expenses.amount stores plain dollars, not cents
         ]);
 
         createdExpenses.push(expenseResult.rows[0]);
