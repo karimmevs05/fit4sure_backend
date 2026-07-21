@@ -1,11 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../../config/db');
-const { requireRole } = require('../../middleware/auth');
+const { requireAuth, requireRole } = require('../../middleware/auth');
 const { searchUSDANutrition } = require('../../services/usdaNutrition');
 
 // GET all inventory items with macro data
-router.get('/', async (req, res) => {
+router.get('/', requireAuth, async (req, res) => {
   try {
     const result = await db.query(
       'SELECT * FROM inventory ORDER BY category, name'
@@ -36,7 +36,7 @@ router.get('/', async (req, res) => {
 });
 
 // GET single inventory item
-router.get('/:id', async (req, res) => {
+router.get('/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
@@ -59,7 +59,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // POST create new inventory item with USDA macro lookup
-router.post('/', requireRole('admin'), async (req, res) => {
+router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { name, category, unit_price_cents, serving_size_g, current_stock_g, store, grade, protein_per_100g, carbs_per_100g, fat_per_100g, calories_per_100g } = req.body;
 
@@ -117,7 +117,7 @@ router.post('/', requireRole('admin'), async (req, res) => {
 });
 
 // PUT update inventory item with macro override support
-router.put('/:id', requireRole('admin'), async (req, res) => {
+router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { id } = req.params;
     const { name, category, unit_price_cents, serving_size_g, current_stock_g, store, grade, protein_per_100g, carbs_per_100g, fat_per_100g, calories_per_100g } = req.body;
@@ -145,7 +145,7 @@ router.put('/:id', requireRole('admin'), async (req, res) => {
 });
 
 // DELETE inventory item
-router.delete('/:id', requireRole('admin'), async (req, res) => {
+router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
