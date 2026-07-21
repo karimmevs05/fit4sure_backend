@@ -296,4 +296,32 @@ function categorizeItem(description) {
   return 'other';
 }
 
-module.exports = router;
+// POST /api/admin/expenses - Create a single manual expense
+// (distinct from /save-receipt-items, which is for multi-item receipt batches
+// and always forces status='pending' + date=NOW())
+router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { date, vendor, category, description, amount, status } = req.body;
+    const validStatuses = ['pending', 'approved', 'reconciled'];
+
+    if (!vendor || amount === undefined || amount === null) {
+      return res.status(400).json({ error: 'vendor and amount are required' });
+    }
+
+    const finalStatus = validStatuses.includes(status) ? status : 'pending';
+
+    const result = await db.query(
+      `INSERT INTO expenses (date, vendor, category, description, amount, status)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, date, vendor, category, description, amount, status`,
+      [date || new Date().toISOString().split('T')[0], vendor, category || 'other', description || '', amount, finalStatus]
+    );
+
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Error creating expense:', error);
+    res.status(500).json({ error: error.message || 'Failed to create expense' });
+  }
+});
+
+// GET
