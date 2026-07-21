@@ -187,6 +187,7 @@ async function processReceiptsFromDrive() {
 
     let processed = 0;
     let failed = 0;
+    const errors = [];
 
     // Process each receipt
     for (const receipt of receipts) {
@@ -210,12 +211,13 @@ async function processReceiptsFromDrive() {
       } catch (error) {
         failed++;
         console.error(`✗ Failed to process ${receipt.name}:`, error.message);
+        errors.push({ filename: receipt.name, error: error.message });
         // Continue processing other receipts
       }
     }
 
     console.log(`\nReceipt sync complete: ${processed} processed, ${failed} failed`);
-    return { processed, failed, total: receipts.length };
+    return { processed, failed, total: receipts.length, errors };
   } catch (error) {
     console.error('Error in receipt sync:', error);
     throw error;
