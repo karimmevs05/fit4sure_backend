@@ -203,7 +203,7 @@ async function saveReceiptItemsToDatabase(items, vendor, date) {
           vendor || 'Manual Entry',
           item.category || 'other',
           description,
-          Math.round(item.price * 100),
+          item.price, // expenses.amount stores plain dollars, not cents
         ]);
 
         createdExpenses.push(expenseResult.rows[0]);
