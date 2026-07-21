@@ -204,8 +204,10 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
 })
 
 // PUT /api/admin/recipes/:recipe_id - Update recipe
+// If `ingredients` is provided, it fully replaces the recipe's ingredient list
+// (delete-then-recreate, same pattern used on create).
 router.put('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) => {
-  const { name, category, prep_time_minutes, servings, instructions, calories, protein_g, carbs_g, fat_g, image } = req.body
+  const { name, category, prep_time_minutes, servings, instructions, calories, protein_g, carbs_g, fat_g, image, ingredients } = req.body
 
   if (!name) return res.status(400).json({ error: 'name is required' })
 
@@ -222,6 +224,18 @@ router.put('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
     )
 
     if (!result.rows[0]) return res.status(404).json({ error: 'Recipe not found' })
+
+    if (Array.isArray(ingredients)) {
+      await pool.query('DELETE FROM recipe_ingredients WHERE recipe_id = $1', [req.params.recipe_id])
+      for (const ing of ingredients) {
+        if (!ing.inventory_id || !ing.quantity_g) continue
+        await pool.query(
+          `INSERT INTO recipe_ingredients (recipe_id, inventory_id, quantity_g)
+           VALUES ($1, $2, $3)`,
+          [req.params.recipe_id, ing.inventory_id, ing.quantity_g]
+        )
+      }
+    }
 
     res.json({ data: result.rows[0] })
   } catch (err) {
