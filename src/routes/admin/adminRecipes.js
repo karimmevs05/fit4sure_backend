@@ -20,11 +20,11 @@ function convertToGrams(quantity, unit) {
   return (quantity || 0) * (conversions[unit?.toLowerCase()] || 1)
 }
 
-// Calculate cost in cents from price per pound
-function calculateIngredientCost(pricePerPound, quantityG) {
-  if (!pricePerPound) return 0
-  // pricePerPound is in dollars, convert to cents and calculate cost per gram
-  const priceCentsPerGram = (pricePerPound * 100) / 453.592
+// Calculate cost in cents from inventory.unit_price_cents (price per POUND, in cents)
+// Matches the formula already used in adminPrep.js so cost figures agree app-wide.
+function calculateIngredientCost(unitPriceCents, quantityG) {
+  if (!unitPriceCents || !quantityG) return 0
+  const priceCentsPerGram = unitPriceCents / 453.592
   return Math.round(priceCentsPerGram * quantityG)
 }
 
@@ -77,7 +77,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
       result.rows.map(async (recipe) => {
         try {
           const ingredientsResult = await pool.query(
-            `SELECT ri.quantity_g, i.price_per_pound
+            `SELECT ri.quantity_g, i.unit_price_cents
              FROM recipe_ingredients ri
              LEFT JOIN inventory i ON ri.inventory_id = i.id
              WHERE ri.recipe_id = $1`,
@@ -86,7 +86,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
 
           // Calculate total cost from ingredients
           const totalCostCents = ingredientsResult.rows.reduce((sum, ing) => {
-            return sum + calculateIngredientCost(ing.price_per_pound, ing.quantity_g)
+            return sum + calculateIngredientCost(ing.unit_price_cents, ing.quantity_g)
           }, 0)
 
           const costPerServingCents = recipe.servings ? Math.round(totalCostCents / recipe.servings) : 0
@@ -115,38 +115,38 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
 })
 
 // POST /api/admin/recipes - Create recipe
+// NOTE: cost_per_serving_cents stored here is a starting value only -- every
+// GET recalculates it live from recipe_ingredients + current inventory pricing,
+// so it will always reflect the latest inventory prices regardless of what's
+// stored at creation time.
+// Expected `ingredients` shape: [{ inventory_id: number, quantity_g: number }]
 router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
-  const { name, category, prep_time_minutes, servings, instructions, calories, protein_g, carbs_g, fat_g, tags, ingredients } = req.body
+  const { name, category, prep_time_minutes, servings, instructions, calories, protein_g, carbs_g, fat_g, tags, image, ingredients } = req.body
 
   if (!name) return res.status(400).json({ error: 'name is required' })
 
   try {
-    // Calculate cost from ingredients
-    let cost = 0
-    if (ingredients && ingredients.length > 0) {
-      cost = Math.round(ingredients.reduce((sum, ing) => sum + (ing.cost_cents || 0), 0) / (servings || 1))
-    }
-
     const recipeResult = await pool.query(
       `INSERT INTO recipes (
         name, category, prep_time_minutes, servings, instructions,
         calories, protein_g, carbs_g, fat_g, cost_per_serving_cents, tags,
-        created_by_user_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        image, created_by_user_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING *`,
       [name, category || null, prep_time_minutes || null, servings || 1, instructions || null,
-       calories || 0, protein_g || 0, carbs_g || 0, fat_g || 0, cost, tags || [], req.userId]
+       calories || 0, protein_g || 0, carbs_g || 0, fat_g || 0, 0, tags || [], image || null, req.userId]
     )
 
     const recipe = recipeResult.rows[0]
 
-    // Insert ingredients
+    // Insert ingredients (linked to real inventory items so cost/macros stay live)
     if (ingredients && ingredients.length > 0) {
       for (const ing of ingredients) {
+        if (!ing.inventory_id || !ing.quantity_g) continue
         await pool.query(
-          `INSERT INTO recipe_ingredients (recipe_id, ingredient_name, quantity, unit, cost_cents)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [recipe.recipe_id, ing.ingredient_name, ing.quantity, ing.unit || 'g', ing.cost_cents || 0]
+          `INSERT INTO recipe_ingredients (recipe_id, inventory_id, quantity_g)
+           VALUES ($1, $2, $3)`,
+          [recipe.recipe_id, ing.inventory_id, ing.quantity_g]
         )
       }
     }
@@ -168,7 +168,7 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
     if (!recipeResult.rows[0]) return res.status(404).json({ error: 'Recipe not found' })
 
     const ingredientsResult = await pool.query(
-      `SELECT ri.id, ri.inventory_id, i.name, ri.quantity_g, i.price_per_pound, i.protein_per_100g, i.carbs_per_100g, i.fat_per_100g, i.calories_per_100g
+      `SELECT ri.id, ri.inventory_id, i.name, ri.quantity_g, i.unit_price_cents, i.protein_per_100g, i.carbs_per_100g, i.fat_per_100g, i.calories_per_100g
        FROM recipe_ingredients ri
        LEFT JOIN inventory i ON ri.inventory_id = i.id
        WHERE ri.recipe_id = $1
@@ -179,7 +179,7 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
     // Calculate costs for each ingredient
     const ingredientsWithCosts = ingredientsResult.rows.map(ing => ({
       ...ing,
-      ingredient_cost_cents: calculateIngredientCost(ing.price_per_pound, ing.quantity_g)
+      ingredient_cost_cents: calculateIngredientCost(ing.unit_price_cents, ing.quantity_g)
     }))
 
     // Calculate total cost from ingredients
