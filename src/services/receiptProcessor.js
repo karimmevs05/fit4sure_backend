@@ -20,7 +20,7 @@ async function processReceiptWithAI(imageBase64, imageSource = 'unknown') {
     console.log(`Processing receipt from ${imageSource}...`);
 
     const genAI = getGeminiClient();
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' });
 
     const prompt = `Analyze this receipt or order screenshot and extract:
 
