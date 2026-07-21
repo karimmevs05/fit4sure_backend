@@ -134,7 +134,7 @@ router.post('/save-receipt-items', requireAuth, requireRole('admin'), async (req
           vendor || 'Receipt',
           category,
           finalProductName + (quantity && unit ? ` (${quantity}${unit})` : ''),
-          Math.round(amount * 100) // Store in cents
+          amount // expenses.amount stores plain dollars, not cents
         ]);
 
         createdExpenses.push(expenseResult.rows[0]);
