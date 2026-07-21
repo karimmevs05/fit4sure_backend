@@ -323,5 +323,109 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
     res.status(500).json({ error: error.message || 'Failed to create expense' });
   }
 });
+// GET /api/admin/expenses - List real expenses from the database
+// Supports optional filters: ?status=pending, ?category=food_cogs, ?vendor=Costco
+router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { status, category, vendor, limit } = req.query;
 
+    const conditions = [];
+    const params = [];
+
+    if (status) {
+      params.push(status);
+      conditions.push(`status = $${params.length}`);
+    }
+    if (category) {
+      params.push(category);
+      conditions.push(`category = $${params.length}`);
+    }
+    if (vendor) {
+      params.push(`%${vendor}%`);
+      conditions.push(`vendor ILIKE $${params.length}`);
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const limitClause = limit ? `LIMIT ${parseInt(limit, 10) || 100}` : 'LIMIT 500';
+
+    const result = await db.query(
+      `SELECT id, date, vendor, category, description, amount, status, created_at
+       FROM expenses
+       ${whereClause}
+       ORDER BY date DESC, id DESC
+       ${limitClause}`,
+      params
+    );
+
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Error fetching expenses:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch expenses' });
+  }
+});
+
+// PATCH /api/admin/expenses/:id - Update any combination of fields
+// (vendor, category, description, amount, date, status)
+router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { vendor, category, description, amount, date, status } = req.body;
+    const validStatuses = ['pending', 'approved', 'reconciled'];
+
+    if (status !== undefined && !validStatuses.includes(status)) {
+      return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+    }
+
+    const fields = [];
+    const params = [];
+
+    if (vendor !== undefined) { params.push(vendor); fields.push(`vendor = $${params.length}`); }
+    if (category !== undefined) { params.push(category); fields.push(`category = $${params.length}`); }
+    if (description !== undefined) { params.push(description); fields.push(`description = $${params.length}`); }
+    if (amount !== undefined) { params.push(amount); fields.push(`amount = $${params.length}`); }
+    if (date !== undefined) { params.push(date); fields.push(`date = $${params.length}`); }
+    if (status !== undefined) { params.push(status); fields.push(`status = $${params.length}`); }
+
+    if (fields.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    params.push(req.params.id);
+
+    const result = await db.query(
+      `UPDATE expenses SET ${fields.join(', ')} WHERE id = $${params.length}
+       RETURNING id, date, vendor, category, description, amount, status`,
+      params
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'Expense not found' });
+    }
+
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Error updating expense:', error);
+    res.status(500).json({ error: error.message || 'Failed to update expense' });
+  }
+});
+
+// DELETE /api/admin/expenses/:id - Delete an expense
+router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query(
+      `DELETE FROM expenses WHERE id = $1 RETURNING id`,
+      [req.params.id]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'Expense not found' });
+    }
+
+    res.json({ success: true, message: 'Expense deleted' });
+  } catch (error) {
+    console.error('Error deleting expense:', error);
+    res.status(500).json({ error: error.message || 'Failed to delete expense' });
+  }
+});
+
+module.exports = router;
 // GET
