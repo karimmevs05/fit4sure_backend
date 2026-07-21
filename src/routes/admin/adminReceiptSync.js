@@ -11,9 +11,15 @@ router.post('/process', requireAuth, requireRole('admin'), async (req, res) => {
     console.log('Manual receipt sync triggered');
     const result = await processReceiptsFromDrive();
 
+    let message = `Processed ${result.processed} receipts (${result.failed} failed)`;
+    if (result.failed > 0 && result.errors?.length) {
+      const reasons = result.errors.map(e => `${e.filename}: ${e.error}`).join('; ');
+      message += ` — Reasons: ${reasons}`;
+    }
+
     res.json({
       success: true,
-      message: `Processed ${result.processed} receipts (${result.failed} failed)`,
+      message,
       data: result,
     });
   } catch (error) {
