@@ -105,7 +105,7 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
       FROM orders o
       JOIN customers c ON o.customer_id = c.id
       LEFT JOIN menus m ON o.menu_id = m.id
-      WHERE date_trunc('week', o.created_at) = date_trunc('week', NOW())
+      WHERE (date_trunc('week', o.created_at + interval '1 day') - interval '1 day') = (date_trunc('week', NOW() + interval '1 day') - interval '1 day')
       ORDER BY c.name, m.category, m.name
     `);
 
@@ -116,7 +116,7 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
         SUM(o.quantity) AS total_count
       FROM orders o
       JOIN menus m ON o.menu_id = m.id
-      WHERE date_trunc('week', o.created_at) = date_trunc('week', NOW())
+      WHERE (date_trunc('week', o.created_at + interval '1 day') - interval '1 day') = (date_trunc('week', NOW() + interval '1 day') - interval '1 day')
       GROUP BY m.id, m.name, m.category, o.day_of_week
       ORDER BY m.name
     `);
@@ -132,7 +132,7 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
         COUNT(DISTINCT CASE WHEN o.source = 'manual' THEN o.customer_id END) AS manual_customers
       FROM orders o
       LEFT JOIN menus m ON o.menu_id = m.id
-      WHERE date_trunc('week', o.created_at) = date_trunc('week', NOW())
+      WHERE (date_trunc('week', o.created_at + interval '1 day') - interval '1 day') = (date_trunc('week', NOW() + interval '1 day') - interval '1 day')
     `);
 
     const nonRespondersResult = await db.query(`
@@ -142,7 +142,7 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
         AND NOT EXISTS (
           SELECT 1 FROM orders o
           WHERE o.customer_id = c.id
-            AND date_trunc('week', o.created_at) = date_trunc('week', NOW())
+            AND (date_trunc('week', o.created_at + interval '1 day') - interval '1 day') = (date_trunc('week', NOW() + interval '1 day') - interval '1 day')
         )
       ORDER BY c.name
     `);
@@ -179,12 +179,12 @@ router.get('/history', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const result = await db.query(`
       SELECT
-        date_trunc('week', o.created_at) AS week_start,
+        (date_trunc('week', o.created_at + interval '1 day') - interval '1 day') AS week_start,
         COUNT(DISTINCT o.customer_id) AS total_customers,
         SUM(o.quantity) AS total_meals,
         ROUND(AVG(o.quantity)::numeric, 1) AS avg_order_size
       FROM orders o
-      GROUP BY date_trunc('week', o.created_at)
+      GROUP BY (date_trunc('week', o.created_at + interval '1 day') - interval '1 day')
       ORDER BY week_start DESC
     `);
 
@@ -208,7 +208,7 @@ router.get('/insights', requireAuth, requireRole('admin'), async (req, res) => {
     const historyResult = await db.query(`
       SELECT
         SUM(quantity) AS total_meals,
-        COUNT(DISTINCT date_trunc('week', created_at)) AS total_weeks,
+        COUNT(DISTINCT (date_trunc('week', created_at + interval '1 day') - interval '1 day')) AS total_weeks,
         COUNT(DISTINCT customer_id) AS total_customers
       FROM orders
     `);
@@ -218,9 +218,9 @@ router.get('/insights', requireAuth, requireRole('admin'), async (req, res) => {
       : 0;
 
     const peakResult = await db.query(`
-      SELECT date_trunc('week', created_at) AS week_start, SUM(quantity) AS total_meals
+      SELECT (date_trunc('week', created_at + interval '1 day') - interval '1 day') AS week_start, SUM(quantity) AS total_meals
       FROM orders
-      GROUP BY date_trunc('week', created_at)
+      GROUP BY (date_trunc('week', created_at + interval '1 day') - interval '1 day')
       ORDER BY total_meals DESC
       LIMIT 1
     `);
@@ -237,7 +237,7 @@ router.get('/insights', requireAuth, requireRole('admin'), async (req, res) => {
 
     const customerResult = await db.query(`
       SELECT c.id, c.name,
-        COUNT(DISTINCT date_trunc('week', o.created_at)) AS weeks_active,
+        COUNT(DISTINCT (date_trunc('week', o.created_at + interval '1 day') - interval '1 day')) AS weeks_active,
         SUM(o.quantity) AS total_meals_ordered
       FROM customers c
       JOIN orders o ON c.id = o.customer_id
@@ -277,7 +277,7 @@ router.get('/non-responders', requireAuth, requireRole('admin'), async (req, res
         AND NOT EXISTS (
           SELECT 1 FROM orders o
           WHERE o.customer_id = c.id
-            AND date_trunc('week', o.created_at) = date_trunc('week', NOW())
+            AND (date_trunc('week', o.created_at + interval '1 day') - interval '1 day') = (date_trunc('week', NOW() + interval '1 day') - interval '1 day')
         )
       ORDER BY c.name
     `);
