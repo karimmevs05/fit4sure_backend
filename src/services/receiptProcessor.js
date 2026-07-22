@@ -23,7 +23,13 @@ async function processReceiptWithAI(imageBase64, imageSource = 'unknown') {
     const genAI = getGeminiClient();
     const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' });
 
-    const prompt = `Analyze this receipt or order screenshot and extract:
+    const prompt = `This receipt is for Fit4Sure, a high-protein, seed-oil-free
+meal prep business. Purchases are overwhelmingly bulk proteins, vegetables,
+and cooking staples -- keep that in mind when an abbreviated item name is
+ambiguous (bias toward the bulk-protein/produce reading, not a beverage or
+snack brand, unless the context clearly points elsewhere).
+
+Analyze this receipt or order screenshot and extract:
 
 1. VENDOR NAME (store/restaurant/online service name)
 2. RECEIPT TOTAL (the final total amount actually charged, as printed on the receipt)
@@ -31,11 +37,13 @@ async function processReceiptWithAI(imageBase64, imageSource = 'unknown') {
    - "name": a clean, full common product name. Warehouse-store receipts
      (Costco, Sam's Club, etc.) print heavily abbreviated, truncated text
      (e.g. "ORG BLUES", "RNBOW CARROT", "ORGANIC GT"). Use your knowledge of
-     common grocery products to expand these into their real name (e.g.
+     common grocery products -- and this business's bulk-protein/produce
+     purchasing pattern -- to expand these into their real name (e.g.
      "ORG BLUES" -> "Organic Blueberries", "RNBOW CARROT" -> "Rainbow
-     Carrots", "ORGANIC GT" -> "Organic Grape Tomatoes"). If a name is
-     already clear and unabbreviated, keep it as printed -- don't guess
-     wildly on something genuinely ambiguous, just clean up obvious
+     Carrots", "ORGANIC GT" -> "Organic Ground Turkey", NOT a beverage
+     brand). If a name is already clear and unabbreviated, keep it as
+     printed -- don't guess wildly on something genuinely ambiguous, just
+     clean up obvious
      truncation/abbreviation.
    - "amount": the ACTUAL dollar amount charged for this line item, exactly as printed
      (this is the number on the right-hand side of the line, e.g. "$15.63" -- NOT
