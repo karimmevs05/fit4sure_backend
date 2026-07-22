@@ -28,7 +28,15 @@ async function processReceiptWithAI(imageBase64, imageSource = 'unknown') {
 1. VENDOR NAME (store/restaurant/online service name)
 2. RECEIPT TOTAL (the final total amount actually charged, as printed on the receipt)
 3. All LINE ITEMS with:
-   - Product name (clean, descriptive)
+   - "name": a clean, full common product name. Warehouse-store receipts
+     (Costco, Sam's Club, etc.) print heavily abbreviated, truncated text
+     (e.g. "ORG BLUES", "RNBOW CARROT", "ORGANIC GT"). Use your knowledge of
+     common grocery products to expand these into their real name (e.g.
+     "ORG BLUES" -> "Organic Blueberries", "RNBOW CARROT" -> "Rainbow
+     Carrots", "ORGANIC GT" -> "Organic Grape Tomatoes"). If a name is
+     already clear and unabbreviated, keep it as printed -- don't guess
+     wildly on something genuinely ambiguous, just clean up obvious
+     truncation/abbreviation.
    - "amount": the ACTUAL dollar amount charged for this line item, exactly as printed
      (this is the number on the right-hand side of the line, e.g. "$15.63" -- NOT
      a per-pound or per-unit rate like "$10.78/lb". If an item is priced per weight,
@@ -42,6 +50,9 @@ async function processReceiptWithAI(imageBase64, imageSource = 'unknown') {
 IMPORTANT RULES:
 - Skip payment method lines (Visa, Mastercard, cash, etc.)
 - Skip tax, subtotal, total lines from the LINE ITEMS list -- only list actual products
+- Skip ALL refund, return, and "refund issued" lines entirely -- these are not
+  purchases and must never appear in the items list, even if the same product
+  also appears as a genuine purchase elsewhere on the receipt
 - Read decimal points carefully -- do not drop or misplace decimal points (e.g. $10.78 must never become 1078)
 - If weight/quantity is on package (e.g., "2lb bag of chicken"), extract it
 - For items without quantity, use "count" as unit with quantity 1
@@ -99,6 +110,18 @@ Auto-categorize based on keywords:
     // Validate structure
     if (!receiptData.vendor || !Array.isArray(receiptData.items)) {
       throw new Error('Invalid receipt data structure');
+    }
+
+    // Safety net: drop any refund/return line that slipped past the prompt
+    // instruction, so a returned item never gets double-counted as a purchase.
+    const refundedCount = receiptData.items.filter((item) =>
+      /refund|return(ed)?/i.test(item.name || '')
+    ).length;
+    if (refundedCount > 0) {
+      console.log(`Filtered out ${refundedCount} refund/return line(s) from ${receiptData.vendor}`);
+      receiptData.items = receiptData.items.filter(
+        (item) => !/refund|return(ed)?/i.test(item.name || '')
+      );
     }
 
     console.log(`✓ Extracted ${receiptData.items.length} items from ${receiptData.vendor}`);
