@@ -1,4 +1,5 @@
 const db = require('../config/db');
+const { searchUSDANutrition } = require('./usdaNutrition');
 
 // Convert a quantity + unit into grams. Returns null if not a recognized weight unit.
 function convertToGrams(quantity, unit) {
@@ -29,13 +30,37 @@ function guessInventoryCategory(name) {
   return 'Condiments';
 }
 
+// Looks up macros via USDA FoodData Central. Never throws -- returns null
+// on any failure (missing API key, no match, network error, etc.), same
+// as searchUSDANutrition itself already guarantees.
+async function lookupMacros(name) {
+  try {
+    return await searchUSDANutrition(name);
+  } catch (err) {
+    console.error('USDA lookup failed:', err.message);
+    return null;
+  }
+}
+
+async function backfillMacros(inventoryId, name) {
+  const macros = await lookupMacros(name);
+  if (!macros) return;
+  await db.query(
+    `UPDATE inventory
+     SET protein_per_100g = $1, carbs_per_100g = $2, fat_per_100g = $3, calories_per_100g = $4, macros_source = 'usda'
+     WHERE id = $5`,
+    [macros.protein_per_100g, macros.carbs_per_100g, macros.fat_per_100g, macros.calories_per_100g, inventoryId]
+  );
+}
+
 /**
  * When a receipt line item is food (category === 'food_cogs'), keep the
  * Inventory table in sync:
  *  - If an inventory item with a matching name (case-insensitive) already
- *    exists, bump its current_stock_g and refresh unit_price_cents.
- *  - Otherwise, create a new inventory row so it's available for use in
- *    Recipes right away.
+ *    exists, bump its current_stock_g, refresh unit_price_cents, and
+ *    backfill macros via USDA lookup if it never got them.
+ *  - Otherwise, create a new inventory row (with a USDA macro lookup) so
+ *    it's available for use in Recipes right away.
  *
  * Non-food items (packaging, delivery, labor, utilities, other) are skipped
  * entirely -- Inventory is for ingredients, not general expenses.
@@ -66,7 +91,7 @@ async function syncInventoryFromReceiptItem(item, vendor) {
     quantityG && quantityG > 0 ? Math.round((amount / quantityG) * 453.592 * 100) : null;
 
   const existing = await db.query(
-    `SELECT id FROM inventory WHERE LOWER(name) = LOWER($1) LIMIT 1`,
+    `SELECT id, protein_per_100g FROM inventory WHERE LOWER(name) = LOWER($1) LIMIT 1`,
     [name]
   );
 
@@ -81,16 +106,39 @@ async function syncInventoryFromReceiptItem(item, vendor) {
        WHERE id = $4`,
       [quantityG || 0, unitPriceCents, vendor || null, id]
     );
+
+    // Existing item never got macros filled in (e.g. created before the
+    // USDA key was configured, or via a path that skipped it) -- try now.
+    if (existing.rows[0].protein_per_100g == null) {
+      await backfillMacros(id, name);
+    }
+
     return { synced: true, action: 'updated', inventoryId: id };
   }
 
+  const macros = await lookupMacros(name);
+
   const result = await db.query(
-    `INSERT INTO inventory (name, category, unit_price_cents, current_stock_g, store)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO inventory (
+       name, category, unit_price_cents, current_stock_g, store,
+       protein_per_100g, carbs_per_100g, fat_per_100g, calories_per_100g, macros_source
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING id`,
-    [name, guessInventoryCategory(name), unitPriceCents, quantityG || 0, vendor || null]
+    [
+      name,
+      guessInventoryCategory(name),
+      unitPriceCents,
+      quantityG || 0,
+      vendor || null,
+      macros?.protein_per_100g ?? null,
+      macros?.carbs_per_100g ?? null,
+      macros?.fat_per_100g ?? null,
+      macros?.calories_per_100g ?? null,
+      macros ? 'usda' : null,
+    ]
   );
-  return { synced: true, action: 'created', inventoryId: result.rows[0].id };
+  return { synced: true, action: 'created', inventoryId: result.rows[0].id, macrosFound: !!macros };
 }
 
 module.exports = { syncInventoryFromReceiptItem, convertToGrams, guessInventoryCategory };
