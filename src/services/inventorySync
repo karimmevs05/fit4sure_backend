@@ -1,0 +1,96 @@
+const db = require('../config/db');
+
+// Convert a quantity + unit into grams. Returns null if not a recognized weight unit.
+function convertToGrams(quantity, unit) {
+  const conversions = {
+    g: 1,
+    kg: 1000,
+    oz: 28.3495,
+    lb: 453.592,
+    cup: 240,
+    tbsp: 15,
+    tsp: 5,
+    ml: 1,
+    l: 1000,
+  };
+  const factor = conversions[(unit || '').toLowerCase()];
+  if (!factor || !quantity) return null;
+  return quantity * factor;
+}
+
+// Rough category guess for brand-new inventory items created from a receipt.
+// Only used when creating a new item -- existing items keep whatever
+// category the user already assigned.
+function guessInventoryCategory(name) {
+  const lower = (name || '').toLowerCase();
+  if (/chicken|beef|pork|turkey|fish|shrimp|salmon|steak|meat|egg|tofu/.test(lower)) return 'Protein';
+  if (/rice|potato|pasta|bread|oat|quinoa|bean|corn|tortilla/.test(lower)) return 'Carbohydrates';
+  if (/pepper|onion|carrot|broccoli|spinach|lettuce|tomato|vegetable|greens|squash|cauliflower|asparagus/.test(lower)) return 'Vegetables';
+  return 'Condiments';
+}
+
+/**
+ * When a receipt line item is food (category === 'food_cogs'), keep the
+ * Inventory table in sync:
+ *  - If an inventory item with a matching name (case-insensitive) already
+ *    exists, bump its current_stock_g and refresh unit_price_cents.
+ *  - Otherwise, create a new inventory row so it's available for use in
+ *    Recipes right away.
+ *
+ * Non-food items (packaging, delivery, labor, utilities, other) are skipped
+ * entirely -- Inventory is for ingredients, not general expenses.
+ *
+ * item: { name | productName, category, amount | price, quantity, unit }
+ * Returns a result object; never throws (caller should still wrap in
+ * try/catch, since this touches the database).
+ */
+async function syncInventoryFromReceiptItem(item, vendor) {
+  const category = item.category || 'other';
+  if (category !== 'food_cogs') {
+    return { synced: false, reason: 'not a food item' };
+  }
+
+  const name = (item.productName || item.name || '').trim();
+  const amount = item.amount ?? item.price;
+
+  if (!name || !amount || amount <= 0) {
+    return { synced: false, reason: 'missing name or amount' };
+  }
+
+  const quantityG = convertToGrams(item.quantity, item.unit);
+
+  // $/lb in cents, derived from what was actually paid for this line item.
+  // Only computed when we have a real weight to divide by -- otherwise we
+  // leave pricing alone rather than guess.
+  const unitPriceCents =
+    quantityG && quantityG > 0 ? Math.round((amount / quantityG) * 453.592 * 100) : null;
+
+  const existing = await db.query(
+    `SELECT id FROM inventory WHERE LOWER(name) = LOWER($1) LIMIT 1`,
+    [name]
+  );
+
+  if (existing.rows.length > 0) {
+    const id = existing.rows[0].id;
+    await db.query(
+      `UPDATE inventory
+       SET current_stock_g = COALESCE(current_stock_g, 0) + $1,
+           unit_price_cents = COALESCE($2, unit_price_cents),
+           store = COALESCE(store, $3),
+           updated_at = NOW()
+       WHERE id = $4`,
+      [quantityG || 0, unitPriceCents, vendor || null, id]
+    );
+    return { synced: true, action: 'updated', inventoryId: id };
+  }
+
+  const result = await db.query(
+    `INSERT INTO inventory (name, category, unit_price_cents, current_stock_g, store)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id`,
+    [name, guessInventoryCategory(name), unitPriceCents, quantityG || 0, vendor || null]
+  );
+  return { synced: true, action: 'created', inventoryId: result.rows[0].id };
+}
+
+module.exports = { syncInventoryFromReceiptItem, convertToGrams, guessInventoryCategory };
