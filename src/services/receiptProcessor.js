@@ -1,5 +1,6 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const db = require('../config/db');
+const { syncInventoryFromReceiptItem } = require('./inventorySync');
 
 // Initialize Gemini with Google API key from .env
 const getGeminiClient = () => {
@@ -197,6 +198,16 @@ async function saveReceiptToDB(receiptData) {
         createdExpenses.push(expenseResult.rows[0]);
       } catch (expenseError) {
         console.error('Error creating expense:', expenseError);
+      }
+
+      // Keep Inventory in sync for food items (skips non-food automatically)
+      try {
+        await syncInventoryFromReceiptItem(
+          { name: item.productName, category: item.category, amount: item.amount, quantity: item.quantity, unit: item.unit },
+          vendor
+        );
+      } catch (inventoryError) {
+        console.error('Error syncing inventory:', inventoryError);
       }
     }
 
