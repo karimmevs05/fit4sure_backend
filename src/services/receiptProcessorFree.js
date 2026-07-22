@@ -163,7 +163,9 @@ async function saveReceiptItemsToDatabase(items, vendor, date) {
     const createdExpenses = [];
 
     for (const item of items) {
-      if (!item.name || item.price <= 0) continue;
+      const itemName = item.productName || item.name;
+      const itemAmount = item.amount ?? item.price;
+      if (!itemName || !itemAmount || itemAmount <= 0) continue;
 
       // Save product
       try {
@@ -177,11 +179,11 @@ async function saveReceiptItemsToDatabase(items, vendor, date) {
             purchase_count = purchase_count + 1
           RETURNING id, name, unit, store, category
         `, [
-          item.name,
+          itemName,
           item.category || 'other',
           item.unit || 'count',
           vendor || 'Manual Entry',
-          Math.round(item.price * 100),
+          Math.round(itemAmount * 100),
         ]);
 
         savedProducts.push(productResult.rows[0]);
@@ -192,8 +194,8 @@ async function saveReceiptItemsToDatabase(items, vendor, date) {
       // Create expense
       try {
         const description = item.quantity && item.unit
-          ? `${item.name} (${item.quantity}${item.unit})`
-          : item.name;
+          ? `${itemName} (${item.quantity}${item.unit})`
+          : itemName;
 
         const expenseResult = await db.query(`
           INSERT INTO expenses (date, vendor, category, description, amount, status)
@@ -204,7 +206,7 @@ async function saveReceiptItemsToDatabase(items, vendor, date) {
           vendor || 'Manual Entry',
           item.category || 'other',
           description,
-          item.price, // expenses.amount stores plain dollars, not cents
+          itemAmount, // expenses.amount stores plain dollars, not cents
         ]);
 
         createdExpenses.push(expenseResult.rows[0]);
@@ -215,7 +217,7 @@ async function saveReceiptItemsToDatabase(items, vendor, date) {
       // Keep Inventory in sync for food items (skips non-food automatically)
       try {
         await syncInventoryFromReceiptItem(
-          { name: item.name, category: item.category, amount: item.price, quantity: item.quantity, unit: item.unit },
+          { name: itemName, category: item.category, amount: itemAmount, quantity: item.quantity, unit: item.unit },
           vendor
         );
       } catch (inventoryError) {
