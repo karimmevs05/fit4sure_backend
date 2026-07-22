@@ -4,6 +4,7 @@ const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const vision = require('@google-cloud/vision');
 const fetch = require('node-fetch');
+const { syncInventoryFromReceiptItem } = require('../../services/inventorySync');
 
 // Initialize Vision API client with credentials from env
 const getVisionClient = () => {
@@ -140,6 +141,16 @@ router.post('/save-receipt-items', requireAuth, requireRole('admin'), async (req
         createdExpenses.push(expenseResult.rows[0]);
       } catch (expenseError) {
         console.error('Error creating expense:', expenseError);
+      }
+
+      // Keep Inventory in sync for food items (skips non-food automatically)
+      try {
+        await syncInventoryFromReceiptItem(
+          { name: finalProductName, category, amount, quantity, unit },
+          vendor
+        );
+      } catch (inventoryError) {
+        console.error('Error syncing inventory:', inventoryError);
       }
     }
 
