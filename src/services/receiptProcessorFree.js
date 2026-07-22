@@ -1,6 +1,7 @@
 const db = require('../config/db');
 const fs = require('fs');
 const path = require('path');
+const { syncInventoryFromReceiptItem } = require('./inventorySync');
 
 /**
  * Parse receipt text and extract structured item data
@@ -209,6 +210,16 @@ async function saveReceiptItemsToDatabase(items, vendor, date) {
         createdExpenses.push(expenseResult.rows[0]);
       } catch (err) {
         console.error('Error creating expense:', err);
+      }
+
+      // Keep Inventory in sync for food items (skips non-food automatically)
+      try {
+        await syncInventoryFromReceiptItem(
+          { name: item.name, category: item.category, amount: item.price, quantity: item.quantity, unit: item.unit },
+          vendor
+        );
+      } catch (inventoryError) {
+        console.error('Error syncing inventory:', inventoryError);
       }
     }
 
