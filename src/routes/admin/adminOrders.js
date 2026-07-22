@@ -2,6 +2,14 @@ const express = require('express');
 const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
+const { google } = require('googleapis');
+
+// The Google Sheet behind the weekly order Form. The "Order_Details" tab is
+// already cleaned into (Timestamp, Client, Category, Meal Name, Qty, Notes)
+// rows by an existing Apps Script -- we read that tab directly rather than
+// re-parsing the raw 1000+ column Form Responses sheet.
+const ORDERS_SPREADSHEET_ID = '1k8n2nSF1BcQly23muB6Pp9A6rFEefZRTdnn4JDWAVtY';
+const ORDERS_SHEET_NAME = 'Order_Details';
 
 // Known price tiers (fit4sure.net). "By The LB" has no fixed price -- it's
 // priced per item, so new By The LB menus are created with a null price
@@ -49,6 +57,42 @@ async function findOrCreateCustomer(name) {
     [cleanName]
   );
   return created.rows[0].id;
+}
+
+// Shared row-import logic for both the paste-import endpoint and the
+// automatic Google Sheets sync. Deduplicates using the row's original
+// timestamp -- since Order_Details keeps every submission ever made, running
+// a sync repeatedly must not create duplicate orders for rows already
+// imported. Returns 'imported', 'duplicate', or 'skipped' (missing data).
+async function importOrderRow({ timestamp, client, category, mealName, qty, dayOfWeek, notes }) {
+  if (!client || !mealName || !qty) return { status: 'skipped', reason: 'missing client, mealName, or qty' };
+
+  const customerId = await findOrCreateCustomer(client);
+  const menuId = await findOrCreateMenu(mealName, category);
+  if (!customerId || !menuId) return { status: 'skipped', reason: 'could not resolve customer or menu' };
+
+  const orderedAt = timestamp ? new Date(timestamp) : new Date();
+  if (isNaN(orderedAt.getTime())) return { status: 'skipped', reason: 'invalid timestamp' };
+
+  // Dedup: same customer + same dish + same original submission timestamp
+  // means this exact row was already imported before.
+  const existing = await db.query(
+    `SELECT id FROM orders WHERE customer_id = $1 AND menu_id = $2 AND created_at = $3 LIMIT 1`,
+    [customerId, menuId, orderedAt]
+  );
+  if (existing.rows.length > 0) return { status: 'duplicate' };
+
+  const quantity = parseFloat(qty);
+  const menuPriceResult = await db.query('SELECT price FROM menus WHERE id = $1', [menuId]);
+  const price = menuPriceResult.rows[0]?.price;
+  const totalPrice = price != null ? price * quantity : null;
+
+  await db.query(
+    `INSERT INTO orders (customer_id, menu_id, quantity, day_of_week, total_price, source, notes, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, 'form', $6, $7, NOW())`,
+    [customerId, menuId, quantity, dayOfWeek || null, totalPrice, notes || null, orderedAt]
+  );
+  return { status: 'imported' };
 }
 
 // GET /api/admin/orders/this-week - Orders placed in the current week
@@ -268,38 +312,84 @@ router.post('/import', requireAuth, requireRole('admin'), async (req, res) => {
       return res.status(400).json({ error: 'rows array is required' });
     }
 
-    let imported = 0;
+    let imported = 0, duplicates = 0, skipped = 0;
     const errors = [];
 
     for (const row of rows) {
       try {
-        const { client, category, mealName, qty, dayOfWeek, notes } = row;
-        if (!client || !mealName || !qty) continue;
-
-        const customerId = await findOrCreateCustomer(client);
-        const menuId = await findOrCreateMenu(mealName, category);
-        if (!customerId || !menuId) continue;
-
-        const quantity = parseFloat(qty);
-        const menuPriceResult = await db.query('SELECT price FROM menus WHERE id = $1', [menuId]);
-        const price = menuPriceResult.rows[0]?.price;
-        const totalPrice = price != null ? price * quantity : null;
-
-        await db.query(
-          `INSERT INTO orders (customer_id, menu_id, quantity, day_of_week, total_price, source, notes, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, 'form', $6, NOW(), NOW())`,
-          [customerId, menuId, quantity, dayOfWeek || null, totalPrice, notes || null]
-        );
-        imported++;
+        const result = await importOrderRow(row);
+        if (result.status === 'imported') imported++;
+        else if (result.status === 'duplicate') duplicates++;
+        else skipped++;
       } catch (err) {
         errors.push({ row, error: err.message });
       }
     }
 
-    res.json({ success: true, imported, errors: errors.length > 0 ? errors : undefined });
+    res.json({ success: true, imported, duplicates, skipped, errors: errors.length > 0 ? errors : undefined });
   } catch (error) {
     console.error('Error importing orders:', error);
     res.status(500).json({ error: 'Failed to import orders' });
+  }
+});
+
+// POST /api/admin/orders/sync-google-sheets - Automatically pull new rows
+// from the Order_Details tab of the order Form's spreadsheet. Safe to run
+// repeatedly -- already-imported rows are skipped via the same
+// timestamp-based dedup as manual import.
+router.post('/sync-google-sheets', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const credentials = process.env.GOOGLE_SHEETS_CREDENTIALS
+      ? JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS)
+      : null;
+
+    if (!credentials) {
+      return res.status(500).json({ error: 'GOOGLE_SHEETS_CREDENTIALS not configured' });
+    }
+
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: ORDERS_SPREADSHEET_ID,
+      range: `'${ORDERS_SHEET_NAME}'!A:F`,
+    });
+
+    const values = response.data.values || [];
+    if (values.length < 2) {
+      return res.json({ success: true, imported: 0, duplicates: 0, skipped: 0, message: 'No order rows found in sheet' });
+    }
+
+    let imported = 0, duplicates = 0, skipped = 0;
+    const errors = [];
+
+    // Row 0 is the header (Timestamp, Client, Category, Meal Name, Qty, Notes)
+    for (let i = 1; i < values.length; i++) {
+      const [timestamp, client, category, mealName, qty, notes] = values[i];
+      try {
+        const result = await importOrderRow({ timestamp, client, category, mealName, qty, notes });
+        if (result.status === 'imported') imported++;
+        else if (result.status === 'duplicate') duplicates++;
+        else skipped++;
+      } catch (err) {
+        errors.push({ row: values[i], error: err.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      imported,
+      duplicates,
+      skipped,
+      totalRows: values.length - 1,
+      errors: errors.length > 0 ? errors : undefined,
+    });
+  } catch (error) {
+    console.error('Error syncing Google Sheets:', error);
+    res.status(500).json({ error: error.message || 'Failed to sync Google Sheets' });
   }
 });
 
