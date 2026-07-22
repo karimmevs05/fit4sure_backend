@@ -11,14 +11,29 @@ const { google } = require('googleapis');
 const ORDERS_SPREADSHEET_ID = '1k8n2nSF1BcQly23muB6Pp9A6rFEefZRTdnn4JDWAVtY';
 const ORDERS_SHEET_NAME = 'Order_Details';
 
-// Known price tiers (fit4sure.net). "By The LB" has no fixed price -- it's
-// priced per item, so new By The LB menus are created with a null price
-// until set manually.
+// Known price tiers (fit4sure.net).
 const CATEGORY_PRICES = {
   Regular: 13.79,
   Large: 16.79,
   Breakfast: 11.30,
 };
+
+// "By The LB" isn't one flat price -- it's always exactly 1lb of a single
+// chosen item, priced by what type of item it is (fit4sure.net/category/all-products).
+const BY_THE_LB_PRICES = {
+  Protein: 20.00,
+  Vegetable: 10.00,
+  Carbohydrate: 5.00,
+};
+
+// Classify a "By The LB" item name into Protein/Vegetable/Carbohydrate by
+// keyword, same approach used for Inventory categorization.
+function guessByTheLbType(name) {
+  const lower = (name || '').toLowerCase();
+  if (/chicken|beef|pork|turkey|fish|shrimp|salmon|steak|meat|egg|tofu/.test(lower)) return 'Protein';
+  if (/rice|potato|pasta|bread|oat|quinoa|bean|corn|tortilla|sweet potato/.test(lower)) return 'Carbohydrate';
+  return 'Vegetable';
+}
 
 // Find an existing menu matching (name, category), or create one.
 async function findOrCreateMenu(name, category) {
@@ -32,7 +47,10 @@ async function findOrCreateMenu(name, category) {
   );
   if (existing.rows.length > 0) return existing.rows[0].id;
 
-  const price = CATEGORY_PRICES[cleanCategory] ?? null;
+  const price = cleanCategory === 'By The LB'
+    ? BY_THE_LB_PRICES[guessByTheLbType(cleanName)]
+    : CATEGORY_PRICES[cleanCategory] ?? null;
+
   const created = await db.query(
     `INSERT INTO menus (name, category, price, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) RETURNING id`,
     [cleanName, cleanCategory || null, price]
