@@ -161,9 +161,9 @@ async function saveReceiptToDB(receiptData) {
           VALUES ($1, $2, $3, $4, $5)
           ON CONFLICT (LOWER(name), store)
           DO UPDATE SET
-            last_purchase_price_cents = $5,
+            last_purchase_price_cents = EXCLUDED.last_purchase_price_cents,
             last_purchase_date = NOW(),
-            purchase_count = purchase_count + 1
+            purchase_count = receipt_products.purchase_count + 1
           RETURNING id, name, unit, store, category
         `, [
           item.productName,
