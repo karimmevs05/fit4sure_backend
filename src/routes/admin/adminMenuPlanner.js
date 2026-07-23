@@ -85,7 +85,7 @@ router.get('/previous-week', requireAuth, requireRole('admin'), async (req, res)
       FROM orders o
       JOIN menus m ON o.menu_id = m.id
       WHERE (date_trunc('week', o.created_at + interval '1 day') - interval '1 day')
-          = (date_trunc('week', NOW() + interval '1 day') - interval '1 day' - interval '7 days')
+          = (date_trunc('week', NOW() + interval '1 day') - interval '1 day')
       ORDER BY o.day_of_week, m.name
     `);
     res.json({
