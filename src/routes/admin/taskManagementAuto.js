@@ -27,6 +27,14 @@ async function getRecipeIngredientNeeds(recipeId, servings) {
   }))
 }
 
+// Which physical station each task type happens at
+const STATIONS = {
+  'Vegetable prep, portioning': 'Veg Prep Station',
+  'Cook proteins, assemble, QC': 'Cooking Station',
+  'Prep, cook, assemble': 'Prep+Cook Station',
+  'Pack & deliver': 'Packaging & Loading',
+}
+
 // Real weeks that actually have plates built in Menu Planner, for the week selector
 router.get('/weeks-with-plates', async (req, res) => {
   try {
@@ -89,6 +97,18 @@ router.post('/auto-generate-plan', async (req, res) => {
     }
     const hasRealOrders = orderCountsResult.rows.length > 0
 
+    // Real completion/notes state already saved for this week, keyed by
+    // (day, plate_id) -- overlaid onto the live-computed schedule below
+    const statusResult = await pool.query(
+      `SELECT day, plate_id, completed, completed_at, actual_quantity, notes
+       FROM production_task_status WHERE week_start = $1`,
+      [week_start]
+    )
+    const statusByDayPlate = {}
+    for (const row of statusResult.rows) {
+      statusByDayPlate[`${row.day}:${row.plate_id}`] = row
+    }
+
     // Ingredient totals per plate (real recipe composition x real inventory cost)
     let totalMeals = 0
     const ingredientTotals = {} // inventoryId -> { name, store, unitPriceCents, gramsNeeded }
@@ -147,13 +167,32 @@ router.post('/auto-generate-plan', async (req, res) => {
         recipes: plateRecipes,
       }
 
+      // Pack/deliver tasks are always critical (customer-facing deadline).
+      // Prep/cook tasks are critical once real orders confirm they're needed.
+      const packDeliverCritical = true
+      const prepCookCritical = quantity != null
+
+      const pushDay = (day, task) => {
+        const status = statusByDayPlate[`${day}:${plate.id}`]
+        scheduleByDay[day].push({
+          ...planItem,
+          task,
+          station: STATIONS[task] || 'General',
+          critical: task === 'Pack & deliver' ? packDeliverCritical : prepCookCritical,
+          completed: status?.completed || false,
+          completed_at: status?.completed_at || null,
+          actual_quantity: status?.actual_quantity != null ? parseFloat(status.actual_quantity) : null,
+          notes: status?.notes || '',
+        })
+      }
+
       if (plate.delivery_day === 'monday') {
-        scheduleByDay.Saturday.push({ ...planItem, task: 'Vegetable prep, portioning' })
-        scheduleByDay.Sunday.push({ ...planItem, task: 'Cook proteins, assemble, QC' })
-        scheduleByDay.Monday.push({ ...planItem, task: 'Pack & deliver' })
+        pushDay('Saturday', 'Vegetable prep, portioning')
+        pushDay('Sunday', 'Cook proteins, assemble, QC')
+        pushDay('Monday', 'Pack & deliver')
       } else if (plate.delivery_day === 'thursday') {
-        scheduleByDay.Wednesday.push({ ...planItem, task: 'Prep, cook, assemble' })
-        scheduleByDay.Thursday.push({ ...planItem, task: 'Pack & deliver' })
+        pushDay('Wednesday', 'Prep, cook, assemble')
+        pushDay('Thursday', 'Pack & deliver')
       }
     }
 
@@ -210,6 +249,217 @@ router.post('/auto-generate-plan', async (req, res) => {
     })
   } catch (error) {
     console.error('Error generating production plan:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// ============================================================================
+// TASK STATUS -- mark complete, log actual quantity, add notes.
+// Upserts on (week_start, day, plate_id) -- never creates duplicates no
+// matter how many times it's called.
+// ============================================================================
+router.post('/task-status', async (req, res) => {
+  try {
+    const { week_start, day, plate_id, completed, actual_quantity, notes } = req.body
+    if (!week_start || !day || !plate_id) {
+      return res.status(400).json({ error: 'week_start, day, and plate_id are required' })
+    }
+
+    const result = await pool.query(
+      `INSERT INTO production_task_status (week_start, day, plate_id, completed, completed_at, actual_quantity, notes, updated_at)
+       VALUES ($1, $2, $3, $4, CASE WHEN $4 THEN NOW() ELSE NULL END, $5, $6, NOW())
+       ON CONFLICT (week_start, day, plate_id)
+       DO UPDATE SET
+         completed = $4,
+         completed_at = CASE WHEN $4 THEN NOW() ELSE NULL END,
+         actual_quantity = COALESCE($5, production_task_status.actual_quantity),
+         notes = COALESCE($6, production_task_status.notes),
+         updated_at = NOW()
+       RETURNING *`,
+      [week_start, day, plate_id, completed ?? false, actual_quantity ?? null, notes ?? null]
+    )
+
+    res.json({ success: true, data: result.rows[0] })
+  } catch (error) {
+    console.error('Error saving task status:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// ============================================================================
+// ISSUES / REQUESTS -- flag a problem or request a schedule change, with a
+// reason and proposed solution. A log, not a single overwritable field.
+// ============================================================================
+router.get('/issues', async (req, res) => {
+  try {
+    const { week_start } = req.query
+    if (!week_start) return res.status(400).json({ error: 'week_start is required' })
+
+    const result = await pool.query(
+      `SELECT i.*, m.name AS plate_name
+       FROM production_task_issues i
+       LEFT JOIN menus m ON i.plate_id = m.id
+       WHERE i.week_start = $1
+       ORDER BY i.status = 'open' DESC, i.created_at DESC`,
+      [week_start]
+    )
+    res.json({ success: true, data: result.rows })
+  } catch (error) {
+    console.error('Error fetching issues:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+router.post('/issues', async (req, res) => {
+  try {
+    const { week_start, day, plate_id, issue_type, reason, proposed_solution } = req.body
+    if (!week_start || !day || !issue_type || !reason) {
+      return res.status(400).json({ error: 'week_start, day, issue_type, and reason are required' })
+    }
+
+    const result = await pool.query(
+      `INSERT INTO production_task_issues (week_start, day, plate_id, issue_type, reason, proposed_solution, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'open', NOW())
+       RETURNING *`,
+      [week_start, day, plate_id || null, issue_type, reason, proposed_solution || null]
+    )
+    res.status(201).json({ success: true, data: result.rows[0] })
+  } catch (error) {
+    console.error('Error logging issue:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+router.put('/issues/:id/resolve', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE production_task_issues SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *`,
+      [req.params.id]
+    )
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Issue not found' })
+    res.json({ success: true, data: result.rows[0] })
+  } catch (error) {
+    console.error('Error resolving issue:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// ============================================================================
+// SUGGESTIONS -- real flags computed from real data: low stock vs what's
+// actually needed this week, and days carrying unusually heavy load.
+// ============================================================================
+router.get('/suggestions', async (req, res) => {
+  try {
+    const { week_start } = req.query
+    if (!week_start) return res.status(400).json({ error: 'week_start is required' })
+
+    const suggestions = []
+
+    // Low stock: real ingredient need this week vs real current inventory stock
+    const plates = await pool.query(`SELECT id FROM menus WHERE planned_week_start = $1`, [week_start])
+    const neededByIngredient = {} // inventory_id -> { name, gramsNeeded }
+
+    for (const plate of plates.rows) {
+      const recipes = await pool.query(
+        `SELECT mpr.recipe_id, mpr.servings FROM menu_plan_recipes mpr WHERE mpr.menu_id = $1`,
+        [plate.id]
+      )
+      const orderQty = await pool.query(
+        `SELECT COALESCE(SUM(quantity), 0) AS qty FROM orders WHERE menu_id = $1
+         AND (date_trunc('week', created_at + interval '1 day') - interval '1 day') = $2`,
+        [plate.id, week_start]
+      )
+      const scale = parseFloat(orderQty.rows[0].qty) || 1
+
+      for (const r of recipes.rows) {
+        const ingredients = await getRecipeIngredientNeeds(r.recipe_id, parseFloat(r.servings))
+        for (const ing of ingredients) {
+          if (!neededByIngredient[ing.inventoryId]) neededByIngredient[ing.inventoryId] = { name: ing.name, gramsNeeded: 0 }
+          neededByIngredient[ing.inventoryId].gramsNeeded += ing.gramsNeeded * scale
+        }
+      }
+    }
+
+    const inventoryIds = Object.keys(neededByIngredient)
+    if (inventoryIds.length > 0) {
+      const stockResult = await pool.query(
+        `SELECT id, name, current_stock_g FROM inventory WHERE id = ANY($1::int[])`,
+        [inventoryIds]
+      )
+      for (const item of stockResult.rows) {
+        const needed = neededByIngredient[item.id]
+        const currentStock = parseFloat(item.current_stock_g) || 0
+        if (needed && needed.gramsNeeded > currentStock) {
+          suggestions.push({
+            type: 'low_stock',
+            severity: 'warning',
+            message: `${item.name}: need ~${(needed.gramsNeeded / 453.592).toFixed(1)} lbs but only ${(currentStock / 453.592).toFixed(1)} lbs in stock`,
+          })
+        }
+      }
+    }
+
+    // Overloaded days: flag any day carrying notably more plates than the week's average
+    const scheduleCounts = await pool.query(
+      `SELECT delivery_day, COUNT(*) AS plate_count FROM menus WHERE planned_week_start = $1 GROUP BY delivery_day`,
+      [week_start]
+    )
+    if (scheduleCounts.rows.length > 1) {
+      const counts = scheduleCounts.rows.map((r) => parseInt(r.plate_count))
+      const avg = counts.reduce((a, b) => a + b, 0) / counts.length
+      for (const row of scheduleCounts.rows) {
+        if (parseInt(row.plate_count) > avg * 1.5) {
+          suggestions.push({
+            type: 'overloaded_day',
+            severity: 'info',
+            message: `${row.delivery_day} delivery has ${row.plate_count} plates, notably more than the week's average (${avg.toFixed(1)})`,
+          })
+        }
+      }
+    }
+
+    res.json({ success: true, data: suggestions })
+  } catch (error) {
+    console.error('Error computing suggestions:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// ============================================================================
+// COMPARISON -- this week's planned quantities vs last week's actual
+// completion (real data from production_task_status, not a guess)
+// ============================================================================
+router.get('/comparison', async (req, res) => {
+  try {
+    const { week_start } = req.query
+    if (!week_start) return res.status(400).json({ error: 'week_start is required' })
+
+    const priorWeekResult = await pool.query(`SELECT ($1::date - interval '7 days')::date AS prior`, [week_start])
+    const priorWeek = priorWeekResult.rows[0].prior
+
+    const priorStatus = await pool.query(
+      `SELECT pts.day, pts.plate_id, m.name AS plate_name, pts.completed, pts.actual_quantity
+       FROM production_task_status pts
+       JOIN menus m ON pts.plate_id = m.id
+       WHERE pts.week_start = $1`,
+      [priorWeek]
+    )
+
+    const totalTasks = priorStatus.rows.length
+    const completedTasks = priorStatus.rows.filter((r) => r.completed).length
+
+    res.json({
+      success: true,
+      data: {
+        prior_week: priorWeek,
+        total_tasks: totalTasks,
+        completed_tasks: completedTasks,
+        completion_rate: totalTasks > 0 ? +((completedTasks / totalTasks) * 100).toFixed(1) : null,
+        tasks: priorStatus.rows,
+      },
+    })
+  } catch (error) {
+    console.error('Error computing comparison:', error)
     res.status(500).json({ error: error.message })
   }
 })
