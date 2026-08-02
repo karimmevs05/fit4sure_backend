@@ -107,12 +107,26 @@ router.post('/auto-generate-plan', async (req, res) => {
       const realQty = orderCountsByMenu[plate.id]
       const quantity = realQty != null ? realQty : null
       if (realQty != null) totalMeals += realQty
+      const scaleFactor = quantity != null ? quantity : 1
+
+      const plateRecipes = []
 
       for (const r of recipesResult.rows) {
         const ingredients = await getRecipeIngredientNeeds(r.recipe_id, parseFloat(r.servings))
+
+        plateRecipes.push({
+          recipe_name: r.recipe_name,
+          servings_per_plate: parseFloat(r.servings),
+          ingredients: ingredients.map((ing) => ({
+            name: ing.name,
+            store: ing.store,
+            pounds_needed: +((ing.gramsNeeded * scaleFactor) / 453.592).toFixed(2),
+            cost: ing.unitPriceCents != null ? +(((ing.gramsNeeded * scaleFactor) / 453.592) * (ing.unitPriceCents / 100)).toFixed(2) : null,
+          })),
+        })
+
         // Scale by real order quantity when known; otherwise show per-batch
         // needs for 1x the plate (staff can scale manually until orders come in)
-        const scaleFactor = quantity != null ? quantity : 1
         for (const ing of ingredients) {
           if (!ingredientTotals[ing.inventoryId]) {
             ingredientTotals[ing.inventoryId] = { name: ing.name, store: ing.store, unitPriceCents: ing.unitPriceCents, gramsNeeded: 0 }
@@ -130,6 +144,7 @@ router.post('/auto-generate-plan', async (req, res) => {
         category: plate.category,
         quantity: quantity,
         quantity_is_estimate: quantity == null,
+        recipes: plateRecipes,
       }
 
       if (plate.delivery_day === 'monday') {
