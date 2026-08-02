@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const { searchUSDANutrition } = require('../../services/usdaNutrition');
+const { detectAllergens } = require('../../utils/allergenTagger');
 
 // GET all inventory items with macro data
 router.get('/', requireAuth, async (req, res) => {
@@ -27,6 +28,7 @@ router.get('/', requireAuth, async (req, res) => {
         calories_per_100g: row.calories_per_100g,
         usda_fdc_id: row.usda_fdc_id,
         macros_source: row.macros_source,
+        allergens: row.allergens || [],
       })),
     });
   } catch (error) {
@@ -58,7 +60,7 @@ router.get('/:id', requireAuth, async (req, res) => {
   }
 });
 
-// POST create new inventory item with USDA macro lookup
+// POST create new inventory item with USDA macro lookup + auto allergen tagging
 router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { name, category, unit_price_cents, serving_size_g, current_stock_g, store, grade, protein_per_100g, carbs_per_100g, fat_per_100g, calories_per_100g } = req.body;
@@ -92,11 +94,13 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
       }
     }
 
+    const allergens = detectAllergens(name);
+
     const result = await db.query(
-      `INSERT INTO inventory (name, category, unit_price_cents, serving_size_g, current_stock_g, store, grade, protein_per_100g, carbs_per_100g, fat_per_100g, calories_per_100g, usda_fdc_id, macros_source)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      `INSERT INTO inventory (name, category, unit_price_cents, serving_size_g, current_stock_g, store, grade, protein_per_100g, carbs_per_100g, fat_per_100g, calories_per_100g, usda_fdc_id, macros_source, allergens)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING *`,
-      [name, category, unit_price_cents, serving_size_g, current_stock_g || 0, store || '', grade || '', macrosData.protein_per_100g, macrosData.carbs_per_100g, macrosData.fat_per_100g, macrosData.calories_per_100g, macrosData.usda_fdc_id, macrosData.macros_source]
+      [name, category, unit_price_cents, serving_size_g, current_stock_g || 0, store || '', grade || '', macrosData.protein_per_100g, macrosData.carbs_per_100g, macrosData.fat_per_100g, macrosData.calories_per_100g, macrosData.usda_fdc_id, macrosData.macros_source, allergens]
     );
 
     res.status(201).json({
@@ -109,6 +113,7 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
         fat_per_100g: macrosData.fat_per_100g,
         calories_per_100g: macrosData.calories_per_100g,
       },
+      allergens,
     });
   } catch (error) {
     console.error('Error creating inventory item:', error);
@@ -116,18 +121,22 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
   }
 });
 
-// PUT update inventory item with macro override support
+// PUT update inventory item with macro override support + re-tag allergens
+// on every save, so a name correction (e.g. "chix" -> "chicken breast")
+// keeps allergen tags accurate automatically.
 router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { id } = req.params;
     const { name, category, unit_price_cents, serving_size_g, current_stock_g, store, grade, protein_per_100g, carbs_per_100g, fat_per_100g, calories_per_100g } = req.body;
 
+    const allergens = detectAllergens(name);
+
     const result = await db.query(
       `UPDATE inventory
-       SET name = $1, category = $2, unit_price_cents = $3, serving_size_g = $4, current_stock_g = $5, store = $6, grade = $7, protein_per_100g = $8, carbs_per_100g = $9, fat_per_100g = $10, calories_per_100g = $11, macros_source = $12
-       WHERE id = $13
+       SET name = $1, category = $2, unit_price_cents = $3, serving_size_g = $4, current_stock_g = $5, store = $6, grade = $7, protein_per_100g = $8, carbs_per_100g = $9, fat_per_100g = $10, calories_per_100g = $11, macros_source = $12, allergens = $13
+       WHERE id = $14
        RETURNING *`,
-      [name, category, unit_price_cents, serving_size_g, current_stock_g || 0, store || '', grade || '', protein_per_100g || null, carbs_per_100g || null, fat_per_100g || null, calories_per_100g || null, protein_per_100g ? 'manual' : 'usda', id]
+      [name, category, unit_price_cents, serving_size_g, current_stock_g || 0, store || '', grade || '', protein_per_100g || null, carbs_per_100g || null, fat_per_100g || null, calories_per_100g || null, protein_per_100g ? 'manual' : 'usda', allergens, id]
     );
 
     if (result.rows.length === 0) {
@@ -161,6 +170,24 @@ router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   } catch (error) {
     console.error('Error deleting inventory item:', error);
     res.status(500).json({ error: 'Failed to delete ingredient' });
+  }
+});
+
+// POST one-time backfill - re-scans every existing ingredient's name and
+// tags allergens. Safe to run more than once (idempotent).
+router.post('/backfill-allergens', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const items = await db.query('SELECT id, name FROM inventory');
+    let updated = 0;
+    for (const item of items.rows) {
+      const allergens = detectAllergens(item.name);
+      await db.query('UPDATE inventory SET allergens = $1 WHERE id = $2', [allergens, item.id]);
+      updated++;
+    }
+    res.json({ success: true, updated });
+  } catch (error) {
+    console.error('Error backfilling allergens:', error);
+    res.status(500).json({ error: 'Failed to backfill allergens' });
   }
 });
 
