@@ -26,9 +26,8 @@ const adminReceiptSyncRoutes = require('./routes/admin/adminReceiptSync')
 const adminReceiptReviewRoutes = require('./routes/admin/adminReceiptReview')
 const adminReceiptReadRoutes = require('./routes/admin/adminReceiptRead')
 const adminReportsRoutes = require('./routes/admin/adminReports')
-const taskManagementRoutes = require('./routes/admin/taskManagement')
-const taskManagementAutoRoutes = require('./routes/admin/taskManagementAuto')
-const taskManagementTestRoutes = require('./routes/admin/taskManagementTest')
+const adminTasksRoutes = require('./routes/admin/adminTasks')
+const adminStaffRoutes = require('./routes/admin/adminStaff')
 
 const app = express()
 
@@ -63,9 +62,8 @@ app.use('/api/admin/receipt-sync', adminReceiptSyncRoutes)
 app.use('/api/admin/receipt-review', adminReceiptReviewRoutes)
 app.use('/api/admin/receipt-read', adminReceiptReadRoutes)
 app.use('/api/admin/reports', adminReportsRoutes)
-app.use('/api/admin/task-management', taskManagementRoutes)
-app.use('/api/admin/task-management-auto', taskManagementAutoRoutes)
-app.use('/api/admin/task-management-test', taskManagementTestRoutes)
+app.use('/api/admin/tasks', adminTasksRoutes)
+app.use('/api/admin/staff', adminStaffRoutes)
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }))
 
