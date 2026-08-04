@@ -193,6 +193,71 @@ router.post('/plates', requireAuth, requireRole('admin'), async (req, res) => {
   }
 });
 
+// Updates an existing plate's name and recipe list (with per-recipe
+// servings) in place, instead of the only previous option -- delete and
+// recreate from scratch. Always operates on the Regular plate's id; its
+// Large twin (1.5x servings), if any, is created/updated/removed to match.
+router.put('/plates/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, recipes, makeLarge } = req.body;
+
+    if (!name || !Array.isArray(recipes) || recipes.length === 0) {
+      return res.status(400).json({ error: 'name and at least one recipe are required' });
+    }
+
+    const menuResult = await db.query('SELECT id, delivery_day, large_variant_of FROM menus WHERE id = $1', [id]);
+    if (menuResult.rows.length === 0) return res.status(404).json({ error: 'Plate not found' });
+    if (menuResult.rows[0].large_variant_of) {
+      return res.status(400).json({ error: 'Edit the Regular plate, not its Large version -- the Large version updates automatically' });
+    }
+
+    await db.query(`UPDATE menus SET name = $1, updated_at = NOW() WHERE id = $2`, [name, id]);
+
+    await db.query(`DELETE FROM menu_plan_recipes WHERE menu_id = $1`, [id]);
+    for (const r of recipes) {
+      await db.query(
+        `INSERT INTO menu_plan_recipes (menu_id, recipe_id, servings) VALUES ($1, $2, $3)`,
+        [id, r.recipe_id, r.servings]
+      );
+    }
+
+    const existingLarge = await db.query('SELECT id FROM menus WHERE large_variant_of = $1', [id]);
+    const largeId = existingLarge.rows[0]?.id || null;
+
+    if (makeLarge) {
+      let targetLargeId = largeId;
+      if (!targetLargeId) {
+        const delivery_day = menuResult.rows[0].delivery_day;
+        const { sunday } = await getNextWeekDates();
+        const largeMenu = await db.query(
+          `INSERT INTO menus (name, category, price, planned_week_start, delivery_day, large_variant_of, created_at, updated_at)
+           VALUES ($1, 'Large', $2, $3, $4, $5, NOW(), NOW()) RETURNING id`,
+          [name, CATEGORY_PRICES.Large, sunday, delivery_day, id]
+        );
+        targetLargeId = largeMenu.rows[0].id;
+      } else {
+        await db.query(`UPDATE menus SET name = $1, updated_at = NOW() WHERE id = $2`, [name, targetLargeId]);
+      }
+
+      await db.query(`DELETE FROM menu_plan_recipes WHERE menu_id = $1`, [targetLargeId]);
+      for (const r of recipes) {
+        await db.query(
+          `INSERT INTO menu_plan_recipes (menu_id, recipe_id, servings) VALUES ($1, $2, $3)`,
+          [targetLargeId, r.recipe_id, r.servings * 1.5]
+        );
+      }
+    } else if (largeId) {
+      await db.query('DELETE FROM menus WHERE id = $1', [largeId]);
+    }
+
+    res.json({ success: true, message: 'Plate updated' });
+  } catch (error) {
+    console.error('Error updating plate:', error);
+    res.status(500).json({ error: 'Failed to update plate' });
+  }
+});
+
 router.delete('/plates/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { id } = req.params;
