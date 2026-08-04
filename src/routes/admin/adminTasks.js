@@ -544,6 +544,49 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
   }
 })
 
+// Creates a recurring task in one call: a task_template (the reusable
+// definition) plus this week's actual task instance linked to it via
+// recurring_template_id. Future weeks pick it up automatically the next
+// time POST /templates/generate-week/:weekStart runs for that week.
+router.post('/recurring', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { title, description, department, owner_id, priority, operational_day, week_start, estimated_minutes } = req.body
+    if (!title || !department || !operational_day || !week_start) {
+      return res.status(400).json({ error: 'title, department, operational_day, and week_start are required' })
+    }
+
+    const deptError = validateEnum(department, DEPARTMENTS, 'department')
+    const priorityError = validateEnum(priority, PRIORITIES, 'priority')
+    const dayError = validateEnum(operational_day, OPERATIONAL_DAYS, 'operational_day')
+    const validationError = deptError || priorityError || dayError
+    if (validationError) return res.status(400).json({ error: validationError })
+
+    const templateResult = await pool.query(
+      `INSERT INTO task_templates (name, department, operational_day, default_owner_id, priority, estimated_minutes)
+       VALUES ($1, $2, $3, $4, COALESCE($5, 'medium'), $6)
+       RETURNING *`,
+      [title, department, operational_day, owner_id || null, priority || null, estimated_minutes || null]
+    )
+    const template = templateResult.rows[0]
+
+    const offset = OPERATIONAL_DAY_OFFSET[operational_day]
+    const dueDateResult = await pool.query(`SELECT ($1::date + ($2 || ' days')::interval)::date AS due_date`, [week_start, offset])
+    const dueDate = dueDateResult.rows[0].due_date
+
+    const taskResult = await pool.query(
+      `INSERT INTO tasks (title, description, department, owner_id, priority, due_date, operational_day, week_start, estimated_minutes, recurring_template_id)
+       VALUES ($1, $2, $3, $4, COALESCE($5, 'medium'), $6, $7, $8, $9, $10)
+       RETURNING *`,
+      [title, description || null, department, owner_id || null, priority || null, dueDate, operational_day, week_start, estimated_minutes || null, template.id]
+    )
+
+    res.status(201).json({ success: true, data: { template, task: taskResult.rows[0] } })
+  } catch (error) {
+    console.error('Error creating recurring task:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
 router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { title, description, department, owner_id, priority, status, due_date, operational_day, week_start, estimated_minutes, actual_minutes, source_type, source_id } = req.body
