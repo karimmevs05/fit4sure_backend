@@ -131,12 +131,40 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 
     const allergens = detectAllergens(name);
 
+    let macrosData = {
+      protein_per_100g: protein_per_100g || null,
+      carbs_per_100g: carbs_per_100g || null,
+      fat_per_100g: fat_per_100g || null,
+      calories_per_100g: calories_per_100g || null,
+      usda_fdc_id: null,
+      macros_source: 'manual',
+    };
+
+    // Macros left blank (e.g. this item never had any, or they were
+    // cleared to force a re-lookup) -- try USDA instead of silently
+    // nulling them out, same fallback as item creation.
+    if (!macrosData.protein_per_100g) {
+      const usdaData = await searchUSDANutrition(name);
+      if (usdaData) {
+        macrosData = {
+          protein_per_100g: usdaData.protein_per_100g,
+          carbs_per_100g: usdaData.carbs_per_100g,
+          fat_per_100g: usdaData.fat_per_100g,
+          calories_per_100g: usdaData.calories_per_100g,
+          usda_fdc_id: usdaData.fdcId,
+          macros_source: 'usda',
+        };
+      } else {
+        macrosData.macros_source = null;
+      }
+    }
+
     const result = await db.query(
       `UPDATE inventory
-       SET name = $1, category = $2, unit_price_cents = $3, serving_size_g = $4, current_stock_g = $5, store = $6, grade = $7, protein_per_100g = $8, carbs_per_100g = $9, fat_per_100g = $10, calories_per_100g = $11, macros_source = $12, allergens = $13
+       SET name = $1, category = $2, unit_price_cents = $3, serving_size_g = $4, current_stock_g = $5, store = $6, grade = $7, protein_per_100g = $8, carbs_per_100g = $9, fat_per_100g = $10, calories_per_100g = $11, macros_source = $12, allergens = $13, usda_fdc_id = COALESCE($15, usda_fdc_id)
        WHERE id = $14
        RETURNING *`,
-      [name, category, unit_price_cents, serving_size_g, current_stock_g || 0, store || '', grade || '', protein_per_100g || null, carbs_per_100g || null, fat_per_100g || null, calories_per_100g || null, protein_per_100g ? 'manual' : 'usda', allergens, id]
+      [name, category, unit_price_cents, serving_size_g, current_stock_g || 0, store || '', grade || '', macrosData.protein_per_100g, macrosData.carbs_per_100g, macrosData.fat_per_100g, macrosData.calories_per_100g, macrosData.macros_source, allergens, id, macrosData.usda_fdc_id]
     );
 
     if (result.rows.length === 0) {
@@ -188,6 +216,34 @@ router.post('/backfill-allergens', requireAuth, requireRole('admin'), async (req
   } catch (error) {
     console.error('Error backfilling allergens:', error);
     res.status(500).json({ error: 'Failed to backfill allergens' });
+  }
+});
+
+// POST one-time (re-runnable) backfill - retries the USDA lookup for every
+// ingredient still missing macros, e.g. because the original search failed
+// before the cleaned-name/multi-result fallback existed. Safe to run more
+// than once -- only touches rows where protein_per_100g is still null.
+router.post('/backfill-macros', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const items = await db.query('SELECT id, name FROM inventory WHERE protein_per_100g IS NULL');
+    let updated = 0;
+    const stillMissing = [];
+    for (const item of items.rows) {
+      const usdaData = await searchUSDANutrition(item.name);
+      if (usdaData) {
+        await db.query(
+          `UPDATE inventory SET protein_per_100g = $1, carbs_per_100g = $2, fat_per_100g = $3, calories_per_100g = $4, usda_fdc_id = $5, macros_source = 'usda' WHERE id = $6`,
+          [usdaData.protein_per_100g, usdaData.carbs_per_100g, usdaData.fat_per_100g, usdaData.calories_per_100g, usdaData.fdcId, item.id]
+        );
+        updated++;
+      } else {
+        stillMissing.push({ id: item.id, name: item.name });
+      }
+    }
+    res.json({ success: true, checked: items.rows.length, updated, stillMissing });
+  } catch (error) {
+    console.error('Error backfilling macros:', error);
+    res.status(500).json({ error: 'Failed to backfill macros' });
   }
 });
 
