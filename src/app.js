@@ -29,6 +29,7 @@ const adminReportsRoutes = require('./routes/admin/adminReports')
 const adminTasksRoutes = require('./routes/admin/adminTasks')
 const adminStaffRoutes = require('./routes/admin/adminStaff')
 const adminProductionPlanRoutes = require('./routes/admin/adminProductionPlan')
+const adminCookingMethodsRoutes = require('./routes/admin/adminCookingMethods')
 
 const app = express()
 
@@ -66,6 +67,7 @@ app.use('/api/admin/reports', adminReportsRoutes)
 app.use('/api/admin/tasks', adminTasksRoutes)
 app.use('/api/admin/staff', adminStaffRoutes)
 app.use('/api/admin/production-plan', adminProductionPlanRoutes)
+app.use('/api/admin', adminCookingMethodsRoutes)
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }))
 
