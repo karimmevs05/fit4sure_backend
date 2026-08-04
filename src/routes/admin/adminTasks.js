@@ -12,7 +12,11 @@ const { getRecipeIngredientNeeds } = require('../../utils/recipeCost')
 const DEPARTMENTS = ['Kitchen', 'Sales', 'Marketing', 'Customer Success', 'Procurement', 'Finance', 'Operations', 'Administration', 'Personal']
 const PRIORITIES = ['critical', 'high', 'medium', 'low']
 const STATUSES = ['not_started', 'in_progress', 'waiting', 'blocked', 'completed', 'cancelled']
+const OPERATIONAL_DAYS = ['saturday', 'sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday']
 const PRIORITY_RANK_SQL = `CASE priority WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END`
+
+// Offset in days from week_start (Sunday) for each operational day.
+const OPERATIONAL_DAY_OFFSET = { saturday: -1, sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5 }
 
 function validateEnum(value, allowed, field) {
   if (value !== undefined && value !== null && !allowed.includes(value)) {
@@ -256,6 +260,253 @@ router.get('/procurement', requireAuth, requireRole('admin'), async (req, res) =
   }
 })
 
+// All tasks for the operational week, grouped by operational_day (Sat..Fri).
+router.get('/week/:weekStart', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { weekStart } = req.params
+    const result = await pool.query(
+      `SELECT t.*, s.name AS owner_name
+       FROM tasks t
+       LEFT JOIN staff s ON t.owner_id = s.id
+       WHERE t.week_start = $1
+       ORDER BY ${PRIORITY_RANK_SQL}, t.id`,
+      [weekStart]
+    )
+
+    const days = {}
+    for (const day of OPERATIONAL_DAYS) days[day] = []
+    for (const row of result.rows) {
+      if (row.operational_day && days[row.operational_day]) days[row.operational_day].push(row)
+    }
+
+    res.json({ success: true, data: { week_start: weekStart, days } })
+  } catch (error) {
+    console.error('Error fetching week tasks:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// One operational day's tasks, grouped by department.
+router.get('/day/:weekStart/:day', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { weekStart, day } = req.params
+    const dayError = validateEnum(day, OPERATIONAL_DAYS, 'day')
+    if (dayError) return res.status(400).json({ error: dayError })
+
+    const result = await pool.query(
+      `SELECT t.*, s.name AS owner_name
+       FROM tasks t
+       LEFT JOIN staff s ON t.owner_id = s.id
+       WHERE t.week_start = $1 AND t.operational_day = $2
+       ORDER BY ${PRIORITY_RANK_SQL}, t.id`,
+      [weekStart, day]
+    )
+
+    const departments = {}
+    for (const dept of DEPARTMENTS) departments[dept] = []
+    for (const row of result.rows) {
+      if (!departments[row.department]) departments[row.department] = []
+      departments[row.department].push(row)
+    }
+
+    res.json({ success: true, data: { week_start: weekStart, day, departments } })
+  } catch (error) {
+    console.error('Error fetching day tasks:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// ----------------------------------------------------------------------------
+// RECURRING TASK TEMPLATES
+// ----------------------------------------------------------------------------
+
+router.get('/templates', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { operational_day, is_active } = req.query
+    const conditions = []
+    const params = []
+    if (operational_day) { params.push(operational_day); conditions.push(`tt.operational_day = $${params.length}`) }
+    if (is_active !== undefined) { params.push(is_active === 'true'); conditions.push(`tt.is_active = $${params.length}`) }
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+
+    const templatesResult = await pool.query(
+      `SELECT tt.*, s.name AS default_owner_name
+       FROM task_templates tt
+       LEFT JOIN staff s ON tt.default_owner_id = s.id
+       ${whereClause}
+       ORDER BY tt.operational_day, tt.name`,
+      params
+    )
+
+    const templateIds = templatesResult.rows.map((t) => t.id)
+    const itemsByTemplate = {}
+    if (templateIds.length > 0) {
+      const itemsResult = await pool.query(
+        `SELECT * FROM task_template_items WHERE template_id = ANY($1::int[]) ORDER BY sort_order, id`,
+        [templateIds]
+      )
+      for (const item of itemsResult.rows) {
+        if (!itemsByTemplate[item.template_id]) itemsByTemplate[item.template_id] = []
+        itemsByTemplate[item.template_id].push(item)
+      }
+    }
+
+    const data = templatesResult.rows.map((t) => ({ ...t, items: itemsByTemplate[t.id] || [] }))
+    res.json({ success: true, data })
+  } catch (error) {
+    console.error('Error listing templates:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+router.post('/templates', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { name, department, operational_day, default_owner_id, priority, estimated_minutes, items } = req.body
+    if (!name || !department || !operational_day) {
+      return res.status(400).json({ error: 'name, department, and operational_day are required' })
+    }
+
+    const deptError = validateEnum(department, DEPARTMENTS, 'department')
+    const dayError = validateEnum(operational_day, OPERATIONAL_DAYS, 'operational_day')
+    const priorityError = validateEnum(priority, PRIORITIES, 'priority')
+    const validationError = deptError || dayError || priorityError
+    if (validationError) return res.status(400).json({ error: validationError })
+
+    const result = await pool.query(
+      `INSERT INTO task_templates (name, department, operational_day, default_owner_id, priority, estimated_minutes)
+       VALUES ($1, $2, $3, $4, COALESCE($5, 'medium'), $6)
+       RETURNING *`,
+      [name, department, operational_day, default_owner_id || null, priority || null, estimated_minutes || null]
+    )
+    const template = result.rows[0]
+
+    if (Array.isArray(items) && items.length > 0) {
+      for (let i = 0; i < items.length; i++) {
+        await pool.query(
+          `INSERT INTO task_template_items (template_id, label, sort_order) VALUES ($1, $2, $3)`,
+          [template.id, items[i].label, items[i].sort_order ?? i]
+        )
+      }
+    }
+
+    const itemsResult = await pool.query(`SELECT * FROM task_template_items WHERE template_id = $1 ORDER BY sort_order, id`, [template.id])
+    res.status(201).json({ success: true, data: { ...template, items: itemsResult.rows } })
+  } catch (error) {
+    console.error('Error creating template:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+router.put('/templates/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { name, department, operational_day, default_owner_id, priority, estimated_minutes, is_active } = req.body
+
+    const deptError = validateEnum(department, DEPARTMENTS, 'department')
+    const dayError = validateEnum(operational_day, OPERATIONAL_DAYS, 'operational_day')
+    const priorityError = validateEnum(priority, PRIORITIES, 'priority')
+    const validationError = deptError || dayError || priorityError
+    if (validationError) return res.status(400).json({ error: validationError })
+
+    const fields = []
+    const params = []
+    const set = (column, value) => { params.push(value); fields.push(`${column} = $${params.length}`) }
+
+    if (name !== undefined) set('name', name)
+    if (department !== undefined) set('department', department)
+    if (operational_day !== undefined) set('operational_day', operational_day)
+    if (default_owner_id !== undefined) set('default_owner_id', default_owner_id)
+    if (priority !== undefined) set('priority', priority)
+    if (estimated_minutes !== undefined) set('estimated_minutes', estimated_minutes)
+    if (is_active !== undefined) set('is_active', is_active)
+    if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' })
+
+    params.push(req.params.id)
+    const result = await pool.query(
+      `UPDATE task_templates SET ${fields.join(', ')} WHERE id = $${params.length} RETURNING *`,
+      params
+    )
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Template not found' })
+
+    res.json({ success: true, data: result.rows[0] })
+  } catch (error) {
+    console.error('Error updating template:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+router.post('/templates/:id/items', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { label, sort_order } = req.body
+    if (!label) return res.status(400).json({ error: 'label is required' })
+
+    const result = await pool.query(
+      `INSERT INTO task_template_items (template_id, label, sort_order) VALUES ($1, $2, $3) RETURNING *`,
+      [req.params.id, label, sort_order ?? 0]
+    )
+    res.status(201).json({ success: true, data: result.rows[0] })
+  } catch (error) {
+    console.error('Error adding template item:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+router.delete('/templates/:id/items/:itemId', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `DELETE FROM task_template_items WHERE id = $1 AND template_id = $2 RETURNING id`,
+      [req.params.itemId, req.params.id]
+    )
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Template item not found' })
+    res.json({ success: true, message: 'Template item deleted' })
+  } catch (error) {
+    console.error('Error deleting template item:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Instantiates tasks from active templates for the given week -- insert-if-
+// not-exists per template per week, keyed by recurring_template_id + week_start.
+router.post('/templates/generate-week/:weekStart', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { weekStart } = req.params
+
+    const templatesResult = await pool.query(`SELECT * FROM task_templates WHERE is_active = true`)
+    const created = []
+
+    for (const template of templatesResult.rows) {
+      const existing = await pool.query(
+        `SELECT id FROM tasks WHERE recurring_template_id = $1 AND week_start = $2`,
+        [template.id, weekStart]
+      )
+      if (existing.rows.length > 0) continue
+
+      const offset = OPERATIONAL_DAY_OFFSET[template.operational_day]
+      const dueDateResult = await pool.query(`SELECT ($1::date + ($2 || ' days')::interval)::date AS due_date`, [weekStart, offset])
+      const dueDate = dueDateResult.rows[0].due_date
+
+      const taskResult = await pool.query(
+        `INSERT INTO tasks (title, department, owner_id, priority, due_date, operational_day, week_start, estimated_minutes, recurring_template_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING *`,
+        [template.name, template.department, template.default_owner_id, template.priority, dueDate, template.operational_day, weekStart, template.estimated_minutes, template.id]
+      )
+      const task = taskResult.rows[0]
+
+      const itemsResult = await pool.query(`SELECT label, sort_order FROM task_template_items WHERE template_id = $1 ORDER BY sort_order, id`, [template.id])
+      for (const item of itemsResult.rows) {
+        await pool.query(`INSERT INTO task_checklist_items (task_id, label, sort_order) VALUES ($1, $2, $3)`, [task.id, item.label, item.sort_order])
+      }
+
+      created.push(task)
+    }
+
+    res.status(201).json({ success: true, data: { week_start: weekStart, created_count: created.length, tasks: created } })
+  } catch (error) {
+    console.error('Error generating week from templates:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
 router.get('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const task = await fetchTaskWithDetails(req.params.id)
@@ -269,20 +520,21 @@ router.get('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 
 router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { title, description, department, owner_id, priority, status, due_date, estimated_minutes, source_type, source_id } = req.body
+    const { title, description, department, owner_id, priority, status, due_date, operational_day, week_start, estimated_minutes, source_type, source_id } = req.body
     if (!title || !department) return res.status(400).json({ error: 'title and department are required' })
 
     const deptError = validateEnum(department, DEPARTMENTS, 'department')
     const priorityError = validateEnum(priority, PRIORITIES, 'priority')
     const statusError = validateEnum(status, STATUSES, 'status')
-    const validationError = deptError || priorityError || statusError
+    const operationalDayError = validateEnum(operational_day, OPERATIONAL_DAYS, 'operational_day')
+    const validationError = deptError || priorityError || statusError || operationalDayError
     if (validationError) return res.status(400).json({ error: validationError })
 
     const result = await pool.query(
-      `INSERT INTO tasks (title, description, department, owner_id, priority, status, due_date, estimated_minutes, source_type, source_id)
-       VALUES ($1, $2, $3, $4, COALESCE($5, 'medium'), COALESCE($6, 'not_started'), $7, $8, $9, $10)
+      `INSERT INTO tasks (title, description, department, owner_id, priority, status, due_date, operational_day, week_start, estimated_minutes, source_type, source_id)
+       VALUES ($1, $2, $3, $4, COALESCE($5, 'medium'), COALESCE($6, 'not_started'), $7, $8, $9, $10, $11, $12)
        RETURNING *`,
-      [title, description || null, department, owner_id || null, priority || null, status || null, due_date || null, estimated_minutes || null, source_type || null, source_id || null]
+      [title, description || null, department, owner_id || null, priority || null, status || null, due_date || null, operational_day || null, week_start || null, estimated_minutes || null, source_type || null, source_id || null]
     )
 
     res.status(201).json({ success: true, data: result.rows[0] })
@@ -294,12 +546,13 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
 
 router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { title, description, department, owner_id, priority, status, due_date, estimated_minutes, actual_minutes, source_type, source_id } = req.body
+    const { title, description, department, owner_id, priority, status, due_date, operational_day, week_start, estimated_minutes, actual_minutes, source_type, source_id } = req.body
 
     const deptError = validateEnum(department, DEPARTMENTS, 'department')
     const priorityError = validateEnum(priority, PRIORITIES, 'priority')
     const statusError = validateEnum(status, STATUSES, 'status')
-    const validationError = deptError || priorityError || statusError
+    const operationalDayError = validateEnum(operational_day, OPERATIONAL_DAYS, 'operational_day')
+    const validationError = deptError || priorityError || statusError || operationalDayError
     if (validationError) return res.status(400).json({ error: validationError })
 
     const fields = []
@@ -316,6 +569,8 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
       set('completed_at', status === 'completed' ? new Date() : null)
     }
     if (due_date !== undefined) set('due_date', due_date)
+    if (operational_day !== undefined) set('operational_day', operational_day)
+    if (week_start !== undefined) set('week_start', week_start)
     if (estimated_minutes !== undefined) set('estimated_minutes', estimated_minutes)
     if (actual_minutes !== undefined) set('actual_minutes', actual_minutes)
     if (source_type !== undefined) set('source_type', source_type)
@@ -362,10 +617,10 @@ router.post('/:id/duplicate', requireAuth, requireRole('admin'), async (req, res
     const t = original.rows[0]
 
     const cloneResult = await pool.query(
-      `INSERT INTO tasks (title, description, department, owner_id, priority, status, due_date, estimated_minutes, source_type, source_id)
-       VALUES ($1, $2, $3, $4, $5, 'not_started', $6, $7, $8, $9)
+      `INSERT INTO tasks (title, description, department, owner_id, priority, status, due_date, operational_day, week_start, estimated_minutes, source_type, source_id)
+       VALUES ($1, $2, $3, $4, $5, 'not_started', $6, $7, $8, $9, $10, $11)
        RETURNING *`,
-      [t.title, t.description, t.department, t.owner_id, t.priority, t.due_date, t.estimated_minutes, t.source_type, t.source_id]
+      [t.title, t.description, t.department, t.owner_id, t.priority, t.due_date, t.operational_day, t.week_start, t.estimated_minutes, t.source_type, t.source_id]
     )
     const clone = cloneResult.rows[0]
 
