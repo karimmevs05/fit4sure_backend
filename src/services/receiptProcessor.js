@@ -45,6 +45,16 @@ Analyze this receipt or order screenshot and extract:
      printed -- don't guess wildly on something genuinely ambiguous, just
      clean up obvious
      truncation/abbreviation.
+   - "display_name": the bare, generic ingredient name as it would appear in
+     a recipe or shopping list -- strip the store/retailer brand (e.g.
+     "Member's Mark", "Kirkland Signature", "Great Value"), any diet/quality
+     qualifier (grass-fed, organic, wild-caught, free-range, non-GMO,
+     cage-free), and packaging/count/size info, keeping only the core
+     food + cut/variety. This is the name used for inventory going forward,
+     so the same real ingredient purchased from different brands/stores
+     should always produce the same display_name (e.g. "Member's Mark Grass
+     Fed Beef Top Sirloin Steak" -> "Top Sirloin Steak", "Organic Ground
+     Turkey" -> "Ground Turkey", "Rainbow Carrots, 2 lb bag" -> "Carrots").
    - "amount": the ACTUAL dollar amount charged for this line item, exactly as printed
      (this is the number on the right-hand side of the line, e.g. "$15.63" -- NOT
      a per-pound or per-unit rate like "$10.78/lb". If an item is priced per weight,
@@ -75,6 +85,7 @@ Return ONLY valid JSON, no markdown:
   "items": [
     {
       "name": "product name",
+      "display_name": "generic ingredient name",
       "amount": 12.99,
       "unit_rate": null,
       "quantity": 500,
@@ -154,6 +165,7 @@ Auto-categorize based on keywords:
       lowConfidence,
       items: receiptData.items.map(item => ({
         productName: item.name || 'Unknown Product',
+        displayName: item.display_name || item.name || 'Unknown Product',
         price: parseFloat(item.amount) || 0,
         quantity: item.quantity || 1,
         unit: item.unit || 'count',
@@ -234,7 +246,14 @@ async function saveReceiptToDB(receiptData) {
       // Keep Inventory in sync for food items (skips non-food automatically)
       try {
         await syncInventoryFromReceiptItem(
-          { name: item.productName, category: item.category, amount: item.amount, quantity: item.quantity, unit: item.unit },
+          {
+            name: item.productName,
+            displayName: item.displayName,
+            category: item.category,
+            amount: item.amount,
+            quantity: item.quantity,
+            unit: item.unit,
+          },
           vendor
         );
       } catch (inventoryError) {

@@ -164,64 +164,91 @@ async function archiveReceipt(fileId, fileName) {
 }
 
 /**
- * Process all receipts in Google Drive folder
+ * Parse every unprocessed receipt in the Drive folder with AI, but do NOT
+ * save anything or archive the files -- that happens only after a human
+ * confirms the parsed items (and any edited display names) via
+ * confirmAndSaveReceipts(). Each parsed receipt carries its driveFileId/
+ * fileName forward so confirmation can archive the right file.
+ */
+async function parseReceiptsFromDrive() {
+  console.log('Starting receipt parse from Google Drive...');
+
+  if (!drive) initializeDrive();
+
+  const folderId = await getOrCreateReceiptsFolder();
+  const receipts = await getUnprocessedReceipts(folderId);
+
+  if (receipts.length === 0) {
+    console.log('No new receipts to parse');
+    return { parsed: [], failed: [] };
+  }
+
+  console.log(`Found ${receipts.length} receipts to parse`);
+
+  const parsed = [];
+  const failed = [];
+
+  for (const receipt of receipts) {
+    try {
+      console.log(`Parsing: ${receipt.name}`);
+      const base64Image = await downloadImageAsBase64(receipt.id);
+      const receiptData = await processReceiptWithAI(base64Image, receipt.name);
+      parsed.push({ driveFileId: receipt.id, fileName: receipt.name, ...receiptData });
+      console.log(`✓ Parsed: ${receipt.name}`);
+    } catch (error) {
+      console.error(`✗ Failed to parse ${receipt.name}:`, error.message);
+      failed.push({ filename: receipt.name, error: error.message });
+      // Continue parsing other receipts
+    }
+  }
+
+  console.log(`\nReceipt parse complete: ${parsed.length} parsed, ${failed.length} failed`);
+  return { parsed, failed };
+}
+
+/**
+ * Save a batch of previously-parsed receipts (as confirmed/edited by an
+ * admin in the review UI) and archive their source files in Drive.
+ * receipts: [{ driveFileId, fileName, vendor, receiptTotal, items }]
+ */
+async function confirmAndSaveReceipts(receipts) {
+  let processed = 0;
+  let failed = 0;
+  const errors = [];
+
+  for (const receipt of receipts) {
+    try {
+      await saveReceiptToDB(receipt);
+      if (receipt.driveFileId) {
+        await archiveReceipt(receipt.driveFileId, receipt.fileName);
+      }
+      processed++;
+    } catch (error) {
+      failed++;
+      console.error(`✗ Failed to save ${receipt.fileName}:`, error.message);
+      errors.push({ filename: receipt.fileName, error: error.message });
+    }
+  }
+
+  return { processed, failed, total: receipts.length, errors };
+}
+
+/**
+ * Process all receipts in Google Drive folder: parse + save + archive in
+ * one pass, no review step. Kept for startAutoReceiptSync (currently not
+ * wired up to run automatically -- see src/index.js); the live "Sync Now"
+ * button instead uses parseReceiptsFromDrive + confirmAndSaveReceipts so an
+ * admin can review display names before anything is saved.
  */
 async function processReceiptsFromDrive() {
-  try {
-    console.log('Starting receipt sync from Google Drive...');
-
-    if (!drive) initializeDrive();
-
-    // Get receipts folder
-    const folderId = await getOrCreateReceiptsFolder();
-
-    // Get unprocessed receipts
-    const receipts = await getUnprocessedReceipts(folderId);
-
-    if (receipts.length === 0) {
-      console.log('No new receipts to process');
-      return { processed: 0, failed: 0 };
-    }
-
-    console.log(`Found ${receipts.length} receipts to process`);
-
-    let processed = 0;
-    let failed = 0;
-    const errors = [];
-
-    // Process each receipt
-    for (const receipt of receipts) {
-      try {
-        console.log(`Processing: ${receipt.name}`);
-
-        // Download image
-        const base64Image = await downloadImageAsBase64(receipt.id);
-
-        // Process with AI
-        const receiptData = await processReceiptWithAI(base64Image, receipt.name);
-
-        // Save to database
-        await saveReceiptToDB(receiptData);
-
-        // Archive the receipt
-        await archiveReceipt(receipt.id, receipt.name);
-
-        processed++;
-        console.log(`✓ Processed: ${receipt.name}`);
-      } catch (error) {
-        failed++;
-        console.error(`✗ Failed to process ${receipt.name}:`, error.message);
-        errors.push({ filename: receipt.name, error: error.message });
-        // Continue processing other receipts
-      }
-    }
-
-    console.log(`\nReceipt sync complete: ${processed} processed, ${failed} failed`);
-    return { processed, failed, total: receipts.length, errors };
-  } catch (error) {
-    console.error('Error in receipt sync:', error);
-    throw error;
-  }
+  const { parsed, failed: parseFailed } = await parseReceiptsFromDrive();
+  const { processed, failed: saveFailed, errors: saveErrors } = await confirmAndSaveReceipts(parsed);
+  return {
+    processed,
+    failed: parseFailed.length + saveFailed,
+    total: parsed.length + parseFailed.length,
+    errors: [...parseFailed, ...saveErrors],
+  };
 }
 
 /**
@@ -245,6 +272,8 @@ module.exports = {
   getUnprocessedReceipts,
   downloadImageAsBase64,
   archiveReceipt,
+  parseReceiptsFromDrive,
+  confirmAndSaveReceipts,
   processReceiptsFromDrive,
   startAutoReceiptSync,
 };

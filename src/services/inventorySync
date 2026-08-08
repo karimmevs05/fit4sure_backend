@@ -75,7 +75,11 @@ async function syncInventoryFromReceiptItem(item, vendor) {
     return { synced: false, reason: 'not a food item' };
   }
 
-  const name = (item.productName || item.name || '').trim();
+  // Prefer the cleaned generic display name for matching/creation, so the
+  // same real ingredient purchased under different brands/stores lands on
+  // one inventory row instead of a new near-duplicate each time. Falls back
+  // to the fuller parsed name for older callers that don't supply one.
+  const name = (item.displayName || item.display_name || item.productName || item.name || '').trim();
   const amount = item.amount ?? item.price;
 
   if (!name || !amount || amount <= 0) {
