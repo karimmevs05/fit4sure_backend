@@ -12,6 +12,7 @@ function cleanFoodName(name) {
     .replace(/\([^)]*\)/g, ' ') // parenthetical asides
     .replace(/,?\s*\d+(\.\d+)?\s*(ct|count|pk|pack|pcs?|pieces?)\.?\b/gi, ' ') // pack/count
     .replace(/,?\s*\d+(\.\d+)?\s*(fl\s?oz|oz|lbs?|kg|g|ml|l)\.?\b/gi, ' ') // weight/volume
+    .replace(/\//g, ' ') // slash-joined alternatives (e.g. "Pork Shoulder/Butt") 400 the USDA search API
     .replace(/,+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -65,6 +66,11 @@ async function searchOnce(query, dataType) {
   for (const food of foods) {
     const nutrients = extractNutrients(food.foodNutrients);
     if (!nutrients) continue;
+    // Some branded entries report all four macros as exactly 0 -- a data
+    // gap in USDA's branded dataset, not a real zero-calorie/zero-everything
+    // food. Treat as incomplete so a real candidate (or a later fallback
+    // attempt) gets picked instead of silently storing broken data.
+    if (nutrients.protein === 0 && nutrients.carbs === 0 && nutrients.fat === 0 && nutrients.calories === 0) continue;
     const score = embellishmentScore(query, food.description);
     if (score < bestScore) {
       bestScore = score;
@@ -114,9 +120,17 @@ async function searchUSDANutrition(ingredientName) {
         : []),
     ];
 
+    // Each attempt is tried independently -- a request error (e.g. USDA's
+    // search API 400ing on a raw "/" before the cleaned-name fallback strips
+    // it) must not abort the remaining, potentially-working attempts.
     let match = null;
     for (const attempt of attempts) {
-      match = await attempt();
+      try {
+        match = await attempt();
+      } catch (err) {
+        console.warn(`   USDA search attempt failed (${err.message}), trying next fallback...`);
+        match = null;
+      }
       if (match) break;
     }
 
