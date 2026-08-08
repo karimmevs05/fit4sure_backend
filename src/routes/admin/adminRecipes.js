@@ -77,7 +77,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
       result.rows.map(async (recipe) => {
         try {
           const ingredientsResult = await pool.query(
-            `SELECT ri.quantity_g, i.unit_price_cents
+            `SELECT ri.quantity_g, i.unit_price_cents, i.suggested_serving_g
              FROM recipe_ingredients ri
              LEFT JOIN inventory i ON ri.inventory_id = i.id
              WHERE ri.recipe_id = $1`,
@@ -94,11 +94,20 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
           // Calculate macros from ingredients
           const macros = await calculateRecipeMacros(recipe.recipe_id, recipe.servings)
 
+          // Reference-only "suggested serving size" for the plate builder --
+          // taken from the recipe's largest-by-weight ingredient (its main
+          // component, e.g. the protein/carb/veg itself rather than a
+          // seasoning), when that ingredient has one set.
+          const mainIngredient = ingredientsResult.rows
+            .filter((ing) => ing.suggested_serving_g != null)
+            .sort((a, b) => (b.quantity_g || 0) - (a.quantity_g || 0))[0]
+
           return {
             ...recipe,
             ...macros,
             cost_per_serving_cents: costPerServingCents,
-            total_recipe_cost_cents: totalCostCents
+            total_recipe_cost_cents: totalCostCents,
+            suggested_serving_g: mainIngredient ? mainIngredient.suggested_serving_g : null
           }
         } catch (err) {
           console.error(`Error calculating cost for recipe ${recipe.recipe_id}:`, err)
