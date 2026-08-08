@@ -83,20 +83,34 @@ router.get('/plates', requireAuth, requireRole('admin'), async (req, res) => {
       ORDER BY delivery_day, large_variant_of NULLS FIRST, name
     `, [sunday]);
 
-    const plates = [];
-    for (const plate of platesResult.rows) {
+    // Each plate's recipe rows are independent reads (yield-corrected macros,
+    // allergens, low-stock) that were previously awaited one at a time in a
+    // nested loop -- ~4 sequential DB round-trips per recipe, serialized
+    // across every plate and recipe (this endpoint was taking 13+ seconds
+    // with a full week's worth of plates). Running them concurrently instead
+    // cuts it to roughly the time of the single slowest query.
+    const plates = await Promise.all(platesResult.rows.map(async (plate) => {
       const recipesResult = await db.query(
         `SELECT recipe_id, servings FROM menu_plan_recipes WHERE menu_id = $1`,
         [plate.id]
       );
 
-      const recipeDetails = [];
+      const perRecipe = await Promise.all(recipesResult.rows.map(async (r) => {
+        const servings = parseFloat(r.servings);
+        const [detail, allergens, warnings] = await Promise.all([
+          computeYieldCorrectedRecipe(r.recipe_id, servings),
+          getRecipeAllergens(r.recipe_id),
+          getLowStockWarnings(r.recipe_id, servings),
+        ]);
+        return { detail, allergens, warnings };
+      }));
+
       let totals = { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0, cost_cents: 0, raw_weight_g: 0, cooked_weight_g: 0 };
       const allergenSet = new Set();
       const lowStockWarnings = [];
+      const recipeDetails = [];
 
-      for (const r of recipesResult.rows) {
-        const detail = await computeYieldCorrectedRecipe(r.recipe_id, parseFloat(r.servings));
+      for (const { detail, allergens, warnings } of perRecipe) {
         if (detail) {
           recipeDetails.push(detail);
           totals.calories += detail.calories;
@@ -107,11 +121,7 @@ router.get('/plates', requireAuth, requireRole('admin'), async (req, res) => {
           totals.raw_weight_g += detail.raw_weight_g;
           totals.cooked_weight_g += detail.cooked_weight_g;
         }
-
-        const recipeAllergens = await getRecipeAllergens(r.recipe_id);
-        recipeAllergens.forEach(a => allergenSet.add(a));
-
-        const warnings = await getLowStockWarnings(r.recipe_id, parseFloat(r.servings));
+        allergens.forEach(a => allergenSet.add(a));
         lowStockWarnings.push(...warnings);
       }
 
@@ -125,15 +135,15 @@ router.get('/plates', requireAuth, requireRole('admin'), async (req, res) => {
       const profitCents = priceCents - totals.cost_cents;
       const marginPct = priceCents > 0 ? +((profitCents / priceCents) * 100).toFixed(1) : 0;
 
-      plates.push({
+      return {
         ...plate,
         recipes: recipeDetails,
         totals,
         allergens: Array.from(allergenSet),
         lowStockWarnings,
         profit: { price_cents: priceCents, cost_cents: totals.cost_cents, profit_cents: profitCents, margin_pct: marginPct },
-      });
-    }
+      };
+    }));
 
     res.json({ data: { weekStart: sunday, plates } });
   } catch (error) {
