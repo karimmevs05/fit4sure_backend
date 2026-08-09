@@ -42,7 +42,7 @@ async function calculateRecipeMacros(recipeId, servings) {
 
   const emptyPerPound = { calories: 0, protein_g: '0.0', carbs_g: '0.0', fat_g: '0.0' }
   if (ingredientsResult.rows.length === 0) {
-    return { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0, per_pound: emptyPerPound }
+    return { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0, per_pound: emptyPerPound, totalWeightG: 0 }
   }
 
   // Sum macros for all ingredients
@@ -86,7 +86,12 @@ async function calculateRecipeMacros(recipeId, servings) {
     carbs_g: (totalCarbs / divisor).toFixed(1),
     fat_g: (totalFat / divisor).toFixed(1),
     per_pound: perPound,
+    totalWeightG,
   }
+}
+
+function costPerPoundCents(totalCostCents, totalWeightG) {
+  return totalWeightG > 0 ? Math.round((totalCostCents * GRAMS_PER_POUND) / totalWeightG) : 0
 }
 
 // GET /api/admin/recipes - List all recipes with calculated costs and macros from ingredients
@@ -114,7 +119,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
           const costPerServingCents = recipe.servings ? Math.round(totalCostCents / recipe.servings) : 0
 
           // Calculate macros from ingredients
-          const macros = await calculateRecipeMacros(recipe.recipe_id, recipe.servings)
+          const { totalWeightG, ...macros } = await calculateRecipeMacros(recipe.recipe_id, recipe.servings)
 
           // Reference-only "suggested serving size" for the plate builder --
           // taken from the recipe's largest-by-weight ingredient (its main
@@ -128,6 +133,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
             ...recipe,
             ...macros,
             cost_per_serving_cents: costPerServingCents,
+            cost_per_pound_cents: costPerPoundCents(totalCostCents, totalWeightG),
             total_recipe_cost_cents: totalCostCents,
             suggested_serving_g: mainIngredient ? mainIngredient.suggested_serving_g : null
           }
@@ -218,13 +224,14 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
     const costPerServingCents = recipeResult.rows[0].servings ? Math.round(totalCostCents / recipeResult.rows[0].servings) : 0
 
     // Calculate macros from ingredients
-    const macros = await calculateRecipeMacros(req.params.recipe_id, recipeResult.rows[0].servings)
+    const { totalWeightG, ...macros } = await calculateRecipeMacros(req.params.recipe_id, recipeResult.rows[0].servings)
 
     res.json({
       data: {
         ...recipeResult.rows[0],
         ...macros,
         cost_per_serving_cents: costPerServingCents,
+        cost_per_pound_cents: costPerPoundCents(totalCostCents, totalWeightG),
         total_recipe_cost_cents: totalCostCents,
         ingredients: ingredientsWithCosts
       }
