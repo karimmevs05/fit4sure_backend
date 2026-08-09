@@ -214,7 +214,7 @@ Auto-categorize based on keywords:
  */
 async function saveReceiptToDB(receiptData) {
   try {
-    const { vendor, items } = receiptData;
+    const { vendor, items, date } = receiptData;
     const savedProducts = [];
     const createdExpenses = [];
 
@@ -256,9 +256,10 @@ async function saveReceiptToDB(receiptData) {
 
         const expenseResult = await db.query(`
           INSERT INTO expenses (date, vendor, category, description, amount, status)
-          VALUES (NOW(), $1, $2, $3, $4, 'pending')
+          VALUES (COALESCE($1, NOW()), $2, $3, $4, $5, 'pending')
           RETURNING id, date, vendor, category, description, amount, status
         `, [
+          date || null,
           vendor || 'Online Order',
           item.category || 'other',
           descriptionWithQty,

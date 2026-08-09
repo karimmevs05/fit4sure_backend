@@ -49,7 +49,7 @@ router.post('/confirm', requireAuth, requireRole('admin'), async (req, res) => {
 
     const result = await confirmAndSaveReceipts(receipts);
 
-    let message = `Saved ${result.processed} receipt(s) (${result.failed} failed)`;
+    let message = `Saved ${result.processed} receipt(s), ${result.productsAdded} product(s) and ${result.expensesCreated} expense(s) (${result.failed} failed)`;
     if (result.failed > 0 && result.errors?.length) {
       const reasons = result.errors.map(e => `${e.filename}: ${e.error}`).join('; ');
       message += ` — Reasons: ${reasons}`;

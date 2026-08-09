@@ -148,11 +148,19 @@ async function archiveReceipt(fileId, fileName) {
     // Create archive folder if needed
     const archiveFolder = await getOrCreateReceiptsFolder('Fit4Sure Receipts/Processed');
 
+    // removeParents must name the file's ACTUAL current parent(s), not the
+    // literal string 'root' -- this receipt lives in the "Fit4Sure Receipts"
+    // folder, not the Drive root, so a hardcoded 'root' 403s with "Increasing
+    // the number of parents is not allowed" (Drive adds the new parent but
+    // refuses to also drop a parent the file was never actually in).
+    const current = await drive.files.get({ fileId, fields: 'parents' });
+    const currentParents = (current.data.parents || []).join(',');
+
     // Move file to archive
     await drive.files.update({
       fileId,
       addParents: archiveFolder,
-      removeParents: 'root', // Remove from root (will be moved to archive)
+      removeParents: currentParents || undefined,
       fields: 'id, parents',
     });
 
@@ -214,11 +222,15 @@ async function parseReceiptsFromDrive() {
 async function confirmAndSaveReceipts(receipts) {
   let processed = 0;
   let failed = 0;
+  let productsAdded = 0;
+  let expensesCreated = 0;
   const errors = [];
 
   for (const receipt of receipts) {
     try {
-      await saveReceiptToDB(receipt);
+      const result = await saveReceiptToDB(receipt);
+      productsAdded += result.productsAdded;
+      expensesCreated += result.expensesCreated;
       if (receipt.driveFileId) {
         await archiveReceipt(receipt.driveFileId, receipt.fileName);
       }
@@ -230,7 +242,7 @@ async function confirmAndSaveReceipts(receipts) {
     }
   }
 
-  return { processed, failed, total: receipts.length, errors };
+  return { processed, failed, total: receipts.length, errors, productsAdded, expensesCreated };
 }
 
 /**
