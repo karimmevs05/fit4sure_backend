@@ -89,8 +89,24 @@ Analyze this receipt or order screenshot and extract:
      the weight -- never the per-unit rate by itself)
    - "unit_rate": if the item shows a separate per-unit or per-pound price (e.g.
      "$10.78/lb"), record that rate here for reference. Leave null if not shown.
-   - Quantity or weight (if available, e.g., "500g", "2 lbs", "1 unit")
-   - Unit of measurement (g, kg, oz, lb, ml, L, count, etc.)
+   - "item_count": how many DISCRETE physical units this "amount" pays for (e.g. a
+     multi-pack of 3 yogurt cups rung as one line -> 3; a single bag of carrots ->
+     1; a steak sold by weight -> 1, since it's one physical piece even though its
+     weight is a decimal). This is a count of objects, never a weight.
+   - "gram_weight": the TOTAL food weight in grams for ALL "item_count" units on
+     this line combined -- this feeds inventory stock directly, so make a real
+     effort on every food item rather than defaulting to null:
+     * If the receipt shows a weight/size (e.g. "2 lb", "500g", "12 oz", "1.63 lb
+       @ $10.78/lb"), convert it to grams (1 lb = 453.6g, 1 oz = 28.3g, 1 kg = 1000g).
+     * If no weight is printed but this is a standard packaged grocery item you
+       recognize (a dozen eggs, a gallon of milk, a standard yogurt cup/tub, a
+       loaf of bread, a jar of honey, a bag of rice), use your knowledge of that
+       product's typical package weight in grams, multiplied by item_count.
+     * Only leave this null if it's genuinely impossible to estimate (e.g. a
+       category that isn't really "weighable" at all).
+   - Quantity or weight as printed, for reference/display (if available, e.g.,
+     "500g", "2 lbs", "1 unit")
+   - Unit of measurement as printed (g, kg, oz, lb, ml, L, count, etc.)
 
 IMPORTANT RULES:
 - Skip payment method lines (Visa, Mastercard, cash, etc.)
@@ -100,7 +116,9 @@ IMPORTANT RULES:
   also appears as a genuine purchase elsewhere on the receipt
 - Read decimal points carefully -- do not drop or misplace decimal points (e.g. $10.78 must never become 1078)
 - If weight/quantity is on package (e.g., "2lb bag of chicken"), extract it
-- For items without quantity, use "count" as unit with quantity 1
+- For items without a printed quantity, item_count defaults to 1 -- but still
+  estimate gram_weight per the rules above, don't let a missing printed
+  quantity become a missing gram_weight
 - If unclear, make best guess based on product type
 - The sum of all "amount" values should be close to the receipt total (before tax).
   Double check any line item whose amount looks unusually large or doesn't fit this pattern.
@@ -115,6 +133,8 @@ Return ONLY valid JSON, no markdown:
       "display_name": "generic ingredient name",
       "amount": 12.99,
       "unit_rate": null,
+      "item_count": 1,
+      "gram_weight": 500,
       "quantity": 500,
       "unit": "g",
       "category": "food_cogs"
@@ -194,6 +214,8 @@ Auto-categorize based on keywords:
         productName: item.name || 'Unknown Product',
         displayName: item.display_name || item.name || 'Unknown Product',
         price: parseFloat(item.amount) || 0,
+        itemCount: parseInt(item.item_count, 10) || 1,
+        gramWeight: item.gram_weight != null ? parseFloat(item.gram_weight) || 0 : null,
         quantity: item.quantity || 1,
         unit: item.unit || 'count',
         category: item.category || 'other',
@@ -250,7 +272,9 @@ async function saveReceiptToDB(receiptData) {
 
       // Create expense entry
       try {
-        const descriptionWithQty = item.quantity && item.unit
+        const descriptionWithQty = item.gramWeight
+          ? `${item.productName} (${item.itemCount || 1} × ${Math.round(item.gramWeight / (item.itemCount || 1))}g)`
+          : item.quantity && item.unit
           ? `${item.productName} (${item.quantity}${item.unit})`
           : item.productName;
 
@@ -281,6 +305,7 @@ async function saveReceiptToDB(receiptData) {
             amount: item.amount,
             quantity: item.quantity,
             unit: item.unit,
+            gramsTotal: item.gramWeight,
           },
           vendor
         );

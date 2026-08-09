@@ -86,7 +86,13 @@ async function syncInventoryFromReceiptItem(item, vendor) {
     return { synced: false, reason: 'missing name or amount' };
   }
 
-  const quantityG = convertToGrams(item.quantity, item.unit);
+  // A directly-supplied gram total (from the AI parse, confirmed/edited by
+  // an admin in the review step) is authoritative -- it already accounts
+  // for item_count and any package-weight estimation the unit-conversion
+  // table below can't do (e.g. "a dozen eggs" or "count" items). Only fall
+  // back to unit-converting quantity+unit for callers that don't supply one
+  // (e.g. Manual Entry).
+  const quantityG = item.gramsTotal != null ? item.gramsTotal : convertToGrams(item.quantity, item.unit);
 
   // $/lb in cents, derived from what was actually paid for this line item.
   // Only computed when we have a real weight to divide by -- otherwise we
