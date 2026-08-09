@@ -28,6 +28,8 @@ function calculateIngredientCost(unitPriceCents, quantityG) {
   return Math.round(priceCentsPerGram * quantityG)
 }
 
+const GRAMS_PER_POUND = 455 // matches this app's stated "1 lb (455g)" convention
+
 // Calculate recipe macros from ingredients
 async function calculateRecipeMacros(recipeId, servings) {
   const ingredientsResult = await pool.query(
@@ -38,8 +40,9 @@ async function calculateRecipeMacros(recipeId, servings) {
     [recipeId]
   )
 
+  const emptyPerPound = { calories: 0, protein_g: '0.0', carbs_g: '0.0', fat_g: '0.0' }
   if (ingredientsResult.rows.length === 0) {
-    return { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 }
+    return { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0, per_pound: emptyPerPound }
   }
 
   // Sum macros for all ingredients
@@ -47,8 +50,13 @@ async function calculateRecipeMacros(recipeId, servings) {
   let totalProtein = 0
   let totalCarbs = 0
   let totalFat = 0
+  let totalWeightG = 0
 
   for (const ing of ingredientsResult.rows) {
+    // pg returns numeric columns as strings -- plain += would silently
+    // string-concatenate instead of add (e.g. "3000.00" + "10.00" ->
+    // "03000.0010.00"), unlike the multiplication below which coerces fine.
+    totalWeightG += parseFloat(ing.quantity_g) || 0
     if (ing.quantity_g && ing.calories_per_100g) {
       totalCalories += (ing.calories_per_100g * ing.quantity_g) / 100
       totalProtein += (ing.protein_per_100g * ing.quantity_g) / 100
@@ -59,11 +67,25 @@ async function calculateRecipeMacros(recipeId, servings) {
 
   // Divide by servings to get per-serving macros
   const divisor = servings || 1
+
+  // Also express as "per pound (453.6g) of the recipe" -- a unit that lets
+  // you compare recipes regardless of how many servings each one claims,
+  // since "per serving" is only as meaningful as that number is accurate.
+  const perPound = totalWeightG > 0
+    ? {
+        calories: Math.round((totalCalories * GRAMS_PER_POUND) / totalWeightG),
+        protein_g: ((totalProtein * GRAMS_PER_POUND) / totalWeightG).toFixed(1),
+        carbs_g: ((totalCarbs * GRAMS_PER_POUND) / totalWeightG).toFixed(1),
+        fat_g: ((totalFat * GRAMS_PER_POUND) / totalWeightG).toFixed(1),
+      }
+    : emptyPerPound
+
   return {
     calories: Math.round(totalCalories / divisor),
     protein_g: (totalProtein / divisor).toFixed(1),
     carbs_g: (totalCarbs / divisor).toFixed(1),
-    fat_g: (totalFat / divisor).toFixed(1)
+    fat_g: (totalFat / divisor).toFixed(1),
+    per_pound: perPound,
   }
 }
 
