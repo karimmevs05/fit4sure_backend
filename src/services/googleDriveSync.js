@@ -192,7 +192,7 @@ async function parseReceiptsFromDrive() {
     try {
       console.log(`Parsing: ${receipt.name}`);
       const base64Image = await downloadImageAsBase64(receipt.id);
-      const receiptData = await processReceiptWithAI(base64Image, receipt.name);
+      const receiptData = await processReceiptWithAI(base64Image, receipt.name, receipt.mimeType);
       parsed.push({ driveFileId: receipt.id, fileName: receipt.name, ...receiptData });
       console.log(`✓ Parsed: ${receipt.name}`);
     } catch (error) {

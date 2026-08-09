@@ -11,12 +11,39 @@ const getGeminiClient = () => {
   return new GoogleGenerativeAI(apiKey);
 };
 
+// Gemini occasionally 503s ("currently experiencing high demand") or 429s
+// (rate limit) under load -- both transient and worth a short retry before
+// giving up, unlike a genuine parse/validation failure which would just
+// fail the same way again immediately.
+function isRetryableGeminiError(error) {
+  return /\b(503|429)\b/.test(error.message || '');
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Process receipt image with Google Gemini API (FREE)
  * Extracts: vendor, items (name, price, quantity/weight, unit)
  * Returns structured data ready for database storage
  */
-async function processReceiptWithAI(imageBase64, imageSource = 'unknown') {
+async function processReceiptWithAI(imageBase64, imageSource = 'unknown', mimeType = 'image/jpeg') {
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await processReceiptWithAIOnce(imageBase64, imageSource, mimeType);
+    } catch (error) {
+      const isLastAttempt = attempt === MAX_ATTEMPTS;
+      if (!isRetryableGeminiError(error) || isLastAttempt) throw error;
+      const delayMs = attempt * 2000; // 2s, 4s
+      console.warn(`Gemini transient error on attempt ${attempt}/${MAX_ATTEMPTS} for ${imageSource}, retrying in ${delayMs}ms: ${error.message}`);
+      await sleep(delayMs);
+    }
+  }
+}
+
+async function processReceiptWithAIOnce(imageBase64, imageSource, mimeType) {
   try {
     console.log(`Processing receipt from ${imageSource}...`);
 
@@ -109,7 +136,7 @@ Auto-categorize based on keywords:
       {
         inlineData: {
           data: imageBase64,
-          mimeType: 'image/jpeg',
+          mimeType,
         },
       },
       prompt,
