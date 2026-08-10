@@ -48,6 +48,97 @@ router.get('/previous-week', requireAuth, requireRole('admin'), async (req, res)
   }
 });
 
+// Returns every published recipe for next week's planned window, joined
+// against whatever's already been selected for each block -- so the UI can
+// render the full recipe list with each one's checked/unchecked state and
+// expected volume in a single call.
+router.get('/recipe-plan', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { sunday } = await getNextWeekDates();
+
+    const recipesResult = await db.query(`
+      SELECT recipe_id, name, category
+      FROM recipes
+      WHERE category != 'prepared_meal'
+      ORDER BY category, name
+    `);
+
+    const planResult = await db.query(
+      `SELECT recipe_id, block, expected_volume
+       FROM weekly_recipe_plan
+       WHERE planned_week_start = $1`,
+      [sunday]
+    );
+
+    const planByKey = {};
+    for (const row of planResult.rows) {
+      planByKey[`${row.recipe_id}:${row.block}`] = row.expected_volume;
+    }
+
+    const withPlan = (block) =>
+      recipesResult.rows.map((r) => {
+        const key = `${r.recipe_id}:${block}`;
+        const selected = Object.prototype.hasOwnProperty.call(planByKey, key);
+        return {
+          recipe_id: r.recipe_id,
+          name: r.name,
+          category: r.category,
+          selected,
+          expected_volume: selected ? planByKey[key] : 0,
+        };
+      });
+
+    res.json({
+      data: {
+        weekStart: sunday,
+        monday: withPlan('monday'),
+        thursday: withPlan('thursday'),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching recipe plan:', error);
+    res.status(500).json({ error: 'Failed to fetch recipe plan' });
+  }
+});
+
+// Saves the full recipe selection + expected volume for one block in a
+// single call -- replace-all semantics, same pattern the plate builder uses
+// for its recipe list. Body: { block: 'monday'|'thursday', selections: [{
+// recipe_id, expected_volume }] }. Recipes left out of `selections` are
+// simply not live for that block; they aren't deleted anywhere else.
+router.post('/recipe-plan', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { block, selections } = req.body;
+
+    if (!['monday', 'thursday'].includes(block)) {
+      return res.status(400).json({ error: "block must be 'monday' or 'thursday'" });
+    }
+    if (!Array.isArray(selections)) {
+      return res.status(400).json({ error: 'selections must be an array' });
+    }
+
+    const { sunday } = await getNextWeekDates();
+
+    await db.query(
+      `DELETE FROM weekly_recipe_plan WHERE block = $1 AND planned_week_start = $2`,
+      [block, sunday]
+    );
+
+    for (const s of selections) {
+      await db.query(
+        `INSERT INTO weekly_recipe_plan (recipe_id, block, planned_week_start, expected_volume, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW())`,
+        [s.recipe_id, block, sunday, s.expected_volume || 0]
+      );
+    }
+
+    res.json({ success: true, message: 'Recipe plan saved' });
+  } catch (error) {
+    console.error('Error saving recipe plan:', error);
+    res.status(500).json({ error: 'Failed to save recipe plan' });
+  }
+});
+
 // Real allergens used across a recipe's ingredients (deduplicated)
 async function getRecipeAllergens(recipeId) {
   const result = await db.query(
