@@ -236,9 +236,36 @@ Auto-categorize based on keywords:
  */
 async function saveReceiptToDB(receiptData) {
   try {
-    const { vendor, items, date } = receiptData;
+    const { vendor, items, date, driveFileId, driveViewLink, lowConfidence, receiptTotal } = receiptData;
     const savedProducts = [];
     const createdExpenses = [];
+
+    // One row per receipt (Drive scan, or a single manual/screenshot entry)
+    // so the expense summary can show one line per receipt -- with a link
+    // back to the source image -- instead of only a flat list of line items.
+    // ON CONFLICT is a safety net for the same file being saved twice in a
+    // race; DO NOTHING + a follow-up SELECT recovers the existing row's id
+    // rather than erroring or silently dropping the link.
+    const itemsTotalCents = Math.round(items.reduce((sum, item) => sum + (item.amount || 0), 0) * 100);
+    const totalAmountCents = receiptTotal != null ? Math.round(receiptTotal * 100) : itemsTotalCents;
+    let receiptScanId = null;
+    try {
+      const receiptScanResult = await db.query(`
+        INSERT INTO receipt_scans (vendor, receipt_date, total_amount_cents, drive_file_id, drive_view_link, low_confidence)
+        VALUES ($1, COALESCE($2, NOW()), $3, $4, $5, $6)
+        ON CONFLICT (drive_file_id) DO NOTHING
+        RETURNING id
+      `, [vendor || 'Unknown', date || null, totalAmountCents, driveFileId || null, driveViewLink || null, !!lowConfidence]);
+
+      if (receiptScanResult.rows.length > 0) {
+        receiptScanId = receiptScanResult.rows[0].id;
+      } else if (driveFileId) {
+        const existing = await db.query('SELECT id FROM receipt_scans WHERE drive_file_id = $1', [driveFileId]);
+        receiptScanId = existing.rows[0]?.id ?? null;
+      }
+    } catch (receiptScanError) {
+      console.error('Error creating receipt scan record:', receiptScanError);
+    }
 
     for (const item of items) {
       if (!item.productName || item.amount <= 0) {
@@ -279,8 +306,8 @@ async function saveReceiptToDB(receiptData) {
           : item.productName;
 
         const expenseResult = await db.query(`
-          INSERT INTO expenses (date, vendor, category, description, amount, status)
-          VALUES (COALESCE($1, NOW()), $2, $3, $4, $5, 'pending')
+          INSERT INTO expenses (date, vendor, category, description, amount, status, receipt_scan_id)
+          VALUES (COALESCE($1, NOW()), $2, $3, $4, $5, 'pending', $6)
           RETURNING id, date, vendor, category, description, amount, status
         `, [
           date || null,
@@ -288,6 +315,7 @@ async function saveReceiptToDB(receiptData) {
           item.category || 'other',
           descriptionWithQty,
           item.amount, // expenses.amount stores plain dollars, not cents
+          receiptScanId,
         ]);
 
         createdExpenses.push(expenseResult.rows[0]);

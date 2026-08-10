@@ -89,6 +89,22 @@ router.post('/save-receipt-items', requireAuth, requireRole('admin'), async (req
     const savedProducts = [];
     const createdExpenses = [];
 
+    // One row per receipt so this entry shows up alongside Drive-scanned
+    // and manually-typed receipts in the expense summary (no Drive file
+    // here, so drive_file_id/drive_view_link stay null).
+    const itemsTotalCents = Math.round(items.reduce((sum, item) => sum + (item.amount || 0), 0) * 100);
+    let receiptScanId = null;
+    try {
+      const receiptScanResult = await db.query(`
+        INSERT INTO receipt_scans (vendor, receipt_date, total_amount_cents)
+        VALUES ($1, NOW(), $2)
+        RETURNING id
+      `, [vendor || 'Unknown', itemsTotalCents]);
+      receiptScanId = receiptScanResult.rows[0].id;
+    } catch (receiptScanError) {
+      console.error('Error creating receipt scan record:', receiptScanError);
+    }
+
     // Process each item
     for (const item of items) {
       const { productName, description, amount, category, unit, quantity } = item;
@@ -128,14 +144,15 @@ router.post('/save-receipt-items', requireAuth, requireRole('admin'), async (req
       // Create expense entry
       try {
         const expenseResult = await db.query(`
-          INSERT INTO expenses (date, vendor, category, description, amount, status)
-          VALUES (NOW(), $1, $2, $3, $4, 'pending')
+          INSERT INTO expenses (date, vendor, category, description, amount, status, receipt_scan_id)
+          VALUES (NOW(), $1, $2, $3, $4, 'pending', $5)
           RETURNING id, date, vendor, category, description, amount, status
         `, [
           vendor || 'Receipt',
           category,
           finalProductName + (quantity && unit ? ` (${quantity}${unit})` : ''),
-          amount // expenses.amount stores plain dollars, not cents
+          amount, // expenses.amount stores plain dollars, not cents
+          receiptScanId,
         ]);
 
         createdExpenses.push(expenseResult.rows[0]);
@@ -372,6 +389,32 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
   } catch (error) {
     console.error('Error fetching expenses:', error);
     res.status(500).json({ error: error.message || 'Failed to fetch expenses' });
+  }
+});
+
+// GET /api/admin/expenses/receipts - One row per receipt (Drive scan, or a
+// single manual/screenshot entry) with a direct link back to the source
+// image, instead of a flat line-item list -- "what did we spend at each
+// receipt, and can I see it."
+router.get('/receipts', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit, 10) || 200;
+    const result = await db.query(
+      `SELECT rs.id, rs.vendor, rs.receipt_date, rs.total_amount_cents, rs.drive_view_link,
+              rs.low_confidence, rs.created_at,
+              COUNT(e.id) AS item_count,
+              COALESCE(SUM(e.amount), 0) AS items_total
+       FROM receipt_scans rs
+       LEFT JOIN expenses e ON e.receipt_scan_id = rs.id
+       GROUP BY rs.id
+       ORDER BY rs.created_at DESC
+       LIMIT $1`,
+      [limit]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Error fetching receipt summary:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch receipts' });
   }
 });
 

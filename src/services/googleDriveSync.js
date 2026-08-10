@@ -1,6 +1,7 @@
 const { google } = require('googleapis');
 const fs = require('fs');
 const path = require('path');
+const db = require('../config/db');
 const { processReceiptWithAI, saveReceiptToDB } = require('./receiptProcessor');
 
 let drive = null;
@@ -139,6 +140,23 @@ async function downloadImageAsBase64(fileId) {
 }
 
 /**
+ * A stable link back to the receipt image in Drive's own viewer -- captured
+ * at parse time and stored, so the expense summary can link straight to the
+ * source image without us hosting a copy ourselves. Stays valid after the
+ * file is archived (moving a file doesn't change its id or this link).
+ */
+async function getFileViewLink(fileId) {
+  try {
+    if (!drive) initializeDrive();
+    const response = await drive.files.get({ fileId, fields: 'webViewLink' });
+    return response.data.webViewLink || null;
+  } catch (error) {
+    console.error('Error fetching Drive view link:', error);
+    return null;
+  }
+}
+
+/**
  * Move processed receipt to archive folder
  */
 async function archiveReceipt(fileId, fileName) {
@@ -198,10 +216,23 @@ async function parseReceiptsFromDrive() {
 
   for (const receipt of receipts) {
     try {
+      // A file can still be sitting in the inbox despite already being
+      // recorded -- e.g. a previous archive-move failed (Drive permissions,
+      // API hiccup). Catch that here instead of re-parsing (another AI call,
+      // and duplicate expenses/inventory bumps if it were saved again) --
+      // just retry moving it out of the way.
+      const existing = await db.query('SELECT id FROM receipt_scans WHERE drive_file_id = $1', [receipt.id]);
+      if (existing.rows.length > 0) {
+        console.log(`Already recorded, re-archiving: ${receipt.name}`);
+        await archiveReceipt(receipt.id, receipt.name);
+        continue;
+      }
+
       console.log(`Parsing: ${receipt.name}`);
       const base64Image = await downloadImageAsBase64(receipt.id);
       const receiptData = await processReceiptWithAI(base64Image, receipt.name, receipt.mimeType);
-      parsed.push({ driveFileId: receipt.id, fileName: receipt.name, ...receiptData });
+      const driveViewLink = await getFileViewLink(receipt.id);
+      parsed.push({ driveFileId: receipt.id, fileName: receipt.name, driveViewLink, ...receiptData });
       console.log(`✓ Parsed: ${receipt.name}`);
     } catch (error) {
       console.error(`✗ Failed to parse ${receipt.name}:`, error.message);
