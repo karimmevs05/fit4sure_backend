@@ -2,119 +2,184 @@ const express = require('express');
 const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
+const { getRecipeIngredientNeeds } = require('../../utils/recipeCost');
 
-// GET /api/admin/prep/weeks - Get all available weeks
+// ============================================================================
+// WEEKLY PREP -- reads from the same live tables Orders already uses
+// (`orders`, `menus`), not the old disconnected `menu_recipes`/`order_totals`/
+// `menus.week_label`, which had no real data under the current schema.
+//
+// Recipe linkage reuses the existing `menu_plan_recipes` table (menu_id ->
+// recipe_id, servings) rather than adding a new column -- real orders this
+// week already match several `menus` rows created by the Menu Planner Plate
+// Builder (via name+category lookup in findOrCreateMenu), and those rows
+// already have real menu_plan_recipes links. Adding a second, weaker
+// one-recipe-per-menu column would fragment data that's already linked
+// correctly (a plate can have more than one recipe, e.g. protein + side).
+// Items with no menu_plan_recipes row are honestly reported as unlinked
+// (recipe_linked: false) rather than falling back to a full inventory dump.
+//
+// Every week boundary below is the same Sunday-anchored formula used
+// everywhere else in the app (adminOrders.js, adminMenuPlanner.js), so
+// Weekly Prep and the Orders "This Week" tab always agree.
+// ============================================================================
+
+const WEEK_BOUNDARY = `(date_trunc('week', o.created_at + interval '1 day') - interval '1 day')::date`;
+
+function isValidWeek(week) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(week);
+}
+
+// GET /api/admin/prep/weeks/list - real weeks that actually have orders
 router.get('/weeks/list', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const result = await db.query(
-      `SELECT id, week_label FROM menus ORDER BY created_at DESC`
-    );
-
-    res.json({
-      data: result.rows.map(row => ({
-        id: row.id,
-        week: row.week_label,
-      })),
-    });
+    const result = await db.query(`
+      SELECT DISTINCT (date_trunc('week', created_at + interval '1 day') - interval '1 day')::date AS week_start
+      FROM orders
+      ORDER BY week_start DESC
+      LIMIT 20
+    `);
+    res.json({ data: result.rows.map((row) => ({ week: row.week_start.toISOString().slice(0, 10) })) });
   } catch (error) {
     console.error('Error fetching weeks:', error);
     res.status(500).json({ error: 'Failed to fetch weeks' });
   }
 });
 
-// GET /api/admin/prep/:week - Get comprehensive prep data for a week
+// GET /api/admin/prep/:week - real prep data for one week (week = ISO date, the week's Sunday)
 router.get('/:week', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    // Decode the week label from URL
-    const week = decodeURIComponent(req.params.week);
+    const { week } = req.params;
+    if (!isValidWeek(week)) {
+      return res.status(400).json({ error: 'week must be an ISO date (YYYY-MM-DD)' });
+    }
 
-    // Get menu ID
-    const menuResult = await db.query(
-      'SELECT id FROM menus WHERE week_label = $1',
+    // Per-menu-item totals this week, dynamic by whatever category actually
+    // appears (Regular, Large, Breakfast, By The LB, anything staff typed) --
+    // mirrors adminOrders.js's /this-week menuTotals query.
+    const menuTotalsResult = await db.query(
+      `SELECT m.id AS menu_id, m.name, m.category, o.day_of_week, SUM(o.quantity) AS quantity
+       FROM orders o
+       JOIN menus m ON o.menu_id = m.id
+       WHERE ${WEEK_BOUNDARY} = $1::date
+       GROUP BY m.id, m.name, m.category, o.day_of_week
+       ORDER BY m.name, m.category`,
       [week]
     );
 
-    if (menuResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Week not found' });
-    }
+    const menuIds = [...new Set(menuTotalsResult.rows.map((r) => r.menu_id))];
+    const linkedResult = menuIds.length > 0
+      ? await db.query(`SELECT DISTINCT menu_id FROM menu_plan_recipes WHERE menu_id = ANY($1::int[])`, [menuIds])
+      : { rows: [] };
+    const linkedMenuIds = new Set(linkedResult.rows.map((r) => r.menu_id));
 
-    const menuId = menuResult.rows[0].id;
-
-    // Get all recipes for this week
-    const recipesResult = await db.query(
-      `SELECT id, recipe_name, day_of_week FROM menu_recipes WHERE menu_id = $1 ORDER BY day_of_week`,
-      [menuId]
-    );
-
-    // Get all customer order totals for this week
-    const customerOrdersResult = await db.query(
-      `SELECT ot.customer_id, c.name, ot.total_meals_monday, ot.total_meals_thursday, ot.breakfast_meals
-       FROM order_totals ot
-       JOIN customers c ON ot.customer_id = c.id
-       WHERE ot.menu_id = $1
-       ORDER BY c.name`,
-      [menuId]
-    );
-
-    // Count regular vs large based on customer names
-    let regularCount = 0;
-    let largeCount = 0;
-
-    for (const order of customerOrdersResult.rows) {
-      if (order.name.includes('LARGE')) {
-        largeCount += 1;
-      } else {
-        regularCount += 1;
+    // Real aggregate ingredient need this week, summed across every linked
+    // menu item's recipe(s) -- exactly what adminProductionPlan.js already
+    // does for the Plate Builder, applied here to what's actually ordered.
+    const ingredientTotals = {}; // inventory_id -> { name, unitPriceCents, gramsNeeded }
+    for (const row of menuTotalsResult.rows) {
+      if (!linkedMenuIds.has(row.menu_id)) continue;
+      const qty = parseFloat(row.quantity) || 0;
+      const links = await db.query(`SELECT recipe_id, servings FROM menu_plan_recipes WHERE menu_id = $1`, [row.menu_id]);
+      for (const link of links.rows) {
+        const needs = await getRecipeIngredientNeeds(link.recipe_id, parseFloat(link.servings));
+        for (const ing of needs) {
+          if (!ingredientTotals[ing.inventoryId]) {
+            ingredientTotals[ing.inventoryId] = { name: ing.name, unitPriceCents: ing.unitPriceCents, gramsNeeded: 0 };
+          }
+          ingredientTotals[ing.inventoryId].gramsNeeded += ing.gramsNeeded * qty;
+        }
       }
     }
 
-    // Calculate total servings
-    const totalServings = customerOrdersResult.rows.reduce(
-      (sum, order) => sum + (order.total_meals_monday || 0) + (order.total_meals_thursday || 0) + (order.breakfast_meals || 0),
-      0
+    const invIds = Object.keys(ingredientTotals);
+    const stockResult = invIds.length > 0
+      ? await db.query(`SELECT id, category, current_stock_g FROM inventory WHERE id = ANY($1::int[])`, [invIds])
+      : { rows: [] };
+    const stockById = {};
+    for (const r of stockResult.rows) stockById[r.id] = r;
+
+    let totalCostCents = 0;
+    const ingredients = Object.entries(ingredientTotals).map(([invId, ing]) => {
+      const neededG = Math.round(ing.gramsNeeded);
+      const costCents = ing.unitPriceCents != null ? Math.round((ing.unitPriceCents / 453.592) * ing.gramsNeeded) : 0;
+      totalCostCents += costCents;
+      return {
+        name: ing.name,
+        category: stockById[invId]?.category || null,
+        needed_g: neededG,
+        available_g: parseFloat(stockById[invId]?.current_stock_g) || 0,
+        unit_price_cents: ing.unitPriceCents || 0,
+        cost_cents: costCents,
+      };
+    }).sort((a, b) => b.needed_g - a.needed_g);
+
+    // Same summary numbers as Orders "This Week" -- same query, same boundary.
+    const summaryResult = await db.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN o.day_of_week ILIKE 'monday' THEN o.quantity ELSE 0 END), 0) AS monday_meals,
+         COALESCE(SUM(CASE WHEN o.day_of_week ILIKE 'thursday' THEN o.quantity ELSE 0 END), 0) AS thursday_meals,
+         COALESCE(SUM(CASE WHEN m.category = 'Breakfast' THEN o.quantity ELSE 0 END), 0) AS breakfast_meals,
+         COALESCE(SUM(o.quantity), 0) AS total_meals
+       FROM orders o
+       LEFT JOIN menus m ON o.menu_id = m.id
+       WHERE ${WEEK_BOUNDARY} = $1::date`,
+      [week]
     );
+    const summary = summaryResult.rows[0];
 
-    // Get all inventory items with stock and pricing
-    const inventoryResult = await db.query(
-      `SELECT id, name, category, unit_price_cents, current_stock_g FROM inventory ORDER BY category, name`
+    // Real days actually present this week, not hardcoded to Monday/Thursday.
+    const prepDays = [...new Set(menuTotalsResult.rows.map((r) => r.day_of_week).filter(Boolean))]
+      .map((d) => d.charAt(0).toUpperCase() + d.slice(1));
+
+    // One row per customer, Monday/Thursday/Breakfast split -- replaces the
+    // old order_totals join with the same live boundary as everything else.
+    const ordersResult = await db.query(
+      `SELECT c.id, c.name,
+         STRING_AGG(DISTINCT o.notes, '; ') FILTER (WHERE o.notes IS NOT NULL AND o.notes != '') AS notes,
+         COALESCE(SUM(CASE WHEN o.day_of_week ILIKE 'monday' THEN o.quantity ELSE 0 END), 0) AS total_meals_monday,
+         COALESCE(SUM(CASE WHEN o.day_of_week ILIKE 'thursday' THEN o.quantity ELSE 0 END), 0) AS total_meals_thursday,
+         COALESCE(SUM(CASE WHEN m.category = 'Breakfast' THEN o.quantity ELSE 0 END), 0) AS breakfast_meals,
+         COALESCE(SUM(o.quantity), 0) AS total_meals
+       FROM orders o
+       JOIN customers c ON o.customer_id = c.id
+       LEFT JOIN menus m ON o.menu_id = m.id
+       WHERE ${WEEK_BOUNDARY} = $1::date
+       GROUP BY c.id, c.name
+       ORDER BY c.name`,
+      [week]
     );
-
-    // Convert to ingredient format with costs
-    const ingredients = inventoryResult.rows.map(row => ({
-      name: row.name,
-      category: row.category,
-      available_g: row.current_stock_g || 0,
-      unit_price_cents: row.unit_price_cents || 0,
-      cost_cents: Math.round(((row.unit_price_cents || 0) / 453.592) * (row.current_stock_g || 0)),
-    }));
-
-    // Calculate total cost of current inventory
-    let totalCost = 0;
-    for (const ing of ingredients) {
-      totalCost += ing.cost_cents;
-    }
-
-    // Add counts to recipes
-    const recipesWithCounts = recipesResult.rows.map(recipe => ({
-      recipe_id: recipe.id,
-      recipe_name: recipe.recipe_name,
-      day_of_week: recipe.day_of_week,
-      regular_count: regularCount,
-      large_count: largeCount,
-    }));
 
     res.json({
       data: {
         week,
-        recipes: recipesWithCounts,
-        ingredients: ingredients,
+        recipes: menuTotalsResult.rows.map((row) => ({
+          menu_id: row.menu_id,
+          name: row.name,
+          category: row.category,
+          day_of_week: row.day_of_week,
+          quantity: parseFloat(row.quantity) || 0,
+          recipe_linked: linkedMenuIds.has(row.menu_id),
+        })),
+        ingredients,
         summary: {
-          total_cost_cents: Math.round(totalCost),
-          total_servings: totalServings,
+          total_cost_cents: totalCostCents,
+          total_servings: parseInt(summary.total_meals, 10) || 0,
           total_ingredients: ingredients.length,
-          prep_days: ['Monday', 'Thursday'],
+          prep_days: prepDays,
+          monday_meals: parseInt(summary.monday_meals, 10) || 0,
+          thursday_meals: parseInt(summary.thursday_meals, 10) || 0,
+          breakfast_meals: parseInt(summary.breakfast_meals, 10) || 0,
         },
-        orders: customerOrdersResult.rows,
+        orders: ordersResult.rows.map((row) => ({
+          id: row.id,
+          name: row.name,
+          notes: row.notes,
+          total_meals_monday: parseInt(row.total_meals_monday, 10) || 0,
+          total_meals_thursday: parseInt(row.total_meals_thursday, 10) || 0,
+          breakfast_meals: parseInt(row.breakfast_meals, 10) || 0,
+          total_meals: parseInt(row.total_meals, 10) || 0,
+        })),
       },
     });
   } catch (error) {
@@ -123,148 +188,102 @@ router.get('/:week', requireAuth, requireRole('admin'), async (req, res) => {
   }
 });
 
-// GET /api/admin/prep/:week/:recipeId - Get detailed info for a specific recipe
-router.get('/:week/:recipeId', requireAuth, requireRole('admin'), async (req, res) => {
+// GET /api/admin/prep/:week/:menuId - real detail for one specific menu item
+// (one specific format/category row, e.g. "Chicken Shawarma... / Regular")
+router.get('/:week/:menuId', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    // Decode the week label from URL
-    const week = decodeURIComponent(req.params.week);
-    const recipeId = req.params.recipeId;
+    const { week, menuId } = req.params;
+    if (!isValidWeek(week)) {
+      return res.status(400).json({ error: 'week must be an ISO date (YYYY-MM-DD)' });
+    }
 
-    // Get menu ID
-    const menuResult = await db.query(
-      'SELECT id FROM menus WHERE week_label = $1',
-      [week]
-    );
-
+    const menuResult = await db.query(`SELECT id, name, category FROM menus WHERE id = $1`, [menuId]);
     if (menuResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Week not found' });
+      return res.status(404).json({ error: 'Menu item not found' });
     }
+    const menu = menuResult.rows[0];
 
-    const menuId = menuResult.rows[0].id;
-
-    // Get recipe details
-    const recipeResult = await db.query(
-      `SELECT id, recipe_name, day_of_week, recipe_id FROM menu_recipes WHERE id = $1 AND menu_id = $2`,
-      [recipeId, menuId]
+    // Real customers who ordered this specific item this week, straight from
+    // orders + customers -- no string-matching a "LARGE" naming convention.
+    const ordersResult = await db.query(
+      `SELECT o.id, o.quantity, o.notes, o.day_of_week, c.id AS customer_id, c.name AS customer_name
+       FROM orders o
+       JOIN customers c ON o.customer_id = c.id
+       WHERE o.menu_id = $1 AND ${WEEK_BOUNDARY} = $2::date
+       ORDER BY c.name`,
+      [menuId, week]
     );
 
-    if (recipeResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Recipe not found' });
-    }
+    const totalQty = ordersResult.rows.reduce((sum, o) => sum + (parseFloat(o.quantity) || 0), 0);
+    const day = ordersResult.rows[0]?.day_of_week || null;
 
-    const recipe = recipeResult.rows[0];
-
-    // Get all customers for this week
-    const customersResult = await db.query(
-      `SELECT c.id, c.name, c.notes, ot.total_meals_monday, ot.total_meals_thursday, ot.breakfast_meals
-       FROM order_totals ot
-       JOIN customers c ON ot.customer_id = c.id
-       WHERE ot.menu_id = $1
-       ORDER BY c.name`,
+    const recipeLinksResult = await db.query(
+      `SELECT mpr.recipe_id, mpr.servings, r.name AS recipe_name
+       FROM menu_plan_recipes mpr JOIN recipes r ON r.recipe_id = mpr.recipe_id
+       WHERE mpr.menu_id = $1`,
       [menuId]
     );
-
-    // Split by regular vs large
-    const regularCustomers = customersResult.rows.filter(c => !c.name.includes('LARGE'));
-    const largeCustomers = customersResult.rows.filter(c => c.name.includes('LARGE'));
-
-    // Get ingredients for this recipe from inventory
-    // First, try to find a linked recipe in the recipes table
-    const linkedRecipe = await db.query(
-      `SELECT recipe_id FROM menu_recipes WHERE id = $1`,
-      [recipe.id]
-    );
+    const recipeLinked = recipeLinksResult.rows.length > 0;
 
     let ingredients = [];
-    let totalCogs = 0;
-    let cogsPerPortion = 0;
+    let totalCogsCents = 0;
 
-    // If we have a linked recipe, get its ingredients
-    if (linkedRecipe.rows.length > 0 && linkedRecipe.rows[0].recipe_id) {
-      const recipeId = linkedRecipe.rows[0].recipe_id;
+    if (recipeLinked) {
+      const ingTotals = {};
+      for (const link of recipeLinksResult.rows) {
+        const needs = await getRecipeIngredientNeeds(link.recipe_id, parseFloat(link.servings));
+        for (const ing of needs) {
+          if (!ingTotals[ing.inventoryId]) {
+            ingTotals[ing.inventoryId] = { name: ing.name, unitPriceCents: ing.unitPriceCents, gramsNeeded: 0 };
+          }
+          ingTotals[ing.inventoryId].gramsNeeded += ing.gramsNeeded * totalQty;
+        }
+      }
 
-      // Get recipe info (servings)
-      const recipeInfo = await db.query(
-        `SELECT servings FROM recipes WHERE recipe_id = $1`,
-        [recipeId]
-      );
+      const invIds = Object.keys(ingTotals);
+      const stockResult = invIds.length > 0
+        ? await db.query(`SELECT id, category, current_stock_g FROM inventory WHERE id = ANY($1::int[])`, [invIds])
+        : { rows: [] };
+      const stockById = {};
+      for (const r of stockResult.rows) stockById[r.id] = r;
 
-      const servings = recipeInfo.rows[0]?.servings || 1;
-
-      const recipeIngredientsResult = await db.query(
-        `SELECT ri.quantity_g, i.id, i.name, i.category, i.unit_price_cents, i.current_stock_g
-         FROM recipe_ingredients ri
-         JOIN inventory i ON ri.inventory_id = i.id
-         WHERE ri.recipe_id = $1`,
-        [recipeId]
-      );
-
-      // Calculate cost per ingredient for this recipe
-      recipeIngredientsResult.rows.forEach(ing => {
-        const costCents = Math.round(((ing.unit_price_cents || 0) / 453.592) * ing.quantity_g);
-        totalCogs += costCents;
-      });
-
-      // Cost per serving of this recipe
-      cogsPerPortion = Math.round(totalCogs / servings);
-
-      ingredients = recipeIngredientsResult.rows.map(ing => {
-        const costCents = Math.round(((ing.unit_price_cents || 0) / 453.592) * ing.quantity_g);
+      ingredients = Object.entries(ingTotals).map(([invId, ing]) => {
+        const costCents = ing.unitPriceCents != null ? Math.round((ing.unitPriceCents / 453.592) * ing.gramsNeeded) : 0;
+        totalCogsCents += costCents;
         return {
           name: ing.name,
-          category: ing.category,
-          quantity_g: ing.quantity_g,
-          unit_price_cents: ing.unit_price_cents || 0,
+          category: stockById[invId]?.category || null,
+          quantity_g: Math.round(ing.gramsNeeded),
+          unit_price_cents: ing.unitPriceCents || 0,
           cost_cents: costCents,
-          available_g: ing.current_stock_g || 0,
+          available_g: parseFloat(stockById[invId]?.current_stock_g) || 0,
         };
-      });
-    } else {
-      // Fallback: show all inventory with per-portion cost
-      const allInventory = await db.query(
-        `SELECT id, name, category, unit_price_cents, current_stock_g FROM inventory ORDER BY category, name`
-      );
-
-      const totalPortions = regularCustomers.length + largeCustomers.length || 1;
-
-      ingredients = allInventory.rows.map(ing => {
-        const costCents = Math.round(((ing.unit_price_cents || 0) / 453.592) * (ing.current_stock_g || 0));
-        totalCogs += costCents;
-        return {
-          name: ing.name,
-          category: ing.category,
-          quantity_g: 0,
-          unit_price_cents: ing.unit_price_cents || 0,
-          cost_cents: costCents,
-          available_g: ing.current_stock_g || 0,
-        };
-      });
-
-      cogsPerPortion = Math.round(totalCogs / totalPortions);
+      }).sort((a, b) => b.quantity_g - a.quantity_g);
     }
+
+    const cogsPerPortion = totalQty > 0 ? Math.round(totalCogsCents / totalQty) : 0;
 
     res.json({
       data: {
-        recipe: {
-          id: recipe.id,
-          name: recipe.recipe_name,
-          day: recipe.day_of_week,
-        },
-        regular_customers: regularCustomers,
-        large_customers: largeCustomers,
-        ingredients: ingredients,
+        recipe: { id: menu.id, name: menu.name, category: menu.category, day },
+        recipe_linked: recipeLinked,
+        customers: ordersResult.rows.map((row) => ({
+          id: row.customer_id,
+          name: row.customer_name,
+          notes: row.notes,
+          quantity: parseFloat(row.quantity) || 0,
+        })),
+        ingredients,
         summary: {
-          total_regular: regularCustomers.length,
-          total_large: largeCustomers.length,
-          total_portions: regularCustomers.length + largeCustomers.length,
-          total_recipe_cost_cents: totalCogs,
+          total_portions: totalQty,
+          total_recipe_cost_cents: totalCogsCents,
           cogs_per_portion_cents: cogsPerPortion,
         },
       },
     });
   } catch (error) {
-    console.error('Error fetching recipe details:', error);
-    res.status(500).json({ error: 'Failed to fetch recipe details', details: error.message });
+    console.error('Error fetching menu item details:', error);
+    res.status(500).json({ error: 'Failed to fetch menu item details', details: error.message });
   }
 });
 
