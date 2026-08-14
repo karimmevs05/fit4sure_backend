@@ -141,6 +141,15 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
     const itemStatus = {}; // menu_id -> 'ready' | 'blocked' | 'unlinked'
     const shortByIngredient = {}; // inventory_id -> { name, shortG, affected: Set<string> }
 
+    // Margin numerator/denominator, but ONLY for items where every needed
+    // ingredient has a real unit_price_cents -- a recipe-linked item with
+    // even one unpriced ingredient (common: most inventory rows have no
+    // price yet) would otherwise silently count as near-zero cost and
+    // blow the margin number up to something like 97%. Partial pricing
+    // data must not produce a number that reads as complete.
+    let linkedRevenueCents = 0;
+    let linkedCostCents = 0;
+
     for (const row of menuTotalsResult.rows) {
       if (!linkedMenuIds.has(row.id)) {
         itemStatus[row.id] = 'unlinked';
@@ -161,20 +170,37 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
 
       const invIds = rowNeeds.map((n) => n.inventoryId);
       const stockResult = invIds.length > 0
-        ? await db.query(`SELECT id, current_stock_g FROM inventory WHERE id = ANY($1::int[])`, [invIds])
+        ? await db.query(`SELECT id, current_stock_g, unit_price_cents FROM inventory WHERE id = ANY($1::int[])`, [invIds])
         : { rows: [] };
       const stockById = {};
-      for (const r of stockResult.rows) stockById[r.id] = parseFloat(r.current_stock_g) || 0;
+      const priceById = {};
+      for (const r of stockResult.rows) {
+        stockById[r.id] = parseFloat(r.current_stock_g) || 0;
+        priceById[r.id] = r.unit_price_cents;
+      }
 
       let blocked = false;
+      let rowCostCents = 0;
+      let fullyPriced = rowNeeds.length > 0;
       for (const n of rowNeeds) {
         if (n.gramsNeeded > (stockById[n.inventoryId] || 0)) {
           blocked = true;
           if (!shortByIngredient[n.inventoryId]) shortByIngredient[n.inventoryId] = { name: n.name, shortG: 0, affected: new Set() };
           shortByIngredient[n.inventoryId].affected.add(`${row.day_of_week || 'unscheduled'} — ${row.name}`);
         }
+        const priceCents = priceById[n.inventoryId];
+        if (priceCents == null) {
+          fullyPriced = false;
+        } else {
+          rowCostCents += Math.round((priceCents / 453.592) * n.gramsNeeded);
+        }
       }
       itemStatus[row.id] = blocked ? 'blocked' : 'ready';
+
+      if (fullyPriced) {
+        linkedRevenueCents += Math.round((parseFloat(row.revenue) || 0) * 100);
+        linkedCostCents += rowCostCents;
+      }
     }
 
     // Compute real shortfall (needed vs total current stock) for the alert banner
@@ -196,24 +222,8 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
       }))
       .sort((a, b) => b.short_lb - a.short_lb);
 
-    // Known margin: revenue and cost scoped ONLY to recipe-linked items, so
-    // an incomplete recipe library doesn't silently understate cost and
-    // overstate margin. Null (not 0%) when there's no linked revenue yet.
-    let linkedRevenueCents = 0;
-    let linkedCostCents = 0;
-    for (const row of menuTotalsResult.rows) {
-      if (itemStatus[row.id] === 'unlinked') continue;
-      linkedRevenueCents += Math.round((parseFloat(row.revenue) || 0) * 100);
-    }
-    if (Object.keys(ingredientTotals).length > 0) {
-      const priceResult = await db.query(`SELECT id, unit_price_cents FROM inventory WHERE id = ANY($1::int[])`, [Object.keys(ingredientTotals)]);
-      const priceById = {};
-      for (const r of priceResult.rows) priceById[r.id] = r.unit_price_cents;
-      for (const [invId, ing] of Object.entries(ingredientTotals)) {
-        const priceCents = priceById[invId];
-        if (priceCents != null) linkedCostCents += Math.round((priceCents / 453.592) * ing.gramsNeeded);
-      }
-    }
+    // Null (not 0%) when there's no fully-priced linked revenue yet -- an
+    // absent number is honest, a fabricated 0% or 97% is not.
     const knownMarginPct = linkedRevenueCents > 0 ? +(((linkedRevenueCents - linkedCostCents) / linkedRevenueCents) * 100).toFixed(1) : null;
 
     const summaryResult = await db.query(`
