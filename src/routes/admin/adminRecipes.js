@@ -30,6 +30,15 @@ function calculateIngredientCost(unitPriceCents, quantityG) {
 
 const GRAMS_PER_POUND = 455 // matches this app's stated "1 lb (455g)" convention
 
+// Join structured steps into the legacy plain-text `instructions` column so
+// anything still reading that column (kiosk display, older UI) keeps working.
+function stepsToInstructionsText(steps) {
+  if (!steps || steps.length === 0) return null
+  return steps
+    .map((s, i) => `${i + 1}. ${s.title ? s.title + ': ' : ''}${s.description}`)
+    .join('\n')
+}
+
 // Calculate recipe macros from ingredients
 async function calculateRecipeMacros(recipeId, servings) {
   const ingredientsResult = await pool.query(
@@ -158,7 +167,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
 // stored at creation time.
 // Expected `ingredients` shape: [{ inventory_id: number, quantity_g: number }]
 router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
-  const { name, category, prep_time_minutes, servings, instructions, calories, protein_g, carbs_g, fat_g, tags, image, ingredients } = req.body
+  const { name, category, prep_time_minutes, servings, instructions, calories, protein_g, carbs_g, fat_g, tags, image, ingredients, steps } = req.body
 
   if (!name) return res.status(400).json({ error: 'name is required' })
 
@@ -170,7 +179,7 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
         image, created_by_user_id
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING *`,
-      [name, category || null, prep_time_minutes || null, servings || 1, instructions || null,
+      [name, category || null, prep_time_minutes || null, servings || 1, stepsToInstructionsText(steps) || instructions || null,
        calories || 0, protein_g || 0, carbs_g || 0, fat_g || 0, 0, tags || [], image || null, req.userId]
     )
 
@@ -184,6 +193,19 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
           `INSERT INTO recipe_ingredients (recipe_id, inventory_id, quantity_g)
            VALUES ($1, $2, $3)`,
           [recipe.recipe_id, ing.inventory_id, ing.quantity_g]
+        )
+      }
+    }
+
+    // Insert prep steps, in the order they were submitted
+    if (steps && steps.length > 0) {
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i]
+        if (!step.description) continue
+        await pool.query(
+          `INSERT INTO recipe_steps (recipe_id, step_number, title, description, time_estimate_minutes)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [recipe.recipe_id, i + 1, step.title || null, step.description, step.time_estimate_minutes || null]
         )
       }
     }
@@ -205,11 +227,19 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
     if (!recipeResult.rows[0]) return res.status(404).json({ error: 'Recipe not found' })
 
     const ingredientsResult = await pool.query(
-      `SELECT ri.id, ri.inventory_id, i.name, ri.quantity_g, i.unit_price_cents, i.protein_per_100g, i.carbs_per_100g, i.fat_per_100g, i.calories_per_100g
+      `SELECT ri.id, ri.inventory_id, i.name, i.category, ri.quantity_g, i.unit_price_cents, i.protein_per_100g, i.carbs_per_100g, i.fat_per_100g, i.calories_per_100g
        FROM recipe_ingredients ri
        LEFT JOIN inventory i ON ri.inventory_id = i.id
        WHERE ri.recipe_id = $1
        ORDER BY i.name`,
+      [req.params.recipe_id]
+    )
+
+    const stepsResult = await pool.query(
+      `SELECT id, step_number, title, description, time_estimate_minutes
+       FROM recipe_steps
+       WHERE recipe_id = $1
+       ORDER BY step_number`,
       [req.params.recipe_id]
     )
 
@@ -233,7 +263,8 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
         cost_per_serving_cents: costPerServingCents,
         cost_per_pound_cents: costPerPoundCents(totalCostCents, totalWeightG),
         total_recipe_cost_cents: totalCostCents,
-        ingredients: ingredientsWithCosts
+        ingredients: ingredientsWithCosts,
+        steps: stepsResult.rows
       }
     })
   } catch (err) {
@@ -245,7 +276,7 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
 // If `ingredients` is provided, it fully replaces the recipe's ingredient list
 // (delete-then-recreate, same pattern used on create).
 router.put('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) => {
-  const { name, category, prep_time_minutes, servings, instructions, calories, protein_g, carbs_g, fat_g, image, ingredients } = req.body
+  const { name, category, prep_time_minutes, servings, instructions, calories, protein_g, carbs_g, fat_g, image, ingredients, steps } = req.body
 
   if (!name) return res.status(400).json({ error: 'name is required' })
 
@@ -257,7 +288,7 @@ router.put('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
         fat_g = $9, image = $10, updated_at = NOW()
        WHERE recipe_id = $11
        RETURNING *`,
-      [name, category || null, prep_time_minutes || null, servings || 1, instructions || null,
+      [name, category || null, prep_time_minutes || null, servings || 1, stepsToInstructionsText(steps) || instructions || null,
        calories || 0, protein_g || 0, carbs_g || 0, fat_g || 0, image || null, req.params.recipe_id]
     )
 
@@ -271,6 +302,19 @@ router.put('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
           `INSERT INTO recipe_ingredients (recipe_id, inventory_id, quantity_g)
            VALUES ($1, $2, $3)`,
           [req.params.recipe_id, ing.inventory_id, ing.quantity_g]
+        )
+      }
+    }
+
+    if (Array.isArray(steps)) {
+      await pool.query('DELETE FROM recipe_steps WHERE recipe_id = $1', [req.params.recipe_id])
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i]
+        if (!step.description) continue
+        await pool.query(
+          `INSERT INTO recipe_steps (recipe_id, step_number, title, description, time_estimate_minutes)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [req.params.recipe_id, i + 1, step.title || null, step.description, step.time_estimate_minutes || null]
         )
       }
     }

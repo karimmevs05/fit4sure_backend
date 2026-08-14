@@ -206,21 +206,26 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
     // Compute real shortfall (needed vs total current stock) for the alert banner
     const neededInvIds = Object.keys(shortByIngredient);
     if (neededInvIds.length > 0) {
-      const stockResult = await db.query(`SELECT id, current_stock_g FROM inventory WHERE id = ANY($1::int[])`, [neededInvIds]);
+      const stockResult = await db.query(`SELECT id, current_stock_g, category FROM inventory WHERE id = ANY($1::int[])`, [neededInvIds]);
       for (const r of stockResult.rows) {
         if (shortByIngredient[r.id]) {
           shortByIngredient[r.id].shortG = Math.max(0, (ingredientTotals[r.id]?.gramsNeeded || 0) - (parseFloat(r.current_stock_g) || 0));
+          shortByIngredient[r.id].category = r.category;
         }
       }
     }
+    // short_g (raw grams) instead of a pre-converted decimal lb -- the
+    // frontend formats protein-category shortfalls as lb:oz, everything
+    // else in grams, and shouldn't have to guess back from a rounded decimal.
     const alerts = Object.values(shortByIngredient)
       .filter((s) => s.shortG > 0)
       .map((s) => ({
         ingredient: s.name,
-        short_lb: +(s.shortG / 453.592).toFixed(1),
+        category: s.category || null,
+        short_g: Math.round(s.shortG),
         affected: Array.from(s.affected),
       }))
-      .sort((a, b) => b.short_lb - a.short_lb);
+      .sort((a, b) => b.short_g - a.short_g);
 
     // Null (not 0%) when there's no fully-priced linked revenue yet -- an
     // absent number is honest, a fabricated 0% or 97% is not.
