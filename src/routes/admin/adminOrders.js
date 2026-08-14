@@ -3,6 +3,8 @@ const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const { google } = require('googleapis');
+const { CATEGORY_PRICES, findOrCreateMenu, getWeeklyMenu } = require('../../services/orderingService');
+const { getRecipeIngredientNeeds } = require('../../utils/recipeCost');
 
 // The Google Sheet behind the weekly order Form. The "Order_Details" tab is
 // already cleaned into (Timestamp, Client, Category, Meal Name, Qty, Notes)
@@ -11,51 +13,32 @@ const { google } = require('googleapis');
 const ORDERS_SPREADSHEET_ID = '1k8n2nSF1BcQly23muB6Pp9A6rFEefZRTdnn4JDWAVtY';
 const ORDERS_SHEET_NAME = 'Order_Details';
 
-// Known price tiers (fit4sure.net).
-const CATEGORY_PRICES = {
-  Regular: 13.79,
-  Large: 16.79,
-  Breakfast: 11.30,
-};
-
-// "By The LB" isn't one flat price -- it's always exactly 1lb of a single
-// chosen item, priced by what type of item it is (fit4sure.net/category/all-products).
-const BY_THE_LB_PRICES = {
-  Protein: 20.00,
-  Vegetable: 10.00,
-  Carbohydrate: 5.00,
-};
-
-// Classify a "By The LB" item name into Protein/Vegetable/Carbohydrate by
-// keyword, same approach used for Inventory categorization.
-function guessByTheLbType(name) {
-  const lower = (name || '').toLowerCase();
-  if (/chicken|beef|pork|turkey|fish|shrimp|salmon|steak|meat|egg|tofu/.test(lower)) return 'Protein';
-  if (/rice|potato|pasta|bread|oat|quinoa|bean|corn|tortilla|sweet potato/.test(lower)) return 'Carbohydrate';
-  return 'Vegetable';
+// The order form's meal names bake the delivery day into the text itself
+// using Unicode Mathematical Bold styling (e.g. "Steak Bowl — 𝐓𝐡𝐮𝐫𝐬𝐝𝐚𝐲
+// 𝐃𝐞𝐥𝐢𝐯𝐞𝐫𝐲"), which (a) never matches Menu Planner's plain-text name for
+// the same dish -- so every sync created a fresh duplicate menus row instead
+// of reusing one -- and (b) meant day_of_week never got parsed onto the
+// order at all. Normalize the bold styling back to plain ASCII first, since
+// regex/string comparisons don't recognize styled Unicode letters as
+// equivalent to their plain counterparts.
+function normalizeUnicodeBold(str) {
+  return (str || '').replace(/[\u{1D400}-\u{1D433}]/gu, (ch) => {
+    const cp = ch.codePointAt(0);
+    if (cp <= 0x1D419) return String.fromCharCode(cp - 0x1D400 + 65); // bold A-Z
+    return String.fromCharCode(cp - 0x1D41A + 97); // bold a-z
+  });
 }
 
-// Find an existing menu matching (name, category), or create one.
-async function findOrCreateMenu(name, category) {
-  const cleanName = (name || '').trim();
-  const cleanCategory = (category || '').trim();
-  if (!cleanName) return null;
-
-  const existing = await db.query(
-    `SELECT id FROM menus WHERE LOWER(name) = LOWER($1) AND LOWER(COALESCE(category, '')) = LOWER($2) LIMIT 1`,
-    [cleanName, cleanCategory]
-  );
-  if (existing.rows.length > 0) return existing.rows[0].id;
-
-  const price = cleanCategory === 'By The LB'
-    ? BY_THE_LB_PRICES[guessByTheLbType(cleanName)]
-    : CATEGORY_PRICES[cleanCategory] ?? null;
-
-  const created = await db.query(
-    `INSERT INTO menus (name, category, price, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) RETURNING id`,
-    [cleanName, cleanCategory || null, price]
-  );
-  return created.rows[0].id;
+// Splits "Dish Name — Monday Delivery" (in any mix of plain/bold Unicode)
+// into { cleanName: "Dish Name", dayOfWeek: "monday" }. Falls back to the
+// normalized-but-unsplit name with a null day when there's no such suffix.
+function extractDayFromMealName(rawName) {
+  const normalized = normalizeUnicodeBold(rawName).trim();
+  const match = normalized.match(/^(.*?)\s*[-—–]\s*(monday|thursday)\s+delivery\s*$/i);
+  if (match) {
+    return { cleanName: match[1].trim(), dayOfWeek: match[2].toLowerCase() };
+  }
+  return { cleanName: normalized, dayOfWeek: null };
 }
 
 // Find an existing customer by name, or create one.
@@ -85,8 +68,11 @@ async function findOrCreateCustomer(name) {
 async function importOrderRow({ timestamp, client, category, mealName, qty, dayOfWeek, notes }) {
   if (!client || !mealName || !qty) return { status: 'skipped', reason: 'missing client, mealName, or qty' };
 
+  const { cleanName, dayOfWeek: parsedDay } = extractDayFromMealName(mealName);
+  const resolvedDay = dayOfWeek || parsedDay;
+
   const customerId = await findOrCreateCustomer(client);
-  const menuId = await findOrCreateMenu(mealName, category);
+  const menuId = await findOrCreateMenu(cleanName, category);
   if (!customerId || !menuId) return { status: 'skipped', reason: 'could not resolve customer or menu' };
 
   const orderedAt = timestamp ? new Date(timestamp) : new Date();
@@ -108,7 +94,7 @@ async function importOrderRow({ timestamp, client, category, mealName, qty, dayO
   await db.query(
     `INSERT INTO orders (customer_id, menu_id, quantity, day_of_week, total_price, source, notes, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, 'form', $6, $7, NOW())`,
-    [customerId, menuId, quantity, dayOfWeek || null, totalPrice, notes || null, orderedAt]
+    [customerId, menuId, quantity, resolvedDay || null, totalPrice, notes || null, orderedAt]
   );
   return { status: 'imported' };
 }
@@ -118,8 +104,9 @@ async function importOrderRow({ timestamp, client, category, mealName, qty, dayO
 router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const ordersResult = await db.query(`
-      SELECT o.id, o.customer_id, c.name AS customer_name, o.menu_id, m.name AS menu_name,
-        m.category, o.quantity, o.day_of_week, o.total_price, o.source, o.notes, o.created_at
+      SELECT o.id, o.customer_id, c.name AS customer_name, c.dietary_restrictions, c.address,
+        o.menu_id, m.name AS menu_name, m.category, o.quantity, o.day_of_week, o.total_price,
+        o.source, o.notes, o.created_at
       FROM orders o
       JOIN customers c ON o.customer_id = c.id
       LEFT JOIN menus m ON o.menu_id = m.id
@@ -131,13 +118,103 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
       SELECT m.id, m.name, m.category, o.day_of_week,
         SUM(CASE WHEN m.category = 'Regular' THEN o.quantity ELSE 0 END) AS regular_count,
         SUM(CASE WHEN m.category = 'Large' THEN o.quantity ELSE 0 END) AS large_count,
-        SUM(o.quantity) AS total_count
+        SUM(o.quantity) AS total_count,
+        SUM(o.total_price) AS revenue
       FROM orders o
       JOIN menus m ON o.menu_id = m.id
       WHERE (date_trunc('week', o.created_at + interval '1 day') - interval '1 day') = (date_trunc('week', NOW() + interval '1 day') - interval '1 day')
       GROUP BY m.id, m.name, m.category, o.day_of_week
       ORDER BY m.name
     `);
+
+    // Real prep status per menu item: 'ready'/'blocked' only make sense for
+    // items linked to a recipe (menu_plan_recipes) -- everything else is
+    // honestly 'unlinked' rather than a fabricated "pending" guess. Reuses
+    // the same recipe-linkage + ingredient-need-vs-stock logic as adminPrep.js.
+    const menuIds = menuTotalsResult.rows.map((r) => r.id);
+    const linkedResult = menuIds.length > 0
+      ? await db.query(`SELECT DISTINCT menu_id FROM menu_plan_recipes WHERE menu_id = ANY($1::int[])`, [menuIds])
+      : { rows: [] };
+    const linkedMenuIds = new Set(linkedResult.rows.map((r) => r.menu_id));
+
+    const ingredientTotals = {}; // inventory_id -> gramsNeeded (across all linked items this week)
+    const itemStatus = {}; // menu_id -> 'ready' | 'blocked' | 'unlinked'
+    const shortByIngredient = {}; // inventory_id -> { name, shortG, affected: Set<string> }
+
+    for (const row of menuTotalsResult.rows) {
+      if (!linkedMenuIds.has(row.id)) {
+        itemStatus[row.id] = 'unlinked';
+        continue;
+      }
+      const qty = parseFloat(row.total_count) || 0;
+      const links = await db.query(`SELECT recipe_id, servings FROM menu_plan_recipes WHERE menu_id = $1`, [row.id]);
+      const rowNeeds = [];
+      for (const link of links.rows) {
+        const needs = await getRecipeIngredientNeeds(link.recipe_id, parseFloat(link.servings));
+        for (const ing of needs) {
+          const gramsNeeded = ing.gramsNeeded * qty;
+          rowNeeds.push({ inventoryId: ing.inventoryId, name: ing.name, gramsNeeded });
+          if (!ingredientTotals[ing.inventoryId]) ingredientTotals[ing.inventoryId] = { name: ing.name, gramsNeeded: 0 };
+          ingredientTotals[ing.inventoryId].gramsNeeded += gramsNeeded;
+        }
+      }
+
+      const invIds = rowNeeds.map((n) => n.inventoryId);
+      const stockResult = invIds.length > 0
+        ? await db.query(`SELECT id, current_stock_g FROM inventory WHERE id = ANY($1::int[])`, [invIds])
+        : { rows: [] };
+      const stockById = {};
+      for (const r of stockResult.rows) stockById[r.id] = parseFloat(r.current_stock_g) || 0;
+
+      let blocked = false;
+      for (const n of rowNeeds) {
+        if (n.gramsNeeded > (stockById[n.inventoryId] || 0)) {
+          blocked = true;
+          if (!shortByIngredient[n.inventoryId]) shortByIngredient[n.inventoryId] = { name: n.name, shortG: 0, affected: new Set() };
+          shortByIngredient[n.inventoryId].affected.add(`${row.day_of_week || 'unscheduled'} — ${row.name}`);
+        }
+      }
+      itemStatus[row.id] = blocked ? 'blocked' : 'ready';
+    }
+
+    // Compute real shortfall (needed vs total current stock) for the alert banner
+    const neededInvIds = Object.keys(shortByIngredient);
+    if (neededInvIds.length > 0) {
+      const stockResult = await db.query(`SELECT id, current_stock_g FROM inventory WHERE id = ANY($1::int[])`, [neededInvIds]);
+      for (const r of stockResult.rows) {
+        if (shortByIngredient[r.id]) {
+          shortByIngredient[r.id].shortG = Math.max(0, (ingredientTotals[r.id]?.gramsNeeded || 0) - (parseFloat(r.current_stock_g) || 0));
+        }
+      }
+    }
+    const alerts = Object.values(shortByIngredient)
+      .filter((s) => s.shortG > 0)
+      .map((s) => ({
+        ingredient: s.name,
+        short_lb: +(s.shortG / 453.592).toFixed(1),
+        affected: Array.from(s.affected),
+      }))
+      .sort((a, b) => b.short_lb - a.short_lb);
+
+    // Known margin: revenue and cost scoped ONLY to recipe-linked items, so
+    // an incomplete recipe library doesn't silently understate cost and
+    // overstate margin. Null (not 0%) when there's no linked revenue yet.
+    let linkedRevenueCents = 0;
+    let linkedCostCents = 0;
+    for (const row of menuTotalsResult.rows) {
+      if (itemStatus[row.id] === 'unlinked') continue;
+      linkedRevenueCents += Math.round((parseFloat(row.revenue) || 0) * 100);
+    }
+    if (Object.keys(ingredientTotals).length > 0) {
+      const priceResult = await db.query(`SELECT id, unit_price_cents FROM inventory WHERE id = ANY($1::int[])`, [Object.keys(ingredientTotals)]);
+      const priceById = {};
+      for (const r of priceResult.rows) priceById[r.id] = r.unit_price_cents;
+      for (const [invId, ing] of Object.entries(ingredientTotals)) {
+        const priceCents = priceById[invId];
+        if (priceCents != null) linkedCostCents += Math.round((priceCents / 453.592) * ing.gramsNeeded);
+      }
+    }
+    const knownMarginPct = linkedRevenueCents > 0 ? +(((linkedRevenueCents - linkedCostCents) / linkedRevenueCents) * 100).toFixed(1) : null;
 
     const summaryResult = await db.query(`
       SELECT
@@ -151,6 +228,16 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
       FROM orders o
       LEFT JOIN menus m ON o.menu_id = m.id
       WHERE (date_trunc('week', o.created_at + interval '1 day') - interval '1 day') = (date_trunc('week', NOW() + interval '1 day') - interval '1 day')
+    `);
+
+    // Same two numbers for last week, purely so the header can show a real
+    // week-over-week delta instead of a made-up trend arrow.
+    const lastWeekResult = await db.query(`
+      SELECT
+        COALESCE(SUM(CASE WHEN o.day_of_week ILIKE 'monday' THEN o.quantity ELSE 0 END), 0) AS monday_meals,
+        COALESCE(SUM(CASE WHEN o.day_of_week ILIKE 'thursday' THEN o.quantity ELSE 0 END), 0) AS thursday_meals
+      FROM orders o
+      WHERE (date_trunc('week', o.created_at + interval '1 day') - interval '1 day') = (date_trunc('week', NOW() + interval '1 day') - interval '1 day' - interval '7 days')
     `);
 
     const nonRespondersResult = await db.query(`
@@ -181,8 +268,14 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
     res.json({
       data: {
         orders: ordersResult.rows,
-        menuTotals: menuTotalsResult.rows,
-        summary: summaryResult.rows[0],
+        menuTotals: menuTotalsResult.rows.map((row) => ({ ...row, status: itemStatus[row.id] })),
+        summary: {
+          ...summaryResult.rows[0],
+          monday_meals_last_week: parseInt(lastWeekResult.rows[0].monday_meals, 10) || 0,
+          thursday_meals_last_week: parseInt(lastWeekResult.rows[0].thursday_meals, 10) || 0,
+          known_margin_pct: knownMarginPct,
+        },
+        alerts,
         nonResponders,
       },
     });
@@ -317,6 +410,26 @@ router.get('/non-responders', requireAuth, requireRole('admin'), async (req, res
   } catch (error) {
     console.error('Error fetching non-responders:', error);
     res.status(500).json({ error: 'Failed to fetch non-responders' });
+  }
+});
+
+// GET /api/admin/orders/weekly-menu - The real menu clients are ordering
+// from THIS delivery week, shaped for the "Add Order" picker grid: every
+// recipe the chef marked live per block in the Weekly Recipe Plan, each
+// offered in all 5 standing formats (Regular/Large/High Protein/Low
+// Carb/1 Pound) priced from CATEGORY_PRICES -- plus standing Breakfast
+// items that have actually been ordered before (keeps stale/test menu
+// entries with no real order history out of the Breakfast list).
+//
+// Sourced from `weekly_recipe_plan`, not the old plate-builder `menus`
+// table -- same planned_week_start formula Menu Planner itself uses, so
+// this always reflects whatever the chef most recently marked live there.
+router.get('/weekly-menu', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    res.json({ data: await getWeeklyMenu() });
+  } catch (error) {
+    console.error('Error fetching weekly menu:', error);
+    res.status(500).json({ error: 'Failed to fetch weekly menu' });
   }
 });
 
