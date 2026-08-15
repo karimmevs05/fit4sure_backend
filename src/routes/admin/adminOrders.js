@@ -255,6 +255,10 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
       WHERE (date_trunc('week', o.created_at + interval '1 day') - interval '1 day') = (date_trunc('week', NOW() + interval '1 day') - interval '1 day' - interval '7 days')
     `);
 
+    // Just id/name -- the Needs Follow-Up card only shows the customer name
+    // and an "Add New Order" button that opens a blank order form, so their
+    // previous order (still available from Order History if needed) isn't
+    // worth an extra per-customer query here.
     const nonRespondersResult = await db.query(`
       SELECT c.id, c.name
       FROM customers c
@@ -266,19 +270,7 @@ router.get('/this-week', requireAuth, requireRole('admin'), async (req, res) => 
         )
       ORDER BY c.name
     `);
-
-    const nonResponders = [];
-    for (const customer of nonRespondersResult.rows) {
-      const lastOrder = await db.query(`
-        SELECT m.name AS menu_name, m.category, o.quantity, o.day_of_week
-        FROM orders o
-        JOIN menus m ON o.menu_id = m.id
-        WHERE o.customer_id = $1
-          AND o.created_at = (SELECT MAX(created_at) FROM orders WHERE customer_id = $1)
-        ORDER BY m.name
-      `, [customer.id]);
-      nonResponders.push({ ...customer, lastOrder: lastOrder.rows });
-    }
+    const nonResponders = nonRespondersResult.rows;
 
     res.json({
       data: {
