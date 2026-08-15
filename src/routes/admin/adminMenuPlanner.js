@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const { computeYieldCorrectedRecipe } = require('./adminCookingMethods');
+const { getReceiptFallbackPriceCents } = require('../../utils/recipeCost');
 
 const CATEGORY_PRICES = { Regular: 13.79, Large: 16.79 };
 
@@ -136,6 +137,116 @@ router.post('/recipe-plan', requireAuth, requireRole('admin'), async (req, res) 
   } catch (error) {
     console.error('Error saving recipe plan:', error);
     res.status(500).json({ error: 'Failed to save recipe plan' });
+  }
+});
+
+const GRAMS_PER_POUND = 455; // matches this app's stated "1 lb (455g)" convention
+
+// Everything the chef needs to actually shop and prep for the week, derived
+// from the Weekly Recipe Plan: scale each selected recipe's ingredient list
+// up to its forecasted lb, then aggregate by real inventory ingredient
+// across every selected recipe in both blocks -- so "how much chicken
+// breast do I need this week" has one answer, not one per recipe. Cost is
+// computed the same way and rolled up per block for the financials view.
+router.get('/prep-and-financials', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { sunday } = await getNextWeekDates();
+
+    const planResult = await db.query(
+      `SELECT wrp.recipe_id, wrp.block, wrp.expected_volume, r.name AS recipe_name
+       FROM weekly_recipe_plan wrp
+       JOIN recipes r ON r.recipe_id = wrp.recipe_id
+       WHERE wrp.planned_week_start = $1`,
+      [sunday]
+    );
+
+    const financials = {
+      monday: { costCents: 0, lb: 0, recipeCount: 0 },
+      thursday: { costCents: 0, lb: 0, recipeCount: 0 },
+    };
+    const ingredientTotals = {}; // inventory_id -> aggregated row
+
+    // Each plan row's ingredient lookup is independent -- run them
+    // concurrently rather than one at a time (learned from the same N+1
+    // pattern in /plates earlier: sequential was 13.5s for a comparable
+    // per-plate loop, parallel was ~1.1s).
+    const perRecipe = await Promise.all(planResult.rows.map(async (planRow) => {
+      const ingResult = await db.query(
+        `SELECT ri.quantity_g, i.id AS inventory_id, i.name, i.category,
+                i.unit_price_cents, i.current_stock_g
+         FROM recipe_ingredients ri
+         LEFT JOIN inventory i ON ri.inventory_id = i.id
+         WHERE ri.recipe_id = $1`,
+        [planRow.recipe_id]
+      );
+
+      const totalRecipeWeightG = ingResult.rows.reduce((sum, r) => sum + (parseFloat(r.quantity_g) || 0), 0);
+      const forecastedG = (planRow.expected_volume || 0) * GRAMS_PER_POUND;
+      const scale = totalRecipeWeightG > 0 ? forecastedG / totalRecipeWeightG : 0;
+
+      let recipeCostCents = 0;
+      const ingredientNeeds = [];
+      for (const ing of ingResult.rows) {
+        const neededG = (parseFloat(ing.quantity_g) || 0) * scale;
+        // No price on file -- use the real price last actually paid on a
+        // receipt rather than treating the ingredient as free.
+        const unitPriceCents = ing.unit_price_cents ?? (ing.name ? await getReceiptFallbackPriceCents(ing.name) : null);
+        const costCents = unitPriceCents ? (unitPriceCents / 453.592) * neededG : 0;
+        recipeCostCents += costCents;
+        if (ing.inventory_id) {
+          ingredientNeeds.push({
+            inventoryId: ing.inventory_id,
+            name: ing.name,
+            category: ing.category,
+            unitPriceCents,
+            currentStockG: parseFloat(ing.current_stock_g) || 0,
+            neededG,
+          });
+        }
+      }
+      return { block: planRow.block, expectedVolume: planRow.expected_volume || 0, recipeCostCents, ingredientNeeds };
+    }));
+
+    for (const r of perRecipe) {
+      financials[r.block].costCents += r.recipeCostCents;
+      financials[r.block].lb += r.expectedVolume;
+      financials[r.block].recipeCount += 1;
+
+      for (const ing of r.ingredientNeeds) {
+        if (!ingredientTotals[ing.inventoryId]) {
+          ingredientTotals[ing.inventoryId] = {
+            name: ing.name,
+            category: ing.category,
+            neededG: 0,
+            unitPriceCents: ing.unitPriceCents,
+            currentStockG: ing.currentStockG,
+          };
+        }
+        ingredientTotals[ing.inventoryId].neededG += ing.neededG;
+      }
+    }
+
+    const ingredients = Object.values(ingredientTotals)
+      .map((i) => ({
+        ...i,
+        neededG: Math.round(i.neededG),
+        shortfallG: Math.max(0, Math.round(i.neededG - i.currentStockG)),
+      }))
+      .sort((a, b) => b.neededG - a.neededG);
+
+    financials.combined = {
+      costCents: financials.monday.costCents + financials.thursday.costCents,
+      lb: financials.monday.lb + financials.thursday.lb,
+      recipeCount: financials.monday.recipeCount + financials.thursday.recipeCount,
+    };
+    financials.monday.costCents = Math.round(financials.monday.costCents);
+    financials.thursday.costCents = Math.round(financials.thursday.costCents);
+    financials.combined.costCents = Math.round(financials.combined.costCents);
+
+    res.json({ data: { weekStart: sunday, ingredients, financials } });
+  } catch (error) {
+    console.error('Error fetching prep and financials:', error);
+    res.status(500).json({ error: 'Failed to fetch prep and financials' });
   }
 });
 

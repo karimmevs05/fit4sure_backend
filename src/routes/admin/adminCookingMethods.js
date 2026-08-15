@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
+const { getReceiptFallbackPriceCents } = require('../../utils/recipeCost');
 
 // ============================================================================
 // COOKING METHODS LIBRARY -- CRUD for the yield-% reference table
@@ -160,7 +161,10 @@ async function computeYieldCorrectedRecipe(recipeId, servings) {
     const protein = ing.protein_per_100g ? (ing.protein_per_100g * rawG) / 100 : 0;
     const carbs = ing.carbs_per_100g ? (ing.carbs_per_100g * rawG) / 100 : 0;
     const fat = ing.fat_per_100g ? (ing.fat_per_100g * rawG) / 100 : 0;
-    const cost = ing.unit_price_cents ? (ing.unit_price_cents / 453.592) * rawG : 0;
+    // No price on file (never in stock or never priced) -- use the real
+    // price last actually paid on a receipt rather than treating it free.
+    const unitPriceCents = ing.unit_price_cents ?? (await getReceiptFallbackPriceCents(ing.ingredient_name));
+    const cost = unitPriceCents ? (unitPriceCents / 453.592) * rawG : 0;
 
     totalRawG += rawG;
     totalCookedG += cookedG;

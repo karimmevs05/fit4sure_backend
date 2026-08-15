@@ -4,7 +4,7 @@ const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const vision = require('@google-cloud/vision');
 const fetch = require('node-fetch');
-const { syncInventoryFromReceiptItem } = require('../../services/inventorySync');
+const { syncInventoryFromReceiptItem, convertToGrams } = require('../../services/inventorySync');
 
 // Initialize Vision API client with credentials from env
 const getVisionClient = () => {
@@ -117,14 +117,20 @@ router.post('/save-receipt-items', requireAuth, requireRole('admin'), async (req
         continue;
       }
 
-      // Save product to database
+      // Save product to database. quantity+unit here (e.g. "2.5 lb") is
+      // converted to grams up front so it lands in the same
+      // last_purchase_weight_g column the AI photo scanner populates --
+      // one consistent field for recipe costing to derive a real $/lb from,
+      // regardless of which entry path the purchase came from.
+      const weightG = quantity ? convertToGrams(parseFloat(quantity), unit) : null;
       try {
         const productResult = await db.query(`
-          INSERT INTO receipt_products (name, category, unit, store, last_purchase_price_cents)
-          VALUES ($1, $2, $3, $4, $5)
+          INSERT INTO receipt_products (name, category, unit, store, last_purchase_price_cents, last_purchase_weight_g)
+          VALUES ($1, $2, $3, $4, $5, $6)
           ON CONFLICT (LOWER(name), store)
           DO UPDATE SET
             last_purchase_price_cents = EXCLUDED.last_purchase_price_cents,
+            last_purchase_weight_g = COALESCE(EXCLUDED.last_purchase_weight_g, receipt_products.last_purchase_weight_g),
             last_purchase_date = NOW(),
             purchase_count = receipt_products.purchase_count + 1
           RETURNING id, name, unit, store
@@ -133,7 +139,8 @@ router.post('/save-receipt-items', requireAuth, requireRole('admin'), async (req
           category,
           unit || 'g',
           vendor || 'Unknown',
-          Math.round(amount * 100) // Convert to cents
+          Math.round(amount * 100), // Convert to cents
+          weightG,
         ]);
 
         savedProducts.push(productResult.rows[0]);

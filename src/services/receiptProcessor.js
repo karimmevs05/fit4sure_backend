@@ -273,14 +273,19 @@ async function saveReceiptToDB(receiptData) {
         continue;
       }
 
-      // Save to receipt_products table
+      // Save to receipt_products table -- gramWeight is the real total food
+      // weight Gemini already extracted for this line (it feeds inventory
+      // stock updates below); persisting it here too is what lets recipe
+      // costing derive a real $/lb "last price on file" instead of just
+      // knowing the total dollar amount with no weight to divide it by.
       try {
         const productResult = await db.query(`
-          INSERT INTO receipt_products (name, category, unit, store, last_purchase_price_cents)
-          VALUES ($1, $2, $3, $4, $5)
+          INSERT INTO receipt_products (name, category, unit, store, last_purchase_price_cents, last_purchase_weight_g)
+          VALUES ($1, $2, $3, $4, $5, $6)
           ON CONFLICT (LOWER(name), store)
           DO UPDATE SET
             last_purchase_price_cents = EXCLUDED.last_purchase_price_cents,
+            last_purchase_weight_g = COALESCE(EXCLUDED.last_purchase_weight_g, receipt_products.last_purchase_weight_g),
             last_purchase_date = NOW(),
             purchase_count = receipt_products.purchase_count + 1
           RETURNING id, name, unit, store, category
@@ -290,6 +295,7 @@ async function saveReceiptToDB(receiptData) {
           item.unit || 'count',
           vendor || 'Unknown',
           Math.round(item.amount * 100), // Convert to cents
+          item.gramWeight != null && item.gramWeight > 0 ? item.gramWeight : null,
         ]);
 
         savedProducts.push(productResult.rows[0]);

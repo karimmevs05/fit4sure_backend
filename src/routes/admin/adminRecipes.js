@@ -1,6 +1,7 @@
 const express = require('express')
 const pool = require('../../config/db')
 const { requireAuth, requireRole } = require('../../middleware/auth')
+const { getReceiptFallbackPriceCents } = require('../../utils/recipeCost')
 
 const router = express.Router()
 
@@ -113,17 +114,20 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
       result.rows.map(async (recipe) => {
         try {
           const ingredientsResult = await pool.query(
-            `SELECT ri.quantity_g, i.unit_price_cents, i.suggested_serving_g
+            `SELECT ri.quantity_g, i.name, i.unit_price_cents, i.suggested_serving_g
              FROM recipe_ingredients ri
              LEFT JOIN inventory i ON ri.inventory_id = i.id
              WHERE ri.recipe_id = $1`,
             [recipe.recipe_id]
           )
 
-          // Calculate total cost from ingredients
-          const totalCostCents = ingredientsResult.rows.reduce((sum, ing) => {
-            return sum + calculateIngredientCost(ing.unit_price_cents, ing.quantity_g)
-          }, 0)
+          // Calculate total cost from ingredients -- falls back to the real
+          // last-paid receipt price when nothing's on file in inventory.
+          let totalCostCents = 0
+          for (const ing of ingredientsResult.rows) {
+            const unitPriceCents = ing.unit_price_cents ?? (ing.name ? await getReceiptFallbackPriceCents(ing.name) : null)
+            totalCostCents += calculateIngredientCost(unitPriceCents, ing.quantity_g)
+          }
 
           const costPerServingCents = recipe.servings ? Math.round(totalCostCents / recipe.servings) : 0
 
@@ -243,11 +247,21 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
       [req.params.recipe_id]
     )
 
-    // Calculate costs for each ingredient
-    const ingredientsWithCosts = ingredientsResult.rows.map(ing => ({
-      ...ing,
-      ingredient_cost_cents: calculateIngredientCost(ing.unit_price_cents, ing.quantity_g)
-    }))
+    // Calculate costs for each ingredient -- falls back to the real
+    // last-paid receipt price when nothing's on file in inventory, flagged
+    // so the UI can show it's an estimate rather than a set price.
+    const ingredientsWithCosts = await Promise.all(
+      ingredientsResult.rows.map(async (ing) => {
+        const fallbackCents = ing.unit_price_cents == null && ing.name ? await getReceiptFallbackPriceCents(ing.name) : null
+        const resolvedPriceCents = ing.unit_price_cents ?? fallbackCents
+        return {
+          ...ing,
+          unit_price_cents: resolvedPriceCents,
+          priced_from_receipt: fallbackCents != null,
+          ingredient_cost_cents: calculateIngredientCost(resolvedPriceCents, ing.quantity_g),
+        }
+      })
+    )
 
     // Calculate total cost from ingredients
     const totalCostCents = ingredientsWithCosts.reduce((sum, ing) => sum + (ing.ingredient_cost_cents || 0), 0)
