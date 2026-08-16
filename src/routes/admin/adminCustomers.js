@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
+const { checkStageTrigger } = require('../../services/automationEngine');
 
 // Fields shared by POST (create) and PUT (update) -- the full CRM profile
 const PROFILE_FIELDS = [
@@ -30,13 +31,19 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
         COALESCE(SUM(o.quantity), 0) AS total_meals_ordered,
         MAX(o.created_at) AS last_order_date,
         COALESCE(SUM(o.total_price), 0) * 100 AS lifetime_value_cents,
-        CASE WHEN MAX(o.created_at) IS NOT NULL
-          THEN EXTRACT(DAY FROM NOW() - MAX(o.created_at))::int
+        GREATEST(MAX(o.created_at), ca.last_activity_at) AS last_contact_at,
+        CASE WHEN GREATEST(MAX(o.created_at), ca.last_activity_at) IS NOT NULL
+          THEN EXTRACT(DAY FROM NOW() - GREATEST(MAX(o.created_at), ca.last_activity_at))::int
           ELSE NULL
         END AS days_since_last_contact
       FROM customers c
       LEFT JOIN orders o ON c.id = o.customer_id
-      GROUP BY c.id
+      LEFT JOIN LATERAL (
+        SELECT MAX(created_at) AS last_activity_at
+        FROM customer_activities
+        WHERE customer_id = c.id
+      ) ca ON true
+      GROUP BY c.id, ca.last_activity_at
       ORDER BY
         CASE WHEN c.sales_pipeline_stage = 'active' THEN 0 ELSE 1 END,
         total_meals_ordered DESC
@@ -88,49 +95,81 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
 // conversion probability, and engagement score for every customer based on
 // real order history (replaces the old /import-from-orders, which relied
 // on a table that never existed).
+//
+// "Active" is a claim about the present ("are they currently ordering"),
+// not a lifetime achievement -- so unlike the rest of the funnel, it has to
+// be re-evaluated every run in both directions: a customer with a recent
+// order should be (re)marked active even if they'd drifted to churned/
+// prospect earlier, and a customer marked active who's gone quiet needs to
+// actually lose that label, not keep it forever just because they crossed
+// a lifetime meal-count threshold once. Delivery is 2x/week (Mon/Thu), so
+// 14 days covers about two missed cycles before calling it at-risk, and 30
+// days of silence before calling it churned.
+//
+// A manually-set 'engaged' or 'trial' stage (via Edit Profile) is a human
+// judgment call this endpoint won't second-guess -- unless a real recent
+// order contradicts it, in which case the order wins and they become
+// active. Every other stage (prospect/active/at_risk/churned) is fair game
+// to move automatically based on order recency in either direction.
 router.post('/recompute-pipeline', requireAuth, requireRole('admin'), async (req, res) => {
+  const ACTIVE_WITHIN_DAYS = 14;
+  const AT_RISK_WITHIN_DAYS = 30;
+
   try {
     const customersResult = await db.query(`
       SELECT c.id, c.name, c.sales_pipeline_stage,
         COALESCE(SUM(o.quantity), 0) AS total_meals_ordered,
-        MAX(o.created_at) AS last_order_date
+        MAX(o.created_at) AS last_order_date,
+        CASE WHEN MAX(o.created_at) IS NOT NULL
+          THEN EXTRACT(DAY FROM NOW() - MAX(o.created_at))::int
+          ELSE NULL
+        END AS days_since_order
       FROM customers c
       LEFT JOIN orders o ON c.id = o.customer_id
       GROUP BY c.id
     `);
+
+    // Stages this endpoint is allowed to move a customer into/out of based
+    // on order recency. 'prospect' is included because that's the default
+    // every new customer starts at (including ones auto-created by the
+    // order sync) -- it's not a protected human judgment call the way
+    // 'engaged'/'trial' are, so a prospect who's actually ordering should
+    // graduate out of it automatically rather than staying stuck there.
+    const AUTO_MANAGED_STAGES = new Set(['prospect', 'active', 'at_risk', 'churned']);
 
     let updatedCount = 0;
     const updates = [];
 
     for (const customer of customersResult.rows) {
       const totalMeals = Number(customer.total_meals_ordered) || 0;
+      const daysSinceOrder = customer.days_since_order;
+      const currentStage = customer.sales_pipeline_stage;
+      const recentOrder = daysSinceOrder != null && daysSinceOrder <= ACTIVE_WITHIN_DAYS;
 
-      // Don't override an already-set terminal stage (active/churned) from
-      // the historical migration -- only recompute for stages that are
-      // meant to move through the funnel based on activity.
-      if (['active', 'churned'].includes(customer.sales_pipeline_stage)) continue;
+      // Manually-set funnel stages (engaged/trial) are a human's judgment
+      // call and stay untouched here unless a real recent order contradicts
+      // them -- an actual order is stronger evidence than a funnel guess
+      // made before it happened.
+      if (!AUTO_MANAGED_STAGES.has(currentStage) && !recentOrder) continue;
 
-      let stage = 'prospect';
-      let conversionProb = 30;
-      let engagementScore = 0;
+      let newStage;
+      if (recentOrder) newStage = 'active';
+      else if (daysSinceOrder == null) newStage = 'prospect'; // never ordered
+      else newStage = daysSinceOrder <= AT_RISK_WITHIN_DAYS ? 'at_risk' : 'churned';
 
-      if (totalMeals > 150) {
-        stage = 'active'; conversionProb = 100; engagementScore = 95;
-      } else if (totalMeals > 80) {
-        stage = 'trial'; conversionProb = 80; engagementScore = 70;
-      } else if (totalMeals > 40) {
-        stage = 'engaged'; conversionProb = 65; engagementScore = 55;
-      } else if (totalMeals > 0) {
-        stage = 'engaged'; conversionProb = 50; engagementScore = 40;
-      }
+      // No real change to make -- leave conversion/engagement untouched.
+      if (newStage === currentStage) continue;
+
+      const conversionProb = newStage === 'active' ? 100 : newStage === 'at_risk' ? 40 : newStage === 'prospect' ? 30 : 5;
+      const engagementScore = newStage === 'active' ? 95 : newStage === 'at_risk' ? 30 : newStage === 'prospect' ? 20 : 10;
 
       await db.query(
         `UPDATE customers SET sales_pipeline_stage = $1, conversion_probability = $2, engagement_score = $3, updated_at = NOW() WHERE id = $4`,
-        [stage, conversionProb, engagementScore, customer.id]
+        [newStage, conversionProb, engagementScore, customer.id]
       );
 
       updatedCount++;
-      updates.push({ name: customer.name, meals: totalMeals, stage, conversion: conversionProb });
+      updates.push({ name: customer.name, meals: totalMeals, from_stage: currentStage, to_stage: newStage, days_since_order: daysSinceOrder });
     }
 
     res.json({ success: true, updated: updatedCount, updates });
@@ -144,6 +183,15 @@ router.post('/recompute-pipeline', requireAuth, requireRole('admin'), async (req
 router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { id } = req.params;
+
+    // Fetch the current stage first so we can tell whether this update is
+    // actually a stage change worth logging.
+    let previousStage = null;
+    if (req.body.sales_pipeline_stage !== undefined) {
+      const current = await db.query('SELECT sales_pipeline_stage FROM customers WHERE id = $1', [id]);
+      previousStage = current.rows[0]?.sales_pipeline_stage ?? null;
+    }
+
     const updates = [];
     const values = [];
     let paramCount = 1;
@@ -168,6 +216,18 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const newStage = req.body.sales_pipeline_stage;
+    if (newStage !== undefined && newStage !== previousStage) {
+      await db.query(
+        `INSERT INTO customer_activities (customer_id, type, status, metadata, created_by_user_id)
+         VALUES ($1, 'stage_change', 'logged', $2, $3)`,
+        [id, JSON.stringify({ from_stage: previousStage, to_stage: newStage }), req.userId]
+      );
+
+      // Auto-enroll into any automation whose trigger is "enters this stage"
+      await checkStageTrigger(id, newStage);
     }
 
     res.json({ data: result.rows[0] });
