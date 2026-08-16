@@ -562,6 +562,40 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
   }
 });
 
+// POST /api/admin/orders/custom-plate - One-command "assign this simulated
+// plate to a real client" from the Plate Cost Simulator. Unlike the regular
+// findOrCreateMenu path, price isn't looked up from CATEGORY_PRICES (there's
+// no category for an arbitrary recipe combo) -- it's exactly what the
+// simulator computed, passed straight through. Always creates a fresh menus
+// row (category 'Custom') rather than trying to reuse one, since each
+// custom combo+serving-size is effectively one-off.
+router.post('/custom-plate', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { customerId, name, priceCents, dayOfWeek, notes } = req.body;
+    if (!customerId || !name || !priceCents) {
+      return res.status(400).json({ error: 'customerId, name, and priceCents are required' });
+    }
+
+    const menuResult = await db.query(
+      `INSERT INTO menus (name, category, price, created_at, updated_at) VALUES ($1, 'Custom', $2, NOW(), NOW()) RETURNING id`,
+      [name, priceCents / 100]
+    );
+    const menuId = menuResult.rows[0].id;
+
+    const result = await db.query(
+      `INSERT INTO orders (customer_id, menu_id, quantity, day_of_week, total_price, source, notes, created_at, updated_at)
+       VALUES ($1, $2, 1, $3, $4, 'manual', $5, NOW(), NOW())
+       RETURNING *`,
+      [customerId, menuId, dayOfWeek || null, priceCents / 100, notes || 'Custom plate from Plate Cost Simulator']
+    );
+
+    res.status(201).json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Error creating custom plate order:', error);
+    res.status(500).json({ error: 'Failed to create custom plate order' });
+  }
+});
+
 // PUT /api/admin/orders/:id - Update an order line
 router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
