@@ -312,8 +312,8 @@ async function saveReceiptToDB(receiptData) {
           : item.productName;
 
         const expenseResult = await db.query(`
-          INSERT INTO expenses (date, vendor, category, description, amount, status, receipt_scan_id)
-          VALUES (COALESCE($1, NOW()), $2, $3, $4, $5, 'pending', $6)
+          INSERT INTO expenses (date, vendor, category, description, amount, status, receipt_scan_id, source_type)
+          VALUES (COALESCE($1, NOW()), $2, $3, $4, $5, 'pending', $6, 'gdrive')
           RETURNING id, date, vendor, category, description, amount, status
         `, [
           date || null,

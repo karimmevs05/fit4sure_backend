@@ -3,6 +3,7 @@ const app = require('./app')
 const cron = require('node-cron')
 const { startAutoReceiptSync } = require('./services/googleDriveSync')
 const { runDueSteps, checkTimeTriggers } = require('./services/automationEngine')
+const { generateReportForMostRecentPeriod } = require('./routes/admin/adminFinancials')
 
 const PORT = process.env.PORT || 3000
 
@@ -29,6 +30,20 @@ app.listen(PORT, () => {
       }
     } catch (err) {
       console.error('Automation scheduler error:', err)
+    }
+  })
+
+  // Once a day: generate the semi-monthly financial report snapshot if the
+  // just-completed half-month period doesn't have one yet. Idempotent --
+  // generateReportForMostRecentPeriod() no-ops if it already exists.
+  cron.schedule('0 6 * * *', async () => {
+    try {
+      const result = await generateReportForMostRecentPeriod()
+      if (!result.alreadyExists) {
+        console.log(`Generated financial report snapshot id=${result.id}`)
+      }
+    } catch (err) {
+      console.error('Financial report scheduler error:', err)
     }
   })
 })

@@ -151,8 +151,8 @@ router.post('/save-receipt-items', requireAuth, requireRole('admin'), async (req
       // Create expense entry
       try {
         const expenseResult = await db.query(`
-          INSERT INTO expenses (date, vendor, category, description, amount, status, receipt_scan_id)
-          VALUES (NOW(), $1, $2, $3, $4, 'pending', $5)
+          INSERT INTO expenses (date, vendor, category, description, amount, status, receipt_scan_id, source_type)
+          VALUES (NOW(), $1, $2, $3, $4, 'pending', $5, 'scan')
           RETURNING id, date, vendor, category, description, amount, status
         `, [
           vendor || 'Receipt',
@@ -336,20 +336,22 @@ function categorizeItem(description) {
 // and always forces status='pending' + date=NOW())
 router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { date, vendor, category, description, amount, status } = req.body;
-    const validStatuses = ['pending', 'approved', 'reconciled'];
+    const { date, vendor, category, description, amount, status, sourceType } = req.body;
+    const validStatuses = ['pending', 'approved', 'reconciled', 'rejected'];
+    const validSourceTypes = ['manual', 'scan', 'gdrive'];
 
     if (!vendor || amount === undefined || amount === null) {
       return res.status(400).json({ error: 'vendor and amount are required' });
     }
 
     const finalStatus = validStatuses.includes(status) ? status : 'pending';
+    const finalSourceType = validSourceTypes.includes(sourceType) ? sourceType : 'manual';
 
     const result = await db.query(
-      `INSERT INTO expenses (date, vendor, category, description, amount, status)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, date, vendor, category, description, amount, status`,
-      [date || new Date().toISOString().split('T')[0], vendor, category || 'other', description || '', amount, finalStatus]
+      `INSERT INTO expenses (date, vendor, category, description, amount, status, source_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, date, vendor, category, description, amount, status, source_type`,
+      [date || new Date().toISOString().split('T')[0], vendor, category || 'other', description || '', amount, finalStatus, finalSourceType]
     );
 
     res.status(201).json({ success: true, data: result.rows[0] });
@@ -384,10 +386,12 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
     const limitClause = limit ? `LIMIT ${parseInt(limit, 10) || 100}` : 'LIMIT 500';
 
     const result = await db.query(
-      `SELECT id, date, vendor, category, description, amount, status, created_at
-       FROM expenses
-       ${whereClause}
-       ORDER BY date DESC, id DESC
+      `SELECT e.id, e.date, e.vendor, e.category, e.description, e.amount, e.status, e.created_at,
+              e.source_type, e.approved_by, e.approved_at, e.receipt_scan_id, u.display_name AS approved_by_name
+       FROM expenses e
+       LEFT JOIN users u ON u.user_id = e.approved_by
+       ${whereClause.replace(/(^|\s)(status|category|vendor)(\s*=|\s+ILIKE)/g, '$1e.$2$3')}
+       ORDER BY e.date DESC, e.id DESC
        ${limitClause}`,
       params
     );
@@ -425,12 +429,85 @@ router.get('/receipts', requireAuth, requireRole('admin'), async (req, res) => {
   }
 });
 
+// PATCH /api/admin/expenses/:id/approve and /reject - thin wrappers around
+// the generic PATCH below that also stamp who approved/rejected it and
+// when, so the audit trail doesn't depend on the frontend remembering to
+// pass those fields itself.
+router.patch('/:id/approve', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query(
+      `UPDATE expenses SET status = 'approved', approved_by = $1, approved_at = NOW() WHERE id = $2
+       RETURNING id, date, vendor, category, description, amount, status, approved_by, approved_at`,
+      [req.userId, req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Expense not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Error approving expense:', error);
+    res.status(500).json({ error: 'Failed to approve expense' });
+  }
+});
+
+router.patch('/:id/reject', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query(
+      `UPDATE expenses SET status = 'rejected', approved_by = $1, approved_at = NOW() WHERE id = $2
+       RETURNING id, date, vendor, category, description, amount, status, approved_by, approved_at`,
+      [req.userId, req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Expense not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Error rejecting expense:', error);
+    res.status(500).json({ error: 'Failed to reject expense' });
+  }
+});
+
+// POST /api/admin/expenses/bulk-approve { ids: number[] }
+router.post('/bulk-approve', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'ids array is required' });
+    }
+    const result = await db.query(
+      `UPDATE expenses SET status = 'approved', approved_by = $1, approved_at = NOW() WHERE id = ANY($2::int[])
+       RETURNING id`,
+      [req.userId, ids]
+    );
+    res.json({ success: true, data: { approvedCount: result.rows.length } });
+  } catch (error) {
+    console.error('Error bulk-approving expenses:', error);
+    res.status(500).json({ error: 'Failed to bulk-approve expenses' });
+  }
+});
+
+// POST /api/admin/expenses/bulk-reject { ids: number[] } -- mirrors
+// bulk-approve, used for the "reject this whole receipt" linked action.
+router.post('/bulk-reject', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'ids array is required' });
+    }
+    const result = await db.query(
+      `UPDATE expenses SET status = 'rejected', approved_by = $1, approved_at = NOW() WHERE id = ANY($2::int[])
+       RETURNING id`,
+      [req.userId, ids]
+    );
+    res.json({ success: true, data: { rejectedCount: result.rows.length } });
+  } catch (error) {
+    console.error('Error bulk-rejecting expenses:', error);
+    res.status(500).json({ error: 'Failed to bulk-reject expenses' });
+  }
+});
+
 // PATCH /api/admin/expenses/:id - Update any combination of fields
 // (vendor, category, description, amount, date, status)
 router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { vendor, category, description, amount, date, status } = req.body;
-    const validStatuses = ['pending', 'approved', 'reconciled'];
+    const validStatuses = ['pending', 'approved', 'reconciled', 'rejected'];
 
     if (status !== undefined && !validStatuses.includes(status)) {
       return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });

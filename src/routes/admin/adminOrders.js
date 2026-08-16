@@ -567,8 +567,8 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
 // findOrCreateMenu path, price isn't looked up from CATEGORY_PRICES (there's
 // no category for an arbitrary recipe combo) -- it's exactly what the
 // simulator computed, passed straight through. Always creates a fresh menus
-// row (category 'Custom') rather than trying to reuse one, since each
-// custom combo+serving-size is effectively one-off.
+// row (category 'Custom Meal Plan') rather than trying to reuse one, since
+// each named/priced combo is effectively its own standing plan.
 router.post('/custom-plate', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { customerId, name, priceCents, dayOfWeek, notes } = req.body;
@@ -577,7 +577,7 @@ router.post('/custom-plate', requireAuth, requireRole('admin'), async (req, res)
     }
 
     const menuResult = await db.query(
-      `INSERT INTO menus (name, category, price, created_at, updated_at) VALUES ($1, 'Custom', $2, NOW(), NOW()) RETURNING id`,
+      `INSERT INTO menus (name, category, price, created_at, updated_at) VALUES ($1, 'Custom Meal Plan', $2, NOW(), NOW()) RETURNING id`,
       [name, priceCents / 100]
     );
     const menuId = menuResult.rows[0].id;
@@ -586,7 +586,7 @@ router.post('/custom-plate', requireAuth, requireRole('admin'), async (req, res)
       `INSERT INTO orders (customer_id, menu_id, quantity, day_of_week, total_price, source, notes, created_at, updated_at)
        VALUES ($1, $2, 1, $3, $4, 'manual', $5, NOW(), NOW())
        RETURNING *`,
-      [customerId, menuId, dayOfWeek || null, priceCents / 100, notes || 'Custom plate from Plate Cost Simulator']
+      [customerId, menuId, dayOfWeek || null, priceCents / 100, notes || 'Custom meal plan from Plate Cost Simulator']
     );
 
     res.status(201).json({ data: result.rows[0] });
@@ -623,6 +623,43 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   } catch (error) {
     console.error('Error updating order:', error);
     res.status(500).json({ error: 'Failed to update order' });
+  }
+});
+
+// PATCH /api/admin/orders/:id/mark-paid { paymentMethod } - Real payment
+// tracking for the Financials Pending Balances panel. Payment here isn't
+// Stripe-only -- bank transfer, cash, Venmo, whatever actually came in --
+// so this is staff recording how/that it was paid, not a processor webhook.
+router.patch('/:id/mark-paid', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { paymentMethod } = req.body;
+    const result = await db.query(
+      `UPDATE orders SET payment_status = 'paid', paid_at = NOW(), payment_method = $1, updated_at = NOW()
+       WHERE id = $2 RETURNING *`,
+      [paymentMethod || null, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Error marking order paid:', error);
+    res.status(500).json({ error: 'Failed to mark order paid' });
+  }
+});
+
+// PATCH /api/admin/orders/:id/mark-pending - Revert a mark-paid, e.g. if
+// staff recorded it by mistake or the payment bounced after the fact.
+router.patch('/:id/mark-pending', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query(
+      `UPDATE orders SET payment_status = 'pending', paid_at = NULL, updated_at = NOW()
+       WHERE id = $1 RETURNING *`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Error marking order pending:', error);
+    res.status(500).json({ error: 'Failed to mark order pending' });
   }
 });
 
