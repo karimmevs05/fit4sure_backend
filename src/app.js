@@ -33,6 +33,7 @@ const launchDayNotesRoutes = require('./routes/admin/launchDayNotes')
 const adminUsersRoutes = require('./routes/admin/adminUsers')
 const adminProductionPlanRoutes = require('./routes/admin/adminProductionPlan')
 const adminCookingMethodsRoutes = require('./routes/admin/adminCookingMethods')
+const publicOrderingRoutes = require('./routes/publicOrdering')
 
 const app = express()
 
@@ -74,6 +75,7 @@ app.use('/api/admin/launch-day-notes', launchDayNotesRoutes)
 app.use('/api/admin/users', adminUsersRoutes)
 app.use('/api/admin/production-plan', adminProductionPlanRoutes)
 app.use('/api/admin', adminCookingMethodsRoutes)
+app.use('/api/public', publicOrderingRoutes)
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }))
 
