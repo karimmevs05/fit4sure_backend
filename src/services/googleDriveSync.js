@@ -232,7 +232,7 @@ async function parseReceiptsFromDrive() {
       const base64Image = await downloadImageAsBase64(receipt.id);
       const receiptData = await processReceiptWithAI(base64Image, receipt.name, receipt.mimeType);
       const driveViewLink = await getFileViewLink(receipt.id);
-      parsed.push({ driveFileId: receipt.id, fileName: receipt.name, driveViewLink, ...receiptData });
+      parsed.push({ driveFileId: receipt.id, fileName: receipt.name, driveViewLink, createdTime: receipt.createdTime, ...receiptData });
       console.log(`✓ Parsed: ${receipt.name}`);
     } catch (error) {
       console.error(`✗ Failed to parse ${receipt.name}:`, error.message);
@@ -241,8 +241,109 @@ async function parseReceiptsFromDrive() {
     }
   }
 
-  console.log(`\nReceipt parse complete: ${parsed.length} parsed, ${failed.length} failed`);
-  return { parsed, failed };
+  const merged = mergeSplitReceipts(parsed);
+  const mergedCount = parsed.length - merged.length;
+  if (mergedCount > 0) {
+    console.log(`Merged ${mergedCount} split-receipt photo(s) into ${merged.filter(r => r.additionalFiles?.length).length} combined receipt(s)`);
+  }
+
+  console.log(`\nReceipt parse complete: ${merged.length} parsed, ${failed.length} failed`);
+  return { parsed: merged, failed };
+}
+
+// Warehouse-club receipts (Costco, Sam's Club) often run too long for one
+// photo, so a single physical receipt sometimes gets uploaded as 2+ separate
+// images. Gemini can only report the printed TOTAL line if it's visible in
+// that specific photo -- so the tell of a split receipt is either (a) no
+// total was found at all (this photo was cropped before reaching the
+// bottom), or (b) a total was found but it's far larger than this photo's
+// own item sum (this photo shows the tail end, whose total covers items
+// photographed elsewhere too). Group same-vendor photos uploaded within a
+// few minutes of each other and fold fragments into whichever one's total
+// actually explains the combined items -- don't finalize any of them on
+// their own total until a total line is found that adds up.
+const SPLIT_RECEIPT_WINDOW_MS = 15 * 60 * 1000;
+const TOTAL_MATCH_TOLERANCE = 0.15; // matches the lowConfidence threshold in receiptProcessor.js
+
+function itemSumOf(receipt) {
+  return receipt.items.reduce((sum, item) => sum + (item.amount || 0), 0);
+}
+
+function mergeSplitReceipts(receipts) {
+  const merged = [];
+  const used = new Set();
+
+  for (let i = 0; i < receipts.length; i++) {
+    if (used.has(i)) continue;
+    const anchor = receipts[i];
+    const anchorSum = itemSumOf(anchor);
+    const anchorExplainsItself =
+      anchor.receiptTotal != null &&
+      Math.abs(anchorSum - anchor.receiptTotal) / anchor.receiptTotal <= TOTAL_MATCH_TOLERANCE;
+
+    if (anchorExplainsItself) {
+      merged.push(anchor);
+      used.add(i);
+      continue;
+    }
+
+    const candidates = [i];
+    for (let j = 0; j < receipts.length; j++) {
+      if (j === i || used.has(j)) continue;
+      const other = receipts[j];
+      if ((other.vendor || '').trim().toLowerCase() !== (anchor.vendor || '').trim().toLowerCase()) continue;
+      const anchorTime = anchor.createdTime ? new Date(anchor.createdTime).getTime() : null;
+      const otherTime = other.createdTime ? new Date(other.createdTime).getTime() : null;
+      if (anchorTime && otherTime && Math.abs(anchorTime - otherTime) > SPLIT_RECEIPT_WINDOW_MS) continue;
+      candidates.push(j);
+    }
+
+    if (candidates.length === 1) {
+      // No same-vendor, nearby-in-time photos to merge with -- leave as-is,
+      // same fallback (item sum as total, or existing lowConfidence flag)
+      // as before this feature existed.
+      merged.push(anchor);
+      used.add(i);
+      continue;
+    }
+
+    // Find whichever candidate's own receiptTotal best explains the whole
+    // group's combined item sum -- that one showed the real total line.
+    const combinedSum = candidates.reduce((sum, idx) => sum + itemSumOf(receipts[idx]), 0);
+    let bestIdx = null;
+    let bestDiff = Infinity;
+    for (const idx of candidates) {
+      const total = receipts[idx].receiptTotal;
+      if (total == null) continue;
+      const diff = Math.abs(combinedSum - total) / total;
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestIdx = idx;
+      }
+    }
+
+    if (bestIdx != null && bestDiff <= TOTAL_MATCH_TOLERANCE) {
+      const primary = receipts[bestIdx];
+      const others = candidates.filter((idx) => idx !== bestIdx);
+      merged.push({
+        ...primary,
+        items: candidates.flatMap((idx) => receipts[idx].items),
+        lowConfidence: false,
+        additionalFiles: others.map((idx) => ({
+          driveFileId: receipts[idx].driveFileId,
+          fileName: receipts[idx].fileName,
+        })),
+      });
+      candidates.forEach((idx) => used.add(idx));
+    } else {
+      // No combination of nearby same-vendor photos explains a total --
+      // don't guess at a merge, fall back to today's per-photo behavior.
+      merged.push(anchor);
+      used.add(i);
+    }
+  }
+
+  return merged;
 }
 
 /**
@@ -264,6 +365,14 @@ async function confirmAndSaveReceipts(receipts) {
       expensesCreated += result.expensesCreated;
       if (receipt.driveFileId) {
         await archiveReceipt(receipt.driveFileId, receipt.fileName);
+      }
+      // A merged split-receipt carries every source photo it absorbed --
+      // archive all of them, not just the primary one, or the fragment
+      // photo sits in the inbox and gets re-parsed (and re-merged) next sync.
+      if (Array.isArray(receipt.additionalFiles)) {
+        for (const extra of receipt.additionalFiles) {
+          if (extra.driveFileId) await archiveReceipt(extra.driveFileId, extra.fileName);
+        }
       }
       processed++;
     } catch (error) {
@@ -319,4 +428,5 @@ module.exports = {
   confirmAndSaveReceipts,
   processReceiptsFromDrive,
   startAutoReceiptSync,
+  mergeSplitReceipts,
 };
