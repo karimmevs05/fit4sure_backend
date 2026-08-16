@@ -9,6 +9,11 @@ const { requireAuth } = require('../middleware/auth')
 const router = express.Router()
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID)
 
+function sanitizeUser(user) {
+  const { password_hash, ...safe } = user
+  return safe
+}
+
 function signToken(user) {
   return jwt.sign(
     { userId: user.user_id, email: user.email, role: user.role },
@@ -75,7 +80,7 @@ router.post('/register', async (req, res) => {
       'INSERT INTO user_identities (user_id, provider, provider_user_id) VALUES ($1, $2, $3)',
       [user.user_id, 'email', email]
     )
-    res.status(201).json({ user, token: signToken(user) })
+    res.status(201).json({ user: sanitizeUser(user), token: signToken(user) })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -97,7 +102,7 @@ router.post('/login', async (req, res) => {
     if (!valid) {
       return res.status(401).json({ error: 'Invalid email or password' })
     }
-    res.json({ user, token: signToken(user) })
+    res.json({ user: sanitizeUser(user), token: signToken(user) })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -118,7 +123,7 @@ router.post('/apple', async (req, res) => {
       ? `${fullName.givenName || ''} ${fullName.familyName || ''}`.trim()
       : null
     const user = await findOrCreateSocialUser('apple', payload.sub, payload.email, displayName)
-    res.json({ user, token: signToken(user) })
+    res.json({ user: sanitizeUser(user), token: signToken(user) })
   } catch (err) {
     res.status(401).json({ error: 'Apple Sign-In failed: ' + err.message })
   }
@@ -152,7 +157,7 @@ router.post('/google', async (req, res) => {
 router.get('/me', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT user_id, email, display_name, phone_number, address_line1, address_line2, city, state, postal_code, is_active, created_at FROM users WHERE user_id = $1',
+      'SELECT user_id, email, display_name, role, department, status, phone_number, address_line1, address_line2, city, state, postal_code, is_active, created_at FROM users WHERE user_id = $1',
       [req.userId]
     )
     if (!result.rows[0]) return res.status(404).json({ error: 'User not found' })
