@@ -3,6 +3,7 @@ const router = express.Router()
 const pool = require('../../config/db')
 const { requireAuth, requireRole } = require('../../middleware/auth')
 const { getRecipeIngredientNeeds } = require('../../utils/recipeCost')
+const { priorityToUrgency, departmentToTag, opsStatusToLaunchStatus, deriveDueDate } = require('../../utils/taskSync')
 
 // ============================================================================
 // OPERATIONS HUB -- generic cross-department task manager. Replaces the old
@@ -27,9 +28,9 @@ function validateEnum(value, allowed, field) {
 
 async function fetchTaskWithDetails(taskId) {
   const taskResult = await pool.query(
-    `SELECT t.*, s.name AS owner_name
+    `SELECT t.*, s.display_name AS owner_name
      FROM tasks t
-     LEFT JOIN staff s ON t.owner_id = s.id
+     LEFT JOIN users s ON t.owner_id = s.user_id
      WHERE t.id = $1`,
     [taskId]
   )
@@ -38,13 +39,73 @@ async function fetchTaskWithDetails(taskId) {
   const [checklistResult, commentsResult] = await Promise.all([
     pool.query(`SELECT * FROM task_checklist_items WHERE task_id = $1 ORDER BY sort_order, id`, [taskId]),
     pool.query(
-      `SELECT c.*, s.name AS staff_name FROM task_comments c LEFT JOIN staff s ON c.staff_id = s.id
+      `SELECT c.*, s.display_name AS staff_name FROM task_comments c LEFT JOIN users s ON c.staff_id = s.user_id
        WHERE c.task_id = $1 ORDER BY c.created_at`,
       [taskId]
     ),
   ])
 
   return { ...taskResult.rows[0], checklist_items: checklistResult.rows, comments: commentsResult.rows }
+}
+
+// ----------------------------------------------------------------------------
+// TASK MANAGEMENT SYNC -- every Ops Hub task automatically gets a mirrored
+// launch_tasks row (Task Management dashboard), kept in sync both ways via
+// ops_task_id. See src/utils/taskSync.js for the (lossy) field mappings.
+// ----------------------------------------------------------------------------
+
+async function createLaunchMirror(opsTask, actor) {
+  const dueDate = deriveDueDate(opsTask)
+  if (!dueDate) return null // launch_tasks.due_date is NOT NULL -- nothing to derive from, skip the mirror
+
+  const result = await pool.query(
+    `INSERT INTO launch_tasks (name, owner_id, tag, urgency, due_date, status, source_ref, ops_task_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING *`,
+    [
+      opsTask.title,
+      opsTask.owner_id,
+      departmentToTag(opsTask.department),
+      priorityToUrgency(opsTask.priority),
+      dueDate,
+      opsStatusToLaunchStatus(opsTask.status),
+      `Operations Hub task #${opsTask.id}`,
+      opsTask.id,
+    ]
+  )
+  const launchTask = result.rows[0]
+  await pool.query(
+    `INSERT INTO launch_activity_log (task_id, actor, type, text) VALUES ($1, $2, 'status_change', $3)`,
+    [launchTask.id, actor, `${actor} created ${launchTask.name} (from Operations Hub)`]
+  )
+  return launchTask
+}
+
+async function pushOpsTaskToLaunchMirror(opsTask, actor) {
+  const existing = await pool.query(`SELECT * FROM launch_tasks WHERE ops_task_id = $1`, [opsTask.id])
+  if (existing.rows.length === 0) return
+  const before = existing.rows[0]
+
+  const dueDate = deriveDueDate(opsTask) || before.due_date
+  const status = opsStatusToLaunchStatus(opsTask.status)
+  const result = await pool.query(
+    `UPDATE launch_tasks SET name = $1, owner_id = $2, tag = $3, urgency = $4, due_date = $5, status = $6, updated_at = NOW()
+     WHERE ops_task_id = $7 RETURNING *`,
+    [opsTask.title, opsTask.owner_id, departmentToTag(opsTask.department), priorityToUrgency(opsTask.priority), dueDate, status, opsTask.id]
+  )
+  const launchTask = result.rows[0]
+
+  if (status !== before.status) {
+    await pool.query(
+      `INSERT INTO launch_activity_log (task_id, actor, type, text) VALUES ($1, $2, $3, $4)`,
+      [launchTask.id, actor, status === 'done' ? 'complete' : 'status_change', status === 'done' ? `${actor} completed ${launchTask.name}` : `${actor} reopened ${launchTask.name}`]
+    )
+  } else {
+    await pool.query(
+      `INSERT INTO launch_activity_log (task_id, actor, type, text) VALUES ($1, $2, 'status_change', $3)`,
+      [launchTask.id, actor, `${actor} updated ${launchTask.name} (from Operations Hub)`]
+    )
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -83,9 +144,9 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
     const limitClause = limit ? `LIMIT ${parseInt(limit, 10) || 500}` : 'LIMIT 500'
 
     const result = await pool.query(
-      `SELECT t.*, s.name AS owner_name
+      `SELECT t.*, s.display_name AS owner_name
        FROM tasks t
-       LEFT JOIN staff s ON t.owner_id = s.id
+       LEFT JOIN users s ON t.owner_id = s.user_id
        ${whereClause}
        ORDER BY ${sortColumn} ${sortDirection}, t.id ${sortDirection}
        ${limitClause}`,
@@ -183,9 +244,9 @@ router.get('/my-focus', requireAuth, requireRole('admin'), async (req, res) => {
     if (!owner_id) return res.status(400).json({ error: 'owner_id is required' })
 
     const result = await pool.query(
-      `SELECT t.*, s.name AS owner_name
+      `SELECT t.*, s.display_name AS owner_name
        FROM tasks t
-       LEFT JOIN staff s ON t.owner_id = s.id
+       LEFT JOIN users s ON t.owner_id = s.user_id
        WHERE t.owner_id = $1 AND t.status NOT IN ('completed', 'cancelled')
        ORDER BY ${PRIORITY_RANK_SQL}, t.due_date ASC NULLS LAST
        LIMIT $2`,
@@ -265,9 +326,9 @@ router.get('/week/:weekStart', requireAuth, requireRole('admin'), async (req, re
   try {
     const { weekStart } = req.params
     const result = await pool.query(
-      `SELECT t.*, s.name AS owner_name
+      `SELECT t.*, s.display_name AS owner_name
        FROM tasks t
-       LEFT JOIN staff s ON t.owner_id = s.id
+       LEFT JOIN users s ON t.owner_id = s.user_id
        WHERE t.week_start = $1
        ORDER BY ${PRIORITY_RANK_SQL}, t.id`,
       [weekStart]
@@ -294,9 +355,9 @@ router.get('/day/:weekStart/:day', requireAuth, requireRole('admin'), async (req
     if (dayError) return res.status(400).json({ error: dayError })
 
     const result = await pool.query(
-      `SELECT t.*, s.name AS owner_name
+      `SELECT t.*, s.display_name AS owner_name
        FROM tasks t
-       LEFT JOIN staff s ON t.owner_id = s.id
+       LEFT JOIN users s ON t.owner_id = s.user_id
        WHERE t.week_start = $1 AND t.operational_day = $2
        ORDER BY ${PRIORITY_RANK_SQL}, t.id`,
       [weekStart, day]
@@ -330,9 +391,9 @@ router.get('/templates', requireAuth, requireRole('admin'), async (req, res) => 
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
 
     const templatesResult = await pool.query(
-      `SELECT tt.*, s.name AS default_owner_name
+      `SELECT tt.*, s.display_name AS default_owner_name
        FROM task_templates tt
-       LEFT JOIN staff s ON tt.default_owner_id = s.id
+       LEFT JOIN users s ON tt.default_owner_id = s.user_id
        ${whereClause}
        ORDER BY tt.operational_day, tt.name`,
       params
@@ -497,6 +558,7 @@ router.post('/templates/generate-week/:weekStart', requireAuth, requireRole('adm
         await pool.query(`INSERT INTO task_checklist_items (task_id, label, sort_order) VALUES ($1, $2, $3)`, [task.id, item.label, item.sort_order])
       }
 
+      await createLaunchMirror(task, req.userName)
       created.push(task)
     }
 
@@ -537,6 +599,7 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
       [title, description || null, department, owner_id || null, priority || null, status || null, due_date || null, operational_day || null, week_start || null, estimated_minutes || null, source_type || null, source_id || null]
     )
 
+    await createLaunchMirror(result.rows[0], req.userName)
     res.status(201).json({ success: true, data: result.rows[0] })
   } catch (error) {
     console.error('Error creating task:', error)
@@ -580,6 +643,7 @@ router.post('/recurring', requireAuth, requireRole('admin'), async (req, res) =>
       [title, description || null, department, owner_id || null, priority || null, dueDate, operational_day, week_start, estimated_minutes || null, template.id]
     )
 
+    await createLaunchMirror(taskResult.rows[0], req.userName)
     res.status(201).json({ success: true, data: { template, task: taskResult.rows[0] } })
   } catch (error) {
     console.error('Error creating recurring task:', error)
@@ -630,6 +694,7 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
     )
     if (result.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
 
+    await pushOpsTaskToLaunchMirror(result.rows[0], req.userName)
     res.json({ success: true, data: result.rows[0] })
   } catch (error) {
     console.error('Error updating task:', error)
@@ -646,6 +711,7 @@ router.post('/:id/complete', requireAuth, requireRole('admin'), async (req, res)
     )
     if (result.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
 
+    await pushOpsTaskToLaunchMirror(result.rows[0], req.userName)
     res.json({ success: true, data: result.rows[0] })
   } catch (error) {
     console.error('Error completing task:', error)
@@ -675,6 +741,7 @@ router.post('/:id/duplicate', requireAuth, requireRole('admin'), async (req, res
       )
     }
 
+    await createLaunchMirror(clone, req.userName)
     const full = await fetchTaskWithDetails(clone.id)
     res.status(201).json({ success: true, data: full })
   } catch (error) {
@@ -762,7 +829,7 @@ router.delete('/:id/checklist-items/:itemId', requireAuth, requireRole('admin'),
 router.get('/:id/comments', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT c.*, s.name AS staff_name FROM task_comments c LEFT JOIN staff s ON c.staff_id = s.id
+      `SELECT c.*, s.display_name AS staff_name FROM task_comments c LEFT JOIN users s ON c.staff_id = s.user_id
        WHERE c.task_id = $1 ORDER BY c.created_at`,
       [req.params.id]
     )
