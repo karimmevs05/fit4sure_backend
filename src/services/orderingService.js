@@ -172,7 +172,7 @@ async function getWeeklyMenu() {
   const weekStart = weekResult.rows[0].sunday.toISOString().slice(0, 10);
 
   const planResult = await db.query(
-    `SELECT wrp.block, r.recipe_id, r.name
+    `SELECT wrp.block, r.recipe_id, r.name, r.category
      FROM weekly_recipe_plan wrp
      JOIN recipes r ON r.recipe_id = wrp.recipe_id
      WHERE wrp.planned_week_start = $1
@@ -196,6 +196,7 @@ async function getWeeklyMenu() {
       .map((r) => ({
         recipeId: r.recipe_id,
         name: r.name,
+        category: r.category,
         perPound: macrosByRecipe[r.recipe_id] || null,
         formats: RECIPE_FORMATS.map((label) => ({
           id: label.toLowerCase().replace(/\s+/g, ''),
