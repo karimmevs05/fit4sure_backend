@@ -11,12 +11,21 @@ const getGeminiClient = () => {
   return new GoogleGenerativeAI(apiKey);
 };
 
-// Gemini occasionally 503s ("currently experiencing high demand") or 429s
-// (rate limit) under load -- both transient and worth a short retry before
-// giving up, unlike a genuine parse/validation failure which would just
-// fail the same way again immediately.
+// Gemini occasionally 503s ("currently experiencing high demand") or hits a
+// short-lived per-minute 429 under load -- both transient and worth a short
+// retry, unlike a genuine parse/validation failure which would just fail
+// the same way again immediately.
 function isRetryableGeminiError(error) {
-  return /\b(503|429)\b/.test(error.message || '');
+  return /\b(503|429)\b/.test(error.message || '') && !isDailyQuotaExceeded(error);
+}
+
+// The free tier's per-day quota (20 requests/day/model as of this writing)
+// is a completely different failure mode from a transient rate limit -- no
+// amount of waiting a few seconds fixes it, and every other call made today
+// will fail identically. Detected separately so callers can stop burning
+// through a whole batch instead of retrying (and failing) each one.
+function isDailyQuotaExceeded(error) {
+  return /PerDay/i.test(error.message || '');
 }
 
 function sleep(ms) {
@@ -365,4 +374,5 @@ async function saveReceiptToDB(receiptData) {
 module.exports = {
   processReceiptWithAI,
   saveReceiptToDB,
+  isDailyQuotaExceeded,
 };

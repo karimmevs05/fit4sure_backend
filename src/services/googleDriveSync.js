@@ -2,7 +2,7 @@ const { google } = require('googleapis');
 const fs = require('fs');
 const path = require('path');
 const db = require('../config/db');
-const { processReceiptWithAI, saveReceiptToDB } = require('./receiptProcessor');
+const { processReceiptWithAI, saveReceiptToDB, isDailyQuotaExceeded } = require('./receiptProcessor');
 
 let drive = null;
 
@@ -237,7 +237,16 @@ async function parseReceiptsFromDrive() {
     } catch (error) {
       console.error(`✗ Failed to parse ${receipt.name}:`, error.message);
       failed.push({ filename: receipt.name, error: error.message });
-      // Continue parsing other receipts
+
+      // The daily quota isn't coming back this run -- every remaining file
+      // would fail the same way, so stop burning API calls on them. They're
+      // never archived on failure, so they stay in the Drive inbox and get
+      // picked up again on the next sync once quota resets.
+      if (isDailyQuotaExceeded(error)) {
+        const remaining = receipts.length - (parsed.length + failed.length);
+        console.warn(`Gemini daily quota exceeded -- stopping this sync run with ${remaining} receipt(s) still queued for next time.`);
+        break;
+      }
     }
   }
 

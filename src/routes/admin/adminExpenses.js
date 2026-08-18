@@ -3,7 +3,7 @@ const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const { syncInventoryFromReceiptItem, convertToGrams } = require('../../services/inventorySync');
-const { processReceiptWithAI } = require('../../services/receiptProcessor');
+const { processReceiptWithAI, isDailyQuotaExceeded } = require('../../services/receiptProcessor');
 
 // POST /api/admin/expenses/save-receipt-items - Save scanned receipt items to database
 router.post('/save-receipt-items', requireAuth, requireRole('admin'), async (req, res) => {
@@ -154,6 +154,11 @@ router.post('/scan-receipt', requireAuth, requireRole('admin'), async (req, res)
     });
   } catch (error) {
     console.error('Receipt scan error:', error);
+    if (isDailyQuotaExceeded(error)) {
+      return res.status(429).json({
+        error: "Hit today's AI scanning limit (free tier caps out fast). Try again tomorrow, or use Quick Entry for now.",
+      });
+    }
     res.status(500).json({ error: error.message || 'Failed to scan receipt' });
   }
 });
