@@ -7,7 +7,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
-const { RECIPE_FORMATS, findOrCreateMenu, findOrCreateCustomerByContact, getWeeklyMenu } = require('../services/orderingService');
+const { RECIPE_FORMATS, SIDE_FORMAT, findOrCreateMenu, findOrCreateCustomerByContact, getWeeklyMenu } = require('../services/orderingService');
 
 // GET /api/public/menu - same shape as the admin picker's weekly-menu, no auth.
 router.get('/menu', async (req, res) => {
@@ -58,7 +58,7 @@ router.post('/orders', async (req, res) => {
       const recipeName = (item.recipeName || '').trim();
 
       if (!['monday', 'thursday'].includes(day)) { errors.push({ item, reason: 'invalid day' }); continue; }
-      if (!RECIPE_FORMATS.includes(format)) { errors.push({ item, reason: 'invalid format' }); continue; }
+      if (!RECIPE_FORMATS.includes(format) && format !== SIDE_FORMAT) { errors.push({ item, reason: 'invalid format' }); continue; }
       if (!quantity || quantity <= 0) { errors.push({ item, reason: 'invalid quantity' }); continue; }
       if (!recipeName || !liveRecipesByDay[day].has(recipeName)) { errors.push({ item, reason: 'recipe is not on this week\'s live menu' }); continue; }
 

@@ -11,6 +11,12 @@ const db = require('../config/db');
 // recipe-plan formats (High Protein / Low Carb / 1 Pound) -- swap for real
 // numbers once confirmed; nothing else needs to change since every caller
 // reads this table directly rather than hardcoding prices of its own.
+// Not a real customer-facing "format" -- carb/veggie sides added under a
+// selected protein format are free, since the plate-structure serving
+// sizes table means that format's price already covers this serving. This
+// is just the price-tier key a side order line resolves to.
+const SIDE_FORMAT = 'Included Side';
+
 const CATEGORY_PRICES = {
   Regular: 13.79,
   Large: 16.79,
@@ -18,6 +24,7 @@ const CATEGORY_PRICES = {
   'Low Carb': 13.79,
   '1 Pound': 19.79,
   Breakfast: 11.30,
+  [SIDE_FORMAT]: 0,
 };
 
 // The five formats offered per live recipe, sourced from the Weekly Recipe
@@ -220,6 +227,7 @@ async function getWeeklyMenu() {
 module.exports = {
   CATEGORY_PRICES,
   RECIPE_FORMATS,
+  SIDE_FORMAT,
   BY_THE_LB_PRICES,
   guessByTheLbType,
   findOrCreateMenu,
