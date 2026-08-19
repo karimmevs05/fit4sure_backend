@@ -184,7 +184,11 @@ async function archiveReceipt(fileId, fileName) {
 
     console.log(`Archived receipt: ${fileName}`);
   } catch (error) {
-    console.error('Error archiving receipt:', error);
+    // Gaxios errors carry a huge circular object (full request/response) --
+    // logging it whole floods the logs with ~100+ lines per failure. The
+    // message alone is enough to see what's wrong (usually a Drive sharing
+    // permission issue on that specific file).
+    console.error(`Error archiving receipt ${fileName}: ${error.message}`);
     // Don't throw - continue processing even if archiving fails
   }
 }
