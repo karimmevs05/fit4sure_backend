@@ -218,6 +218,30 @@ router.get('/crm-tasks', requireAuth, requireRole('admin'), async (req, res) => 
   }
 })
 
+// POST /api/admin/crm-tasks -- the manual-create path. Everything else that
+// writes to this table (executeStep() in automationEngine, and the cron
+// auto-flags below) inserts directly; this is what lets a human, or the
+// frontend's quick-add, create one from outside that flow. Leaving
+// system_source and source_automation_rule_id both null is exactly how a
+// manually-added task is told apart from a system-generated one.
+router.post('/crm-tasks', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { customer_id, title, description } = req.body
+    if (!title || !title.trim()) return res.status(400).json({ error: 'title is required' })
+
+    const result = await db.query(
+      `INSERT INTO crm_tasks (customer_id, title, description)
+       VALUES ($1, $2, $3)
+       RETURNING *`,
+      [customer_id || null, title.trim(), description || null]
+    )
+    res.status(201).json({ data: result.rows[0] })
+  } catch (error) {
+    console.error('Error creating crm task:', error)
+    res.status(500).json({ error: 'Failed to create task' })
+  }
+})
+
 // PUT /api/admin/crm-tasks/:id/complete
 router.put('/crm-tasks/:id/complete', requireAuth, requireRole('admin'), async (req, res) => {
   try {
