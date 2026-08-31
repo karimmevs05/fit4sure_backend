@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const { checkStageTrigger } = require('../../services/automationEngine');
+const { computeWinProbability, daysBetween, clamp } = require('../../services/winProbability');
 
 // Fields shared by POST (create) and PUT (update) -- the full CRM profile
 const PROFILE_FIELDS = [
@@ -17,6 +18,15 @@ const PROFILE_FIELDS = [
 // weeks_active, total_meals_ordered, last_order_date, lifetime_value_cents,
 // and days_since_last_contact are all computed live from real order history
 // -- not stored columns -- so they're never stale.
+//
+// conversion_probability in the response is likewise computed live (via
+// computeWinProbability) rather than read straight from the stored column --
+// that guarantees the headline score always agrees with its own breakdown
+// (momentum/recency/completeness/objection), which a snapshot taken at the
+// last recompute-pipeline run couldn't promise if inputs like
+// days_since_last_contact have moved since. conversion_probability_prev is
+// still the raw stored snapshot, so the frontend's trend arrow is comparing
+// live-now against a real historical baseline, not against itself.
 router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const result = await db.query(`
@@ -25,7 +35,8 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
         c.address, c.apt_gate_code, c.payment_mode, c.household_size, c.occupation,
         c.primary_goal, c.biggest_hurdle, c.protein_preference, c.dietary_preference,
         c.foods_to_avoid, c.notes, c.dietary_restrictions,
-        c.engagement_score, c.conversion_probability,
+        c.engagement_score, c.conversion_probability_prev,
+        c.stage_entered_at,
         c.created_at, c.updated_at,
         COALESCE(COUNT(DISTINCT date_trunc('week', o.created_at)), 0) AS weeks_active,
         COALESCE(SUM(o.quantity), 0) AS total_meals_ordered,
@@ -49,7 +60,28 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
         total_meals_ordered DESC
     `);
 
-    res.json({ data: result.rows });
+    const data = result.rows.map((c) => {
+      const { stage_entered_at, ...rest } = c;
+      const breakdown = computeWinProbability({
+        sales_pipeline_stage: c.sales_pipeline_stage,
+        days_in_current_stage: daysBetween(stage_entered_at) ?? 0,
+        days_since_last_contact: c.days_since_last_contact,
+        primary_goal: c.primary_goal,
+        protein_preference: c.protein_preference,
+        dietary_preference: c.dietary_preference,
+        biggest_hurdle: c.biggest_hurdle,
+      });
+      return {
+        ...rest,
+        conversion_probability: breakdown.score,
+        win_probability_momentum: breakdown.momentum,
+        win_probability_recency: breakdown.recency,
+        win_probability_completeness: breakdown.completeness,
+        win_probability_objection: breakdown.objection,
+      };
+    });
+
+    res.json({ data });
   } catch (error) {
     console.error('Error fetching customers:', error);
     res.status(500).json({ error: 'Failed to fetch customers' });
@@ -117,16 +149,26 @@ router.post('/recompute-pipeline', requireAuth, requireRole('admin'), async (req
 
   try {
     const customersResult = await db.query(`
-      SELECT c.id, c.name, c.sales_pipeline_stage,
+      SELECT c.id, c.name, c.sales_pipeline_stage, c.primary_goal,
+        c.protein_preference, c.dietary_preference, c.biggest_hurdle,
         COALESCE(SUM(o.quantity), 0) AS total_meals_ordered,
         MAX(o.created_at) AS last_order_date,
         CASE WHEN MAX(o.created_at) IS NOT NULL
           THEN EXTRACT(DAY FROM NOW() - MAX(o.created_at))::int
           ELSE NULL
-        END AS days_since_order
+        END AS days_since_order,
+        GREATEST(MAX(o.created_at), ca.last_activity_at) AS last_contact_at,
+        CASE WHEN GREATEST(MAX(o.created_at), ca.last_activity_at) IS NOT NULL
+          THEN EXTRACT(DAY FROM NOW() - GREATEST(MAX(o.created_at), ca.last_activity_at))::int
+          ELSE NULL
+        END AS days_since_last_contact
       FROM customers c
       LEFT JOIN orders o ON c.id = o.customer_id
-      GROUP BY c.id
+      LEFT JOIN LATERAL (
+        SELECT MAX(created_at) AS last_activity_at
+        FROM customer_activities WHERE customer_id = c.id
+      ) ca ON true
+      GROUP BY c.id, ca.last_activity_at
     `);
 
     // Stages this endpoint is allowed to move a customer into/out of based
@@ -160,16 +202,38 @@ router.post('/recompute-pipeline', requireAuth, requireRole('admin'), async (req
       // No real change to make -- leave conversion/engagement untouched.
       if (newStage === currentStage) continue;
 
-      const conversionProb = newStage === 'active' ? 100 : newStage === 'at_risk' ? 40 : newStage === 'prospect' ? 30 : 5;
-      const engagementScore = newStage === 'active' ? 95 : newStage === 'at_risk' ? 30 : newStage === 'prospect' ? 20 : 10;
+      // This IS a stage transition happening right now, so days_in_current_stage
+      // is 0 for the purposes of this score -- momentum becomes meaningful on
+      // the next recompute after they've actually sat in the new stage a while.
+      const { score, momentum, recency, completeness, objection } = computeWinProbability({
+        sales_pipeline_stage: newStage,
+        days_in_current_stage: 0,
+        days_since_last_contact: customer.days_since_last_contact,
+        primary_goal: customer.primary_goal,
+        protein_preference: customer.protein_preference,
+        dietary_preference: customer.dietary_preference,
+        biggest_hurdle: customer.biggest_hurdle,
+      });
+      // Engagement score isn't part of the Win Probability spec -- kept as a
+      // simpler proxy (recency + completeness only, no momentum/objection)
+      // until it has its own real definition.
+      const engagementScore = clamp(Math.round(50 + recency + completeness), 0, 100);
 
       await db.query(
-        `UPDATE customers SET sales_pipeline_stage = $1, conversion_probability = $2, engagement_score = $3, updated_at = NOW() WHERE id = $4`,
-        [newStage, conversionProb, engagementScore, customer.id]
+        `UPDATE customers SET
+           sales_pipeline_stage = $1,
+           conversion_probability_prev = conversion_probability,
+           conversion_probability = $2,
+           conversion_probability_updated_at = NOW(),
+           engagement_score = $3,
+           stage_entered_at = NOW(),
+           updated_at = NOW()
+         WHERE id = $4`,
+        [newStage, score, engagementScore, customer.id]
       );
 
       updatedCount++;
-      updates.push({ name: customer.name, meals: totalMeals, from_stage: currentStage, to_stage: newStage, days_since_order: daysSinceOrder });
+      updates.push({ name: customer.name, meals: totalMeals, from_stage: currentStage, to_stage: newStage, days_since_order: daysSinceOrder, win_probability: score });
     }
 
     res.json({ success: true, updated: updatedCount, updates });
@@ -225,6 +289,13 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
          VALUES ($1, 'stage_change', 'logged', $2, $3)`,
         [id, JSON.stringify({ from_stage: previousStage, to_stage: newStage }), req.userId]
       );
+
+      // Stamped here too, not just in recompute-pipeline's own auto-managed
+      // transitions -- this is the far more common path (a rep dragging a
+      // card, or the board's stage arrows), and Win Probability's momentum
+      // component needs to know how long they've actually been in the
+      // stage regardless of which path moved them into it.
+      await db.query('UPDATE customers SET stage_entered_at = NOW() WHERE id = $1', [id]);
 
       // Auto-enroll into any automation whose trigger is "enters this stage"
       await checkStageTrigger(id, newStage);

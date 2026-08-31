@@ -3,6 +3,7 @@ const app = require('./app')
 const cron = require('node-cron')
 const { startAutoReceiptSync } = require('./services/googleDriveSync')
 const { runDueSteps, checkTimeTriggers } = require('./services/automationEngine')
+const { checkStaleDeals, checkWinProbabilityDrops } = require('./services/pipelineAutoFlags')
 const { generateReportForMostRecentPeriod } = require('./routes/admin/adminFinancials')
 
 const PORT = process.env.PORT || 3000
@@ -30,6 +31,18 @@ app.listen(PORT, () => {
       }
     } catch (err) {
       console.error('Automation scheduler error:', err)
+    }
+
+    // Pipeline Intelligence auto-flags: one open task per customer per
+    // reason, guarded against duplicates -- see pipelineAutoFlags.js.
+    try {
+      const staleFlagged = await checkStaleDeals()
+      const wpDropFlagged = await checkWinProbabilityDrops()
+      if (staleFlagged > 0 || wpDropFlagged > 0) {
+        console.log(`Pipeline auto-flag tick: ${staleFlagged} stale deal(s), ${wpDropFlagged} win-probability drop(s) flagged`)
+      }
+    } catch (err) {
+      console.error('Pipeline auto-flag scheduler error:', err)
     }
   })
 
