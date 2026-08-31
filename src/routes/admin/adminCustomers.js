@@ -61,10 +61,9 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
     `);
 
     const data = result.rows.map((c) => {
-      const { stage_entered_at, ...rest } = c;
       const breakdown = computeWinProbability({
         sales_pipeline_stage: c.sales_pipeline_stage,
-        days_in_current_stage: daysBetween(stage_entered_at) ?? 0,
+        days_in_current_stage: daysBetween(c.stage_entered_at) ?? 0,
         days_since_last_contact: c.days_since_last_contact,
         primary_goal: c.primary_goal,
         protein_preference: c.protein_preference,
@@ -72,7 +71,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
         biggest_hurdle: c.biggest_hurdle,
       });
       return {
-        ...rest,
+        ...c,
         conversion_probability: breakdown.score,
         win_probability_momentum: breakdown.momentum,
         win_probability_recency: breakdown.recency,
