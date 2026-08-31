@@ -326,9 +326,14 @@ router.get('/week/:weekStart', requireAuth, requireRole('admin'), async (req, re
   try {
     const { weekStart } = req.params
     const result = await pool.query(
-      `SELECT t.*, s.display_name AS owner_name
+      `SELECT t.*, s.display_name AS owner_name,
+              COALESCE(ci.total, 0) AS checklist_total, COALESCE(ci.done, 0) AS checklist_done
        FROM tasks t
        LEFT JOIN users s ON t.owner_id = s.user_id
+       LEFT JOIN (
+         SELECT task_id, COUNT(*) AS total, COUNT(*) FILTER (WHERE is_completed) AS done
+         FROM task_checklist_items GROUP BY task_id
+       ) ci ON ci.task_id = t.id
        WHERE t.week_start = $1
        ORDER BY ${PRIORITY_RANK_SQL}, t.id`,
       [weekStart]
@@ -347,6 +352,60 @@ router.get('/week/:weekStart', requireAuth, requireRole('admin'), async (req, re
   }
 })
 
+// Per-recipe production status for the week -- one row per recipe (not per
+// task), aggregated across whichever Kitchen batch tasks reference it (a
+// recipe usually spans a Prep task and a separate Production task; this
+// merges both into one on-time/behind read). Powers the "This Week's
+// Recipes" status widget: due date is the *latest* task date a recipe
+// appears on (Production, since that's the real deadline -- prep happening
+// a day earlier doesn't move when the dish actually needs to be done),
+// completion is checklist items done/total summed across every task it's in.
+router.get('/week/:weekStart/recipe-status', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { weekStart } = req.params
+    const result = await pool.query(
+      `SELECT t.id AS task_id, t.due_date, t.title AS task_title,
+              ci.group_label, ci.category, r.image,
+              COUNT(*) AS total, COUNT(*) FILTER (WHERE ci.is_completed) AS done
+       FROM tasks t
+       JOIN task_checklist_items ci ON ci.task_id = t.id
+       LEFT JOIN recipes r ON r.name = ci.group_label
+       WHERE t.week_start = $1 AND t.department = 'Kitchen'
+         AND t.source_type LIKE 'weekly_recipe_plan%' AND ci.group_label IS NOT NULL
+       GROUP BY t.id, t.due_date, t.title, ci.group_label, ci.category, r.image
+       ORDER BY t.due_date`,
+      [weekStart]
+    )
+
+    const byRecipe = {}
+    for (const row of result.rows) {
+      const key = row.group_label
+      if (!byRecipe[key]) {
+        byRecipe[key] = { name: key, category: row.category, image: row.image || null, dueDate: row.due_date, taskId: row.task_id, taskIds: [], done: 0, total: 0 }
+      }
+      const r = byRecipe[key]
+      r.done += parseInt(row.done, 10)
+      r.total += parseInt(row.total, 10)
+      // Rows arrive ordered by due_date, so pushing here keeps taskIds in
+      // chronological order (Prep task before Production task) -- lets a
+      // client render a recipe's full checklist (both phases) in the right
+      // sequence instead of just whichever single task is "the" deadline.
+      if (!r.taskIds.includes(row.task_id)) r.taskIds.push(row.task_id)
+      // Latest due date wins -- that's the real deadline (Production day),
+      // and its task is what the widget should link into.
+      if (new Date(row.due_date) >= new Date(r.dueDate)) {
+        r.dueDate = row.due_date
+        r.taskId = row.task_id
+      }
+    }
+
+    res.json({ success: true, data: { week_start: weekStart, recipes: Object.values(byRecipe) } })
+  } catch (error) {
+    console.error('Error fetching recipe status:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
 // One operational day's tasks, grouped by department.
 router.get('/day/:weekStart/:day', requireAuth, requireRole('admin'), async (req, res) => {
   try {
@@ -355,9 +414,14 @@ router.get('/day/:weekStart/:day', requireAuth, requireRole('admin'), async (req
     if (dayError) return res.status(400).json({ error: dayError })
 
     const result = await pool.query(
-      `SELECT t.*, s.display_name AS owner_name
+      `SELECT t.*, s.display_name AS owner_name,
+              COALESCE(ci.total, 0) AS checklist_total, COALESCE(ci.done, 0) AS checklist_done
        FROM tasks t
        LEFT JOIN users s ON t.owner_id = s.user_id
+       LEFT JOIN (
+         SELECT task_id, COUNT(*) AS total, COUNT(*) FILTER (WHERE is_completed) AS done
+         FROM task_checklist_items GROUP BY task_id
+       ) ci ON ci.task_id = t.id
        WHERE t.week_start = $1 AND t.operational_day = $2
        ORDER BY ${PRIORITY_RANK_SQL}, t.id`,
       [weekStart, day]

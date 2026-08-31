@@ -181,6 +181,30 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   }
 });
 
+// PATCH just the store -- unlike PUT above, doesn't touch macros/allergens/
+// price, so the Shopping List can assign/correct where an ingredient is
+// bought without re-running USDA lookup or re-tagging allergens.
+router.patch('/:id/store', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { store } = req.body;
+
+    const result = await db.query(
+      'UPDATE inventory SET store = $1 WHERE id = $2 RETURNING id, name, store',
+      [store || '', id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Ingredient not found' });
+    }
+
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Error updating ingredient store:', error);
+    res.status(500).json({ error: 'Failed to update store' });
+  }
+});
+
 // DELETE inventory item
 router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {

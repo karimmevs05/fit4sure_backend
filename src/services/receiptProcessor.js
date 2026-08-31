@@ -38,12 +38,12 @@ function sleep(ms) {
  * Returns structured data ready for database storage
  */
 async function processReceiptWithAI(imageBase64, imageSource = 'unknown', mimeType = 'image/jpeg') {
-  // Free-tier quota is a shared per-day pool (20 requests/day as of this
-  // writing) across the whole batch, not per-receipt -- every retry attempt
-  // burns one of those requests even when it fails, so retrying here just
-  // means fewer *other* receipts in the batch get a first attempt at all.
-  // No retry until real quota (billing) is in place.
-  const MAX_ATTEMPTS = 1;
+  // A 503 "high demand" (or short-lived per-minute 429) means Gemini never
+  // actually processed the request -- it doesn't count against the shared
+  // per-day quota, so retrying it is free. Only a genuine per-day quota
+  // error (isDailyQuotaExceeded, excluded from isRetryableGeminiError) is
+  // the case where retrying would burn budget for nothing.
+  const MAX_ATTEMPTS = 3;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       return await processReceiptWithAIOnce(imageBase64, imageSource, mimeType);

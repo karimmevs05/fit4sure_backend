@@ -46,6 +46,90 @@ router.get('/weeks/list', requireAuth, requireRole('admin'), async (req, res) =>
   }
 });
 
+// GET /api/admin/prep/this-week/summary - compact performance summary for the
+// task dashboard: meals, revenue, COGS, margin, profit, prep time invested.
+// Defined before /:week so Express doesn't swallow "this-week" as a :week
+// param. Reuses the exact same recipe-linkage/ingredient-cost logic as
+// /:week (menu_plan_recipes -> recipe_ingredients -> inventory) so COGS here
+// always agrees with Weekly Prep's own total_cost_cents for the same week --
+// revenue is orders.total_price (stored in dollars, unlike every cost field
+// here which is cents) converted to cents once, up front, so profit/margin
+// never mixes units.
+router.get('/this-week/summary', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const weekResult = await db.query(`SELECT (date_trunc('week', NOW() + interval '1 day') - interval '1 day')::date AS week_start`);
+    const week = weekResult.rows[0].week_start.toISOString().slice(0, 10);
+
+    const summaryResult = await db.query(
+      `SELECT COALESCE(SUM(o.quantity), 0) AS total_meals, COALESCE(SUM(o.total_price), 0) AS total_revenue_dollars
+       FROM orders o
+       WHERE ${WEEK_BOUNDARY} = $1::date`,
+      [week]
+    );
+    const totalMeals = parseFloat(summaryResult.rows[0].total_meals) || 0;
+    const totalRevenueCents = Math.round((parseFloat(summaryResult.rows[0].total_revenue_dollars) || 0) * 100);
+
+    const menuTotalsResult = await db.query(
+      `SELECT m.id AS menu_id, o.quantity
+       FROM orders o
+       JOIN menus m ON o.menu_id = m.id
+       WHERE ${WEEK_BOUNDARY} = $1::date`,
+      [week]
+    );
+
+    const menuIds = [...new Set(menuTotalsResult.rows.map((r) => r.menu_id))];
+    const linkedResult = menuIds.length > 0
+      ? await db.query(`SELECT menu_id, recipe_id, servings FROM menu_plan_recipes WHERE menu_id = ANY($1::int[])`, [menuIds])
+      : { rows: [] };
+    const linksByMenu = {};
+    for (const l of linkedResult.rows) {
+      if (!linksByMenu[l.menu_id]) linksByMenu[l.menu_id] = [];
+      linksByMenu[l.menu_id].push(l);
+    }
+
+    const recipeIds = [...new Set(linkedResult.rows.map((l) => l.recipe_id))];
+    const recipesResult = recipeIds.length > 0
+      ? await db.query(`SELECT recipe_id, prep_time_minutes FROM recipes WHERE recipe_id = ANY($1::int[])`, [recipeIds])
+      : { rows: [] };
+    const prepTimeByRecipe = {};
+    for (const r of recipesResult.rows) prepTimeByRecipe[r.recipe_id] = parseFloat(r.prep_time_minutes) || 0;
+
+    let totalCogsCents = 0;
+    let prepTimeMinutes = 0;
+    for (const row of menuTotalsResult.rows) {
+      const qty = parseFloat(row.quantity) || 0;
+      const links = linksByMenu[row.menu_id] || [];
+      for (const link of links) {
+        const servings = parseFloat(link.servings) || 0;
+        const needs = await getRecipeIngredientNeeds(link.recipe_id, servings);
+        for (const ing of needs) {
+          if (ing.unitPriceCents == null) continue;
+          totalCogsCents += Math.round((ing.unitPriceCents / 453.592) * ing.gramsNeeded * qty);
+        }
+        prepTimeMinutes += (prepTimeByRecipe[link.recipe_id] || 0) * qty;
+      }
+    }
+
+    const profitCents = totalRevenueCents - totalCogsCents;
+    const marginPct = totalRevenueCents > 0 ? Math.round((profitCents / totalRevenueCents) * 1000) / 10 : 0;
+
+    res.json({
+      data: {
+        weekStart: week,
+        totalMeals: Math.round(totalMeals),
+        totalRevenueCents,
+        totalCogsCents,
+        profitCents,
+        marginPct,
+        prepTimeMinutes: Math.round(prepTimeMinutes),
+      },
+    });
+  } catch (error) {
+    console.error('Error computing this-week summary:', error);
+    res.status(500).json({ error: 'Failed to compute this-week summary' });
+  }
+});
+
 // GET /api/admin/prep/:week - real prep data for one week (week = ISO date, the week's Sunday)
 router.get('/:week', requireAuth, requireRole('admin'), async (req, res) => {
   try {

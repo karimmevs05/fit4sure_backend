@@ -3,7 +3,7 @@ const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const { google } = require('googleapis');
-const { CATEGORY_PRICES, findOrCreateMenu, getWeeklyMenu } = require('../../services/orderingService');
+const { CATEGORY_PRICES, ADD_ON_FORMATS, ADD_ON_FREE_PRICE, ADD_ON_EXTRA_PRICE, findOrCreateMenu, getWeeklyMenu } = require('../../services/orderingService');
 const { getRecipeIngredientNeeds } = require('../../utils/recipeCost');
 
 // The Google Sheet behind the weekly order Form. The "Order_Details" tab is
@@ -535,7 +535,20 @@ router.post('/sync-google-sheets', requireAuth, requireRole('admin'), async (req
 // for a non-responding customer)
 router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { customerId, customerName, mealName, category, quantity, dayOfWeek, notes } = req.body;
+    const { customerId, customerName, mealName, category, quantity, dayOfWeek, notes, price: submittedPrice } = req.body;
+
+    // Sides/sauces are add-ons whose real price depends on how many others
+    // are already in that day's order (sides: first 2 free; sauces: first 1
+    // free; every one after that is +$2.50) -- same reasoning as
+    // publicOrdering.js. CATEGORY_PRICES can't represent that, so for these
+    // two formats only, trust the admin picker's computed price, clamped to
+    // exactly one of the two legitimate values.
+    if (ADD_ON_FORMATS.includes(category)) {
+      const clean = Number(submittedPrice);
+      if (clean !== ADD_ON_FREE_PRICE && clean !== ADD_ON_EXTRA_PRICE) {
+        return res.status(400).json({ error: 'invalid add-on price' });
+      }
+    }
 
     const resolvedCustomerId = customerId || await findOrCreateCustomer(customerName);
     const menuId = await findOrCreateMenu(mealName, category);
@@ -544,9 +557,14 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
       return res.status(400).json({ error: 'customer, meal, and quantity are required' });
     }
 
-    const menuPriceResult = await db.query('SELECT price FROM menus WHERE id = $1', [menuId]);
-    const price = menuPriceResult.rows[0]?.price;
-    const totalPrice = price != null ? price * quantity : null;
+    let totalPrice;
+    if (ADD_ON_FORMATS.includes(category)) {
+      totalPrice = Number(submittedPrice) * quantity;
+    } else {
+      const menuPriceResult = await db.query('SELECT price FROM menus WHERE id = $1', [menuId]);
+      const price = menuPriceResult.rows[0]?.price;
+      totalPrice = price != null ? price * quantity : null;
+    }
 
     const result = await db.query(
       `INSERT INTO orders (customer_id, menu_id, quantity, day_of_week, total_price, source, notes, created_at, updated_at)

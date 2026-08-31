@@ -11,11 +11,21 @@ const db = require('../config/db');
 // recipe-plan formats (High Protein / Low Carb / 1 Pound) -- swap for real
 // numbers once confirmed; nothing else needs to change since every caller
 // reads this table directly rather than hardcoding prices of its own.
-// Not a real customer-facing "format" -- carb/veggie sides added under a
-// selected protein format are free, since the plate-structure serving
-// sizes table means that format's price already covers this serving. This
-// is just the price-tier key a side order line resolves to.
+// Not real customer-facing "formats" -- carb/veggie sides and sauces added
+// under a selected protein are add-ons, each with their own free allowance
+// (sides: first 2 free; sauces: first 1 free) before every one after costs
+// $ADD_ON_EXTRA_PRICE (tracked per-group client-side, since which ones in a
+// batch are "first" depends on tap order within that specific plate).
+// Because the same (name, format) menu row can't hold two different prices
+// for two different orders, these two formats are the one case where the
+// client's submitted price is trusted (see publicOrdering.js) rather than
+// looked up from CATEGORY_PRICES -- but only ever exactly ADD_ON_FREE_PRICE
+// or ADD_ON_EXTRA_PRICE, never an arbitrary client-supplied number.
 const SIDE_FORMAT = 'Included Side';
+const SAUCE_ADDON_FORMAT = 'Sauce Add-On';
+const ADD_ON_FORMATS = [SIDE_FORMAT, SAUCE_ADDON_FORMAT];
+const ADD_ON_FREE_PRICE = 0;
+const ADD_ON_EXTRA_PRICE = 2.5;
 
 const CATEGORY_PRICES = {
   Regular: 13.79,
@@ -24,7 +34,8 @@ const CATEGORY_PRICES = {
   'Low Carb': 13.79,
   '1 Pound': 19.79,
   Breakfast: 11.30,
-  [SIDE_FORMAT]: 0,
+  [SIDE_FORMAT]: ADD_ON_FREE_PRICE,
+  [SAUCE_ADDON_FORMAT]: ADD_ON_FREE_PRICE,
 };
 
 // The five formats offered per live recipe, sourced from the Weekly Recipe
@@ -151,6 +162,7 @@ async function getPerPoundMacrosByRecipe(recipeIds) {
        SUM(COALESCE(ri.quantity_g, 0)) AS total_weight_g,
        SUM(COALESCE(ri.quantity_g, 0) * COALESCE(i.calories_per_100g, 0) / 100) AS total_calories,
        SUM(COALESCE(ri.quantity_g, 0) * COALESCE(i.protein_per_100g, 0) / 100) AS total_protein,
+       SUM(COALESCE(ri.quantity_g, 0) * COALESCE(i.carbs_per_100g, 0) / 100) AS total_carbs,
        SUM(COALESCE(ri.quantity_g, 0) * COALESCE(i.fat_per_100g, 0) / 100) AS total_fat
      FROM recipe_ingredients ri
      LEFT JOIN inventory i ON ri.inventory_id = i.id
@@ -165,6 +177,7 @@ async function getPerPoundMacrosByRecipe(recipeIds) {
       ? {
           calories: Math.round((parseFloat(row.total_calories) * GRAMS_PER_POUND) / totalWeightG),
           protein_g: ((parseFloat(row.total_protein) * GRAMS_PER_POUND) / totalWeightG).toFixed(1),
+          carbs_g: ((parseFloat(row.total_carbs) * GRAMS_PER_POUND) / totalWeightG).toFixed(1),
           fat_g: ((parseFloat(row.total_fat) * GRAMS_PER_POUND) / totalWeightG).toFixed(1),
         }
       : null;
@@ -215,12 +228,21 @@ async function getWeeklyMenu() {
   const monday = buildBlock('monday');
   const thursday = buildBlock('thursday');
 
+  // Ready means "the chef explicitly published this week" -- not just
+  // "a block happens to have a recipe in it". Without this, every in-
+  // progress edit while building the week (Save Block, Add to Block) would
+  // go instantly live to real customers before the plan was finished.
+  const publishResult = await db.query(
+    'SELECT 1 FROM weekly_menu_publish_state WHERE planned_week_start = $1',
+    [weekStart]
+  );
+
   return {
     weekStart,
     monday,
     thursday,
     breakfast: breakfastResult.rows,
-    menuReady: monday.length > 0 || thursday.length > 0,
+    menuReady: publishResult.rows.length > 0,
   };
 }
 
@@ -228,6 +250,10 @@ module.exports = {
   CATEGORY_PRICES,
   RECIPE_FORMATS,
   SIDE_FORMAT,
+  SAUCE_ADDON_FORMAT,
+  ADD_ON_FORMATS,
+  ADD_ON_FREE_PRICE,
+  ADD_ON_EXTRA_PRICE,
   BY_THE_LB_PRICES,
   guessByTheLbType,
   findOrCreateMenu,

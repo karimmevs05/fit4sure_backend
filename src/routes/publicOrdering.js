@@ -7,7 +7,17 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
-const { RECIPE_FORMATS, SIDE_FORMAT, findOrCreateMenu, findOrCreateCustomerByContact, getWeeklyMenu } = require('../services/orderingService');
+const {
+  RECIPE_FORMATS,
+  SIDE_FORMAT,
+  SAUCE_ADDON_FORMAT,
+  ADD_ON_FORMATS,
+  ADD_ON_FREE_PRICE,
+  ADD_ON_EXTRA_PRICE,
+  findOrCreateMenu,
+  findOrCreateCustomerByContact,
+  getWeeklyMenu,
+} = require('../services/orderingService');
 
 // GET /api/public/menu - same shape as the admin picker's weekly-menu, no auth.
 router.get('/menu', async (req, res) => {
@@ -40,6 +50,15 @@ router.post('/orders', async (req, res) => {
 
   try {
     const menu = await getWeeklyMenu();
+    // The order page shows the draft plan for browsing before it's
+    // published (customers can see what's coming, pick formats, build a
+    // cart), but real submission stays blocked server-side until the chef
+    // actually publishes -- the page's own disabled Submit button is only
+    // the UI half of this; without this check here, a direct POST could
+    // place a real order against an unfinished, still-changing plan.
+    if (!menu.menuReady) {
+      return res.status(403).json({ error: "This week's menu hasn't been published yet -- check back soon to order." });
+    }
     const liveRecipesByDay = {
       monday: new Set(menu.monday.map((r) => r.name)),
       thursday: new Set(menu.thursday.map((r) => r.name)),
@@ -58,15 +77,34 @@ router.post('/orders', async (req, res) => {
       const recipeName = (item.recipeName || '').trim();
 
       if (!['monday', 'thursday'].includes(day)) { errors.push({ item, reason: 'invalid day' }); continue; }
-      if (!RECIPE_FORMATS.includes(format) && format !== SIDE_FORMAT) { errors.push({ item, reason: 'invalid format' }); continue; }
+      if (!RECIPE_FORMATS.includes(format) && format !== SIDE_FORMAT && format !== SAUCE_ADDON_FORMAT) { errors.push({ item, reason: 'invalid format' }); continue; }
       if (!quantity || quantity <= 0) { errors.push({ item, reason: 'invalid quantity' }); continue; }
       if (!recipeName || !liveRecipesByDay[day].has(recipeName)) { errors.push({ item, reason: 'recipe is not on this week\'s live menu' }); continue; }
 
+      // Sides/sauces are add-ons whose real price depends on tap order within
+      // this specific plate (sides: first 2 free; sauces: first 1 free;
+      // every one after that is +$2.50) -- that can't be looked up from the
+      // fixed CATEGORY_PRICES table, so for these two formats only, trust
+      // the client's submitted price, but strictly clamp it to one of the
+      // two legitimate values first.
+      if (ADD_ON_FORMATS.includes(format)) {
+        const submittedPrice = Number(item.price);
+        if (submittedPrice !== ADD_ON_FREE_PRICE && submittedPrice !== ADD_ON_EXTRA_PRICE) {
+          errors.push({ item, reason: 'invalid add-on price' });
+          continue;
+        }
+      }
+
       try {
         const menuId = await findOrCreateMenu(recipeName, format);
-        const menuPriceResult = await db.query('SELECT price FROM menus WHERE id = $1', [menuId]);
-        const price = menuPriceResult.rows[0]?.price;
-        const totalPrice = price != null ? price * quantity : null;
+        let totalPrice;
+        if (ADD_ON_FORMATS.includes(format)) {
+          totalPrice = Number(item.price) * quantity;
+        } else {
+          const menuPriceResult = await db.query('SELECT price FROM menus WHERE id = $1', [menuId]);
+          const price = menuPriceResult.rows[0]?.price;
+          totalPrice = price != null ? price * quantity : null;
+        }
 
         const result = await db.query(
           `INSERT INTO orders (customer_id, menu_id, quantity, day_of_week, total_price, source, notes, created_at, updated_at)

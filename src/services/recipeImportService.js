@@ -49,23 +49,36 @@ async function withGeminiRetry(fn) {
 }
 
 // Same conversion table as adminRecipes.js convertToGrams -- kept local so
-// this service has no dependency on that route file.
+// this service has no dependency on that route file. Mass units (g/kg/oz/lb)
+// and countable "each" convert the same regardless of wet/dry. ml/l are
+// liquid-only by definition, so no ambiguity there either. cup/tbsp/tsp are
+// the ambiguous ones -- "1 cup" of water and "1 cup" of flour are roughly
+// half the weight apart -- so those get a separate wet vs dry table below.
 const UNIT_TO_GRAMS = {
   g: 1,
   kg: 1000,
   oz: 28.3495,
   lb: 453.592,
-  cup: 240,
-  tbsp: 15,
-  tsp: 5,
   ml: 1,
   l: 1000,
   each: 100, // countable items (e.g. "2 eggs") with no weight given -- rough placeholder, always flagged low-confidence
 }
 
-function toGrams(quantity, unit) {
+// Water-density volume conversion, for liquids/pourables (milk, oil, honey,
+// broth, sauce).
+const WET_VOLUME_TO_GRAMS = { cup: 240, tbsp: 15, tsp: 5 }
+
+// Flour-density approximation, for dry/scoopable goods (flour, sugar, rice,
+// oats, spices). No single number is exact across every dry ingredient, but
+// this is far closer than assuming water density for something you scoop
+// instead of pour.
+const DRY_VOLUME_TO_GRAMS = { cup: 120, tbsp: 7.5, tsp: 2.5 }
+
+function toGrams(quantity, unit, isLiquid = true) {
   const q = Number(quantity) || 0
-  const factor = UNIT_TO_GRAMS[(unit || 'g').toLowerCase()] ?? 1
+  const normalizedUnit = (unit || 'g').toLowerCase()
+  const volumeTable = isLiquid ? WET_VOLUME_TO_GRAMS : DRY_VOLUME_TO_GRAMS
+  const factor = UNIT_TO_GRAMS[normalizedUnit] ?? volumeTable[normalizedUnit] ?? 1
   return Math.round(q * factor)
 }
 
@@ -81,7 +94,7 @@ Schema:
     { "title": string (short, 2-5 words, e.g. "Brown the turkey" -- can be empty string if the source has no natural step titles), "description": string (what to do, in your own words -- do not copy the source text verbatim), "time_estimate_minutes": number or null (only set this if the source gives or clearly implies a duration for this specific step, e.g. "simmer 20 minutes" -- otherwise null, do not guess) }
   ],
   "ingredients": [
-    { "raw_text": string (the original ingredient line), "name": string (just the ingredient, no quantity/notes), "quantity": number, "unit": one of "g","kg","oz","lb","cup","tbsp","tsp","ml","l","each", "low_confidence": boolean (true if the quantity or unit was ambiguous in the source and you had to guess) }
+    { "raw_text": string (the original ingredient line), "name": string (just the ingredient, no quantity/notes), "quantity": number, "unit": one of "g","kg","oz","lb","cup","tbsp","tsp","ml","l","each", "is_liquid": boolean (only matters for cup/tbsp/tsp, where the same volume weighs very differently poured vs scooped -- true for something poured/liquid at room temp: milk, oil, honey, broth, sauce, water, juice, melted butter; false for something scooped/dry: flour, sugar, rice, oats, spices, shredded cheese, chopped vegetables. For g/kg/oz/lb/ml/l/each this doesn't change the conversion, but still set it accurately), "low_confidence": boolean (true if the quantity or unit was ambiguous in the source and you had to guess) }
   ]
 }
 
@@ -278,7 +291,8 @@ async function matchIngredientsToInventory(extractedIngredients) {
     return {
       raw_text: ing.raw_text,
       name: ing.name,
-      quantity_g: toGrams(ing.quantity, ing.unit),
+      quantity_g: toGrams(ing.quantity, ing.unit, ing.is_liquid !== false),
+      is_liquid: ing.is_liquid !== false,
       low_confidence: !!ing.low_confidence,
       match:
         confidence === 'none'

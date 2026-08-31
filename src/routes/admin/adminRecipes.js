@@ -41,11 +41,30 @@ function stepsToInstructionsText(steps) {
 }
 
 // Calculate recipe macros from ingredients
+//
+// Cooking changes an ingredient's WEIGHT (water loss/gain) but not the
+// nutrients actually in it -- a grilled chicken breast has the same total
+// protein as the raw breast it came from, just less water. So nutrient
+// totals here are always computed from the raw quantity_g on file, exactly
+// as before. What changes is totalWeightG (returned and used downstream
+// for "per pound of the recipe" and cost-per-pound): it's now the sum of
+// each ingredient's *cooked* weight, via the cooking_methods/
+// ingredient_cooking_yields tables (same effective-yield lookup as
+// computeYieldCorrectedRecipe in adminCookingMethods.js -- per-ingredient
+// override > cooking method's typical yield % > 0/no change). Any
+// ingredient with no cooking_method_id set (every recipe as of this
+// writing) gets 0% yield, i.e. identical to the old raw-weight behavior --
+// this only changes anything once a recipe's ingredients are actually
+// tagged with a cooking method in the builder.
 async function calculateRecipeMacros(recipeId, servings) {
   const ingredientsResult = await pool.query(
-    `SELECT ri.quantity_g, i.protein_per_100g, i.carbs_per_100g, i.fat_per_100g, i.calories_per_100g
+    `SELECT ri.quantity_g, ri.cooking_method_id, i.protein_per_100g, i.carbs_per_100g, i.fat_per_100g, i.calories_per_100g,
+            cm.typical_yield_pct, icy.yield_pct AS override_yield_pct
      FROM recipe_ingredients ri
      LEFT JOIN inventory i ON ri.inventory_id = i.id
+     LEFT JOIN cooking_methods cm ON ri.cooking_method_id = cm.id
+     LEFT JOIN ingredient_cooking_yields icy
+       ON icy.inventory_id = ri.inventory_id AND icy.cooking_method_id = ri.cooking_method_id
      WHERE ri.recipe_id = $1`,
     [recipeId]
   )
@@ -60,33 +79,39 @@ async function calculateRecipeMacros(recipeId, servings) {
   let totalProtein = 0
   let totalCarbs = 0
   let totalFat = 0
-  let totalWeightG = 0
+  let totalCookedWeightG = 0
 
   for (const ing of ingredientsResult.rows) {
     // pg returns numeric columns as strings -- plain += would silently
     // string-concatenate instead of add (e.g. "3000.00" + "10.00" ->
     // "03000.0010.00"), unlike the multiplication below which coerces fine.
-    totalWeightG += parseFloat(ing.quantity_g) || 0
+    const rawG = parseFloat(ing.quantity_g) || 0
+    const yieldPct = ing.override_yield_pct != null
+      ? parseFloat(ing.override_yield_pct)
+      : (ing.typical_yield_pct != null ? parseFloat(ing.typical_yield_pct) : 0)
+    totalCookedWeightG += rawG * (1 + yieldPct / 100)
     if (ing.quantity_g && ing.calories_per_100g) {
-      totalCalories += (ing.calories_per_100g * ing.quantity_g) / 100
-      totalProtein += (ing.protein_per_100g * ing.quantity_g) / 100
-      totalCarbs += (ing.carbs_per_100g * ing.quantity_g) / 100
-      totalFat += (ing.fat_per_100g * ing.quantity_g) / 100
+      totalCalories += (ing.calories_per_100g * rawG) / 100
+      totalProtein += (ing.protein_per_100g * rawG) / 100
+      totalCarbs += (ing.carbs_per_100g * rawG) / 100
+      totalFat += (ing.fat_per_100g * rawG) / 100
     }
   }
 
   // Divide by servings to get per-serving macros
   const divisor = servings || 1
 
-  // Also express as "per pound (453.6g) of the recipe" -- a unit that lets
-  // you compare recipes regardless of how many servings each one claims,
-  // since "per serving" is only as meaningful as that number is accurate.
-  const perPound = totalWeightG > 0
+  // Also express as "per pound (453.6g) of the finished recipe" -- a unit
+  // that lets you compare recipes regardless of how many servings each one
+  // claims, since "per serving" is only as meaningful as that number is
+  // accurate. Uses cooked weight, since a pound bought/forecasted for a
+  // block is a pound of the finished dish, not a pound of raw inputs.
+  const perPound = totalCookedWeightG > 0
     ? {
-        calories: Math.round((totalCalories * GRAMS_PER_POUND) / totalWeightG),
-        protein_g: ((totalProtein * GRAMS_PER_POUND) / totalWeightG).toFixed(1),
-        carbs_g: ((totalCarbs * GRAMS_PER_POUND) / totalWeightG).toFixed(1),
-        fat_g: ((totalFat * GRAMS_PER_POUND) / totalWeightG).toFixed(1),
+        calories: Math.round((totalCalories * GRAMS_PER_POUND) / totalCookedWeightG),
+        protein_g: ((totalProtein * GRAMS_PER_POUND) / totalCookedWeightG).toFixed(1),
+        carbs_g: ((totalCarbs * GRAMS_PER_POUND) / totalCookedWeightG).toFixed(1),
+        fat_g: ((totalFat * GRAMS_PER_POUND) / totalCookedWeightG).toFixed(1),
       }
     : emptyPerPound
 
@@ -96,7 +121,7 @@ async function calculateRecipeMacros(recipeId, servings) {
     carbs_g: (totalCarbs / divisor).toFixed(1),
     fat_g: (totalFat / divisor).toFixed(1),
     per_pound: perPound,
-    totalWeightG,
+    totalWeightG: totalCookedWeightG,
   }
 }
 
@@ -114,7 +139,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
       result.rows.map(async (recipe) => {
         try {
           const ingredientsResult = await pool.query(
-            `SELECT ri.quantity_g, i.name, i.unit_price_cents, i.suggested_serving_g
+            `SELECT ri.quantity_g, ri.prep_section, i.name, i.unit_price_cents, i.suggested_serving_g, i.store
              FROM recipe_ingredients ri
              LEFT JOIN inventory i ON ri.inventory_id = i.id
              WHERE ri.recipe_id = $1`,
@@ -148,7 +173,8 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
             cost_per_serving_cents: costPerServingCents,
             cost_per_pound_cents: costPerPoundCents(totalCostCents, totalWeightG),
             total_recipe_cost_cents: totalCostCents,
-            suggested_serving_g: mainIngredient ? mainIngredient.suggested_serving_g : null
+            suggested_serving_g: mainIngredient ? mainIngredient.suggested_serving_g : null,
+            main_ingredient_store: mainIngredient ? mainIngredient.store : null
           }
         } catch (err) {
           console.error(`Error calculating cost for recipe ${recipe.recipe_id}:`, err)
@@ -169,7 +195,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
 // GET recalculates it live from recipe_ingredients + current inventory pricing,
 // so it will always reflect the latest inventory prices regardless of what's
 // stored at creation time.
-// Expected `ingredients` shape: [{ inventory_id: number, quantity_g: number }]
+// Expected `ingredients` shape: [{ inventory_id: number, quantity_g: number, prep_section?: 'dry' | 'wet' }]
 router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
   const { name, category, prep_time_minutes, servings, instructions, calories, protein_g, carbs_g, fat_g, tags, image, ingredients, steps } = req.body
 
@@ -194,9 +220,9 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
       for (const ing of ingredients) {
         if (!ing.inventory_id || !ing.quantity_g) continue
         await pool.query(
-          `INSERT INTO recipe_ingredients (recipe_id, inventory_id, quantity_g)
-           VALUES ($1, $2, $3)`,
-          [recipe.recipe_id, ing.inventory_id, ing.quantity_g]
+          `INSERT INTO recipe_ingredients (recipe_id, inventory_id, quantity_g, prep_section, cooking_method_id)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [recipe.recipe_id, ing.inventory_id, ing.quantity_g, ing.prep_section || 'dry', ing.cooking_method_id || null]
         )
       }
     }
@@ -231,8 +257,9 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
     if (!recipeResult.rows[0]) return res.status(404).json({ error: 'Recipe not found' })
 
     const ingredientsResult = await pool.query(
-      `SELECT ri.id, ri.inventory_id, i.name, i.category, ri.quantity_g, i.unit_price_cents, i.protein_per_100g, i.carbs_per_100g, i.fat_per_100g, i.calories_per_100g
+      `SELECT ri.id, ri.inventory_id, i.name, i.category, ri.quantity_g, ri.prep_section, ri.cooking_method_id, cm.name AS cooking_method_name, i.unit_price_cents, i.protein_per_100g, i.carbs_per_100g, i.fat_per_100g, i.calories_per_100g
        FROM recipe_ingredients ri
+       LEFT JOIN cooking_methods cm ON ri.cooking_method_id = cm.id
        LEFT JOIN inventory i ON ri.inventory_id = i.id
        WHERE ri.recipe_id = $1
        ORDER BY i.name`,
@@ -313,9 +340,9 @@ router.put('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
       for (const ing of ingredients) {
         if (!ing.inventory_id || !ing.quantity_g) continue
         await pool.query(
-          `INSERT INTO recipe_ingredients (recipe_id, inventory_id, quantity_g)
-           VALUES ($1, $2, $3)`,
-          [req.params.recipe_id, ing.inventory_id, ing.quantity_g]
+          `INSERT INTO recipe_ingredients (recipe_id, inventory_id, quantity_g, prep_section, cooking_method_id)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [req.params.recipe_id, ing.inventory_id, ing.quantity_g, ing.prep_section || 'dry', ing.cooking_method_id || null]
         )
       }
     }

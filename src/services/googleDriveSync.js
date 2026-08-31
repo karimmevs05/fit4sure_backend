@@ -92,7 +92,7 @@ async function getUnprocessedReceipts(folderId) {
     const allFilesResponse = await drive.files.list({
       q: `'${folderId}' in parents and trashed=false`,
       spaces: 'drive',
-      fields: 'files(id, name, mimeType, createdTime)',
+      fields: 'files(id, name, mimeType, createdTime, md5Checksum)',
       pageSize: 50,
       orderBy: 'createdTime desc',
     });
@@ -156,15 +156,53 @@ async function getFileViewLink(fileId) {
   }
 }
 
+// A receipt that keeps failing for a real (non-transient) reason -- a
+// corrupt image, a format Gemini can't read, a persistently garbled
+// response -- would otherwise sit in the inbox and get silently
+// re-attempted (and re-billed against the shared daily quota) on every
+// single sync forever. After this many failures it gets moved out of the
+// inbox into a "Needs Attention" folder for a human to look at instead.
+const QUARANTINE_AFTER_FAILURES = 3;
+
 /**
- * Move processed receipt to archive folder
+ * Record a parse failure for a Drive file and return its running count.
+ * Persisted in the DB (not in-memory) because failures happen across
+ * separate sync runs, potentially days apart.
  */
-async function archiveReceipt(fileId, fileName) {
+async function recordParseFailure(driveFileId, filename, errorMessage) {
+  const result = await db.query(`
+    INSERT INTO receipt_parse_failures (drive_file_id, filename, fail_count, last_error, last_attempted_at)
+    VALUES ($1, $2, 1, $3, NOW())
+    ON CONFLICT (drive_file_id) DO UPDATE SET
+      fail_count = receipt_parse_failures.fail_count + 1,
+      filename = EXCLUDED.filename,
+      last_error = EXCLUDED.last_error,
+      last_attempted_at = NOW()
+    RETURNING fail_count
+  `, [driveFileId, filename, errorMessage]);
+  return result.rows[0].fail_count;
+}
+
+/**
+ * A file that eventually parses successfully (maybe today's Gemini hiccup
+ * is gone, or someone re-uploaded a cleaner photo under the same id --
+ * doesn't happen, but harmless either way) shouldn't carry stale failure
+ * history into the future.
+ */
+async function clearParseFailure(driveFileId) {
+  await db.query('DELETE FROM receipt_parse_failures WHERE drive_file_id = $1', [driveFileId]);
+}
+
+/**
+ * Move a file into an arbitrary named subfolder of the receipts folder --
+ * shared by both the "Processed" archive and the "Needs Attention"
+ * quarantine folder, just with a different destination name.
+ */
+async function moveReceiptToFolder(fileId, fileName, folderName) {
   try {
     if (!drive) initializeDrive();
 
-    // Create archive folder if needed
-    const archiveFolder = await getOrCreateReceiptsFolder('Fit4Sure Receipts/Processed');
+    const targetFolder = await getOrCreateReceiptsFolder(folderName);
 
     // removeParents must name the file's ACTUAL current parent(s), not the
     // literal string 'root' -- this receipt lives in the "Fit4Sure Receipts"
@@ -174,23 +212,29 @@ async function archiveReceipt(fileId, fileName) {
     const current = await drive.files.get({ fileId, fields: 'parents' });
     const currentParents = (current.data.parents || []).join(',');
 
-    // Move file to archive
     await drive.files.update({
       fileId,
-      addParents: archiveFolder,
+      addParents: targetFolder,
       removeParents: currentParents || undefined,
       fields: 'id, parents',
     });
 
-    console.log(`Archived receipt: ${fileName}`);
+    console.log(`Moved receipt to ${folderName}: ${fileName}`);
   } catch (error) {
     // Gaxios errors carry a huge circular object (full request/response) --
     // logging it whole floods the logs with ~100+ lines per failure. The
     // message alone is enough to see what's wrong (usually a Drive sharing
     // permission issue on that specific file).
-    console.error(`Error archiving receipt ${fileName}: ${error.message}`);
-    // Don't throw - continue processing even if archiving fails
+    console.error(`Error moving receipt ${fileName} to ${folderName}: ${error.message}`);
+    // Don't throw - continue processing even if the move fails
   }
+}
+
+/**
+ * Move processed receipt to archive folder
+ */
+async function archiveReceipt(fileId, fileName) {
+  return moveReceiptToFolder(fileId, fileName, 'Fit4Sure Receipts/Processed');
 }
 
 /**
@@ -217,6 +261,7 @@ async function parseReceiptsFromDrive() {
 
   const parsed = [];
   const failed = [];
+  const seenChecksums = new Map(); // md5Checksum -> filename of the copy we're keeping
 
   for (const receipt of receipts) {
     try {
@@ -232,24 +277,48 @@ async function parseReceiptsFromDrive() {
         continue;
       }
 
+      // A byte-identical copy of a file already queued in this same batch
+      // (same photo uploaded twice) -- skip the Gemini call entirely and
+      // just archive the extra copy alongside the one we do parse.
+      if (receipt.md5Checksum && seenChecksums.has(receipt.md5Checksum)) {
+        const keptAs = seenChecksums.get(receipt.md5Checksum);
+        console.log(`Duplicate of ${keptAs} (identical file), skipping parse and archiving: ${receipt.name}`);
+        await archiveReceipt(receipt.id, receipt.name);
+        continue;
+      }
+      if (receipt.md5Checksum) seenChecksums.set(receipt.md5Checksum, receipt.name);
+
       console.log(`Parsing: ${receipt.name}`);
       const base64Image = await downloadImageAsBase64(receipt.id);
       const receiptData = await processReceiptWithAI(base64Image, receipt.name, receipt.mimeType);
       const driveViewLink = await getFileViewLink(receipt.id);
       parsed.push({ driveFileId: receipt.id, fileName: receipt.name, driveViewLink, createdTime: receipt.createdTime, ...receiptData });
+      await clearParseFailure(receipt.id);
       console.log(`✓ Parsed: ${receipt.name}`);
     } catch (error) {
       console.error(`✗ Failed to parse ${receipt.name}:`, error.message);
-      failed.push({ filename: receipt.name, error: error.message });
 
       // The daily quota isn't coming back this run -- every remaining file
       // would fail the same way, so stop burning API calls on them. They're
       // never archived on failure, so they stay in the Drive inbox and get
-      // picked up again on the next sync once quota resets.
+      // picked up again on the next sync once quota resets. Also don't count
+      // this attempt toward quarantine -- it never got a real shot.
       if (isDailyQuotaExceeded(error)) {
+        failed.push({ filename: receipt.name, error: error.message });
         const remaining = receipts.length - (parsed.length + failed.length);
         console.warn(`Gemini daily quota exceeded -- stopping this sync run with ${remaining} receipt(s) still queued for next time.`);
         break;
+      }
+
+      // A genuine (non-quota) failure -- track it so a file that keeps
+      // failing the same way doesn't just quietly burn a request on every
+      // future sync forever.
+      const failCount = await recordParseFailure(receipt.id, receipt.name, error.message);
+      if (failCount >= QUARANTINE_AFTER_FAILURES) {
+        await moveReceiptToFolder(receipt.id, receipt.name, 'Fit4Sure Receipts/Needs Attention');
+        failed.push({ filename: receipt.name, error: `${error.message} (failed ${failCount}x -- moved to "Needs Attention", won't retry automatically)` });
+      } else {
+        failed.push({ filename: receipt.name, error: `${error.message} (attempt ${failCount}/${QUARANTINE_AFTER_FAILURES})` });
       }
     }
   }
