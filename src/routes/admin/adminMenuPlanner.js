@@ -118,18 +118,20 @@ router.get('/current-week', requireAuth, requireRole('admin'), async (req, res) 
   try {
     const { sunday } = await getCurrentWeekDates();
     const result = await db.query(
-      `SELECT wrp.block, COALESCE(r.name, wrp.custom_name) AS name
+      `SELECT wrp.block, COALESCE(r.name, wrp.custom_name) AS name,
+              COALESCE(r.category, 'custom') AS category, wrp.recipe_id
        FROM weekly_recipe_plan wrp
        LEFT JOIN recipes r ON r.recipe_id = wrp.recipe_id
        WHERE wrp.planned_week_start = $1
        ORDER BY wrp.block, name`,
       [sunday]
     );
+    const toItem = (r) => ({ name: r.name, category: r.category, recipeId: r.recipe_id });
     res.json({
       data: {
         weekStart: sunday.toISOString().slice(0, 10),
-        monday: result.rows.filter(r => r.block === 'monday').map(r => r.name),
-        thursday: result.rows.filter(r => r.block === 'thursday').map(r => r.name),
+        monday: result.rows.filter(r => r.block === 'monday').map(toItem),
+        thursday: result.rows.filter(r => r.block === 'thursday').map(toItem),
       },
     });
   } catch (error) {
