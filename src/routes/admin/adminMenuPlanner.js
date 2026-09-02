@@ -118,7 +118,7 @@ router.get('/current-week', requireAuth, requireRole('admin'), async (req, res) 
   try {
     const { sunday } = await getCurrentWeekDates();
     const result = await db.query(
-      `SELECT wrp.block, COALESCE(r.name, wrp.custom_name) AS name,
+      `SELECT wrp.id, wrp.block, COALESCE(r.name, wrp.custom_name) AS name,
               COALESCE(r.category, 'custom') AS category, wrp.recipe_id, wrp.expected_volume
        FROM weekly_recipe_plan wrp
        LEFT JOIN recipes r ON r.recipe_id = wrp.recipe_id
@@ -126,7 +126,7 @@ router.get('/current-week', requireAuth, requireRole('admin'), async (req, res) 
        ORDER BY wrp.block, name`,
       [sunday]
     );
-    const toItem = (r) => ({ name: r.name, category: r.category, recipeId: r.recipe_id, expectedVolume: r.expected_volume });
+    const toItem = (r) => ({ id: r.id, name: r.name, category: r.category, recipeId: r.recipe_id, expectedVolume: r.expected_volume });
     res.json({
       data: {
         weekStart: sunday.toISOString().slice(0, 10),
@@ -137,6 +137,33 @@ router.get('/current-week', requireAuth, requireRole('admin'), async (req, res) 
   } catch (error) {
     console.error('Error fetching current week menu:', error);
     res.status(500).json({ error: 'Failed to fetch current week menu' });
+  }
+});
+
+// Corrects the forecasted lb for one already-live weekly_recipe_plan row --
+// used from This Week's Menu to fix a number after the fact, not from the
+// Block 1/Block 2 planner (that's next week's draft, saved via the
+// replace-all POST /recipe-plan below). Deliberately does NOT re-run
+// syncKitchenPrepTasks/syncProcurementTask the way saving a block does --
+// this week's prep tasks may already be underway with checklist items
+// checked off, and regenerating them would wipe that progress. A number
+// correction here is just that: a number correction, not a re-plan.
+router.patch('/weekly-plan/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { expected_volume } = req.body;
+    const volume = Number(expected_volume);
+    if (!Number.isFinite(volume) || volume < 0) {
+      return res.status(400).json({ error: 'expected_volume must be a non-negative number' });
+    }
+    const result = await db.query(
+      `UPDATE weekly_recipe_plan SET expected_volume = $1, updated_at = NOW() WHERE id = $2 RETURNING id, expected_volume`,
+      [volume, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Plan item not found' });
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Error updating weekly plan item:', error);
+    res.status(500).json({ error: 'Failed to update quantity' });
   }
 });
 
