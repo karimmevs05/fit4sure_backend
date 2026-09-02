@@ -18,6 +18,20 @@ async function getNextWeekDates() {
   return { sunday: sundayDate, monday, thursday };
 }
 
+// Same Sunday-anchored boundary as getNextWeekDates, minus the +7 days --
+// this is the week actually live right now (what's on the plate today),
+// not the one currently being drafted for next week.
+async function getCurrentWeekDates() {
+  const result = await db.query(`
+    SELECT (date_trunc('week', NOW() + interval '1 day') - interval '1 day')::date AS sunday
+  `);
+  const sunday = result.rows[0].sunday;
+  const sundayDate = new Date(sunday);
+  const monday = new Date(sundayDate); monday.setDate(sundayDate.getDate() + 1);
+  const thursday = new Date(sundayDate); thursday.setDate(sundayDate.getDate() + 4);
+  return { sunday: sundayDate, monday, thursday };
+}
+
 // Whether next week's plan has been explicitly published yet -- drives the
 // "Submit Menu" button's label/state on the Menu Planner page.
 router.get('/publish-status', requireAuth, requireRole('admin'), async (req, res) => {
@@ -91,6 +105,36 @@ router.get('/previous-week', requireAuth, requireRole('admin'), async (req, res)
   } catch (error) {
     console.error('Error fetching previous week menu:', error);
     res.status(500).json({ error: 'Failed to fetch previous week menu' });
+  }
+});
+
+// What's actually live on the menu this week -- sourced from
+// weekly_recipe_plan (the real published plan for this week), not from
+// orders. Unlike /previous-week (a retrospective of what people actually
+// bought), this is available in full on day one of the week regardless of
+// order volume, which is what makes it useful as a "what's the menu right
+// now" reference next to Weekly Prep.
+router.get('/current-week', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { sunday } = await getCurrentWeekDates();
+    const result = await db.query(
+      `SELECT wrp.block, COALESCE(r.name, wrp.custom_name) AS name
+       FROM weekly_recipe_plan wrp
+       LEFT JOIN recipes r ON r.recipe_id = wrp.recipe_id
+       WHERE wrp.planned_week_start = $1
+       ORDER BY wrp.block, name`,
+      [sunday]
+    );
+    res.json({
+      data: {
+        weekStart: sunday.toISOString().slice(0, 10),
+        monday: result.rows.filter(r => r.block === 'monday').map(r => r.name),
+        thursday: result.rows.filter(r => r.block === 'thursday').map(r => r.name),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching current week menu:', error);
+    res.status(500).json({ error: 'Failed to fetch current week menu' });
   }
 });
 
