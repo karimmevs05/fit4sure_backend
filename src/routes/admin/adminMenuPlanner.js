@@ -119,14 +119,32 @@ router.get('/current-week', requireAuth, requireRole('admin'), async (req, res) 
     const { sunday } = await getCurrentWeekDates();
     const result = await db.query(
       `SELECT wrp.id, wrp.block, COALESCE(r.name, wrp.custom_name) AS name,
-              COALESCE(r.category, 'custom') AS category, wrp.recipe_id, wrp.expected_volume
+              COALESCE(r.category, 'custom') AS category, wrp.recipe_id, wrp.expected_volume,
+              r.prep_time_minutes, ing.total_g AS recipe_base_weight_g
        FROM weekly_recipe_plan wrp
        LEFT JOIN recipes r ON r.recipe_id = wrp.recipe_id
+       LEFT JOIN (
+         SELECT recipe_id, SUM(quantity_g) AS total_g FROM recipe_ingredients GROUP BY recipe_id
+       ) ing ON ing.recipe_id = wrp.recipe_id
        WHERE wrp.planned_week_start = $1
        ORDER BY wrp.block, name`,
       [sunday]
     );
-    const toItem = (r) => ({ id: r.id, name: r.name, category: r.category, recipeId: r.recipe_id, expectedVolume: r.expected_volume });
+    // prep_time_minutes is documented against the recipe's own ingredient
+    // list as written (recipe_base_weight_g) -- scaling it by how much this
+    // week actually forecasts (expected_volume, in lb) gives a real batch-
+    // size-aware estimate instead of treating a 3 lb test batch and a 40 lb
+    // production run as the same amount of work. Custom one-off meals (no
+    // recipe_id) have neither figure on file, so they contribute no prep
+    // time rather than a guessed one.
+    const toItem = (r) => {
+      const baseWeightLb = r.recipe_base_weight_g ? parseFloat(r.recipe_base_weight_g) / 453.592 : null;
+      const baseMinutes = r.prep_time_minutes != null ? parseFloat(r.prep_time_minutes) : null;
+      const prepMinutes = baseMinutes != null && baseWeightLb && baseWeightLb > 0
+        ? Math.round(baseMinutes * ((parseFloat(r.expected_volume) || 0) / baseWeightLb))
+        : null;
+      return { id: r.id, name: r.name, category: r.category, recipeId: r.recipe_id, expectedVolume: r.expected_volume, prepMinutes };
+    };
     res.json({
       data: {
         weekStart: sunday.toISOString().slice(0, 10),
