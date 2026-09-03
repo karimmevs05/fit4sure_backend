@@ -421,7 +421,7 @@ async function computeBlockPrepPlan(block, sunday) {
       costCents = Math.round(costCents);
 
       const stepsResult = await db.query(
-        `SELECT step_number, title, description, time_estimate_minutes FROM recipe_steps WHERE recipe_id = $1 ORDER BY step_number`,
+        `SELECT step_number, title, description, time_estimate_minutes, step_type FROM recipe_steps WHERE recipe_id = $1 ORDER BY step_number`,
         [row.recipe_id]
       );
       steps = stepsResult.rows;
@@ -515,12 +515,17 @@ const CUTTING_BOARD_COLOR = {
 // Heat-application verbs -- a step mentioning one of these is actual
 // cooking; anything else in a recipe's step list (seasoning, marinating,
 // resting, mixing, chilling) is prep, not cooking, even though both come
-// from the same recipe_steps rows. Inferred from the step's own text, not a
-// separate authored field, so it's a heuristic split, not ground truth.
+// from the same recipe_steps rows. Only a fallback now -- classifyStep
+// prefers the step's own stored step_type (set by the recipe parser's
+// Prep/Cook drag-and-drop, or a manual edit) when it's on file, and only
+// falls back to this regex for older/hand-typed steps that were never
+// classified.
 const COOK_STEP_PATTERN = /\b(grill|bake|cook|sauté|saute|fry|boil|simmer|roast|broil|sear|steam|poach)|heat\b.*\b(oven|grill|skillet|pan|stove)/i;
 
-function classifyStep(description) {
-  return COOK_STEP_PATTERN.test(description) ? 'cook_step' : 'prep_step';
+function classifyStep(step) {
+  if (step.step_type === 'prep') return 'prep_step';
+  if (step.step_type === 'cook') return 'cook_step';
+  return COOK_STEP_PATTERN.test(step.description) ? 'cook_step' : 'prep_step';
 }
 
 function estimateTimeMinutes(steps) {
@@ -543,8 +548,8 @@ function estimateTimeMinutes(steps) {
 function buildExecutionLines(item, phase) {
   const lines = [];
   const volumeText = formatWeight(item.volume * GRAMS_PER_POUND);
-  const prepSteps = item.steps.filter((s) => classifyStep(s.description) === 'prep_step');
-  const cookSteps = item.steps.filter((s) => classifyStep(s.description) === 'cook_step');
+  const prepSteps = item.steps.filter((s) => classifyStep(s) === 'prep_step');
+  const cookSteps = item.steps.filter((s) => classifyStep(s) === 'cook_step');
   const board = CUTTING_BOARD_COLOR[item.category];
   const tempGuidance = SAFE_TEMP_GUIDANCE[item.category];
 

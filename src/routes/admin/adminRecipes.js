@@ -233,9 +233,9 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
         const step = steps[i]
         if (!step.description) continue
         await pool.query(
-          `INSERT INTO recipe_steps (recipe_id, step_number, title, description, time_estimate_minutes)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [recipe.recipe_id, i + 1, step.title || null, step.description, step.time_estimate_minutes || null]
+          `INSERT INTO recipe_steps (recipe_id, step_number, title, description, time_estimate_minutes, step_type)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [recipe.recipe_id, i + 1, step.title || null, step.description, step.time_estimate_minutes || null, step.step_type || null]
         )
       }
     }
@@ -267,7 +267,7 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
     )
 
     const stepsResult = await pool.query(
-      `SELECT id, step_number, title, description, time_estimate_minutes
+      `SELECT id, step_number, title, description, time_estimate_minutes, step_type
        FROM recipe_steps
        WHERE recipe_id = $1
        ORDER BY step_number`,
@@ -353,9 +353,9 @@ router.put('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
         const step = steps[i]
         if (!step.description) continue
         await pool.query(
-          `INSERT INTO recipe_steps (recipe_id, step_number, title, description, time_estimate_minutes)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [req.params.recipe_id, i + 1, step.title || null, step.description, step.time_estimate_minutes || null]
+          `INSERT INTO recipe_steps (recipe_id, step_number, title, description, time_estimate_minutes, step_type)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [req.params.recipe_id, i + 1, step.title || null, step.description, step.time_estimate_minutes || null, step.step_type || null]
         )
       }
     }

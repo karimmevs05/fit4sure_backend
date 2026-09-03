@@ -91,7 +91,7 @@ Schema:
   "servings": number,
   "prep_time_minutes": number or null,
   "steps": [
-    { "title": string (short, 2-5 words, e.g. "Brown the turkey" -- can be empty string if the source has no natural step titles), "description": string (what to do, in your own words -- do not copy the source text verbatim), "time_estimate_minutes": number or null (only set this if the source gives or clearly implies a duration for this specific step, e.g. "simmer 20 minutes" -- otherwise null, do not guess) }
+    { "title": string (short, 2-5 words, e.g. "Brown the turkey" -- can be empty string if the source has no natural step titles), "description": string (what to do, in your own words -- do not copy the source text verbatim), "time_estimate_minutes": number or null (only set this if the source gives or clearly implies a duration for this specific step, e.g. "simmer 20 minutes" -- otherwise null, do not guess), "step_type": one of "prep","cook" (prep = anything before real heat is applied to the food: measuring, seasoning, marinating, chopping, mixing, resting, chilling, staging; cook = the step actually applies heat or is a direct continuation of an already-cooking process: grilling, baking, sautéing, simmering, roasting, basting, flipping, checking doneness. A step with no heat verb but that only makes sense once cooking has started -- e.g. "flip and cook 3 more minutes", "let rest 5 minutes off the heat" -- is still "cook") }
   ],
   "ingredients": [
     { "raw_text": string (the original ingredient line), "name": string (just the ingredient, no quantity/notes), "quantity": number, "unit": one of "g","kg","oz","lb","cup","tbsp","tsp","ml","l","each", "is_liquid": boolean (only matters for cup/tbsp/tsp, where the same volume weighs very differently poured vs scooped -- true for something poured/liquid at room temp: milk, oil, honey, broth, sauce, water, juice, melted butter; false for something scooped/dry: flour, sugar, rice, oats, spices, shredded cheese, chopped vegetables. For g/kg/oz/lb/ml/l/each this doesn't change the conversion, but still set it accurately), "low_confidence": boolean (true if the quantity or unit was ambiguous in the source and you had to guess) }
@@ -320,6 +320,7 @@ function withStepIds(steps) {
     title: s.title || '',
     description: s.description,
     time_estimate_minutes: s.time_estimate_minutes ?? null,
+    step_type: s.step_type === 'cook' ? 'cook' : 'prep',
   }))
 }
 
