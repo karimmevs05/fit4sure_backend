@@ -120,8 +120,20 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
        RETURNING *`,
       values
     );
+    const customer = result.rows[0];
 
-    res.status(201).json({ data: result.rows[0] });
+    // Seeds the new multi-address table so a customer created here (address
+    // typed straight into the quick-add form) shows up in the Address
+    // Manager too, instead of only living in customers.address until
+    // someone happens to add a "real" address row later.
+    if (customer.address) {
+      await db.query(
+        `INSERT INTO customer_addresses (customer_id, address, apt_gate_code, is_primary) VALUES ($1, $2, $3, true)`,
+        [customer.id, customer.address, customer.apt_gate_code || null]
+      );
+    }
+
+    res.status(201).json({ data: customer });
   } catch (error) {
     console.error('Error creating customer:', error);
     res.status(500).json({ error: 'Failed to create customer' });
@@ -285,6 +297,28 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    // The Edit Customer form still has its own address/apt_gate_code fields
+    // (separate from the dedicated Address Manager) -- if used, keep the
+    // primary customer_addresses row in step with whatever just got written
+    // to customers.address, rather than letting the two silently diverge
+    // until someone happens to open the Address Manager and overwrite it
+    // back the other way.
+    if (req.body.address !== undefined || req.body.apt_gate_code !== undefined) {
+      const customer = result.rows[0];
+      const primary = await db.query(`SELECT id FROM customer_addresses WHERE customer_id = $1 AND is_primary`, [id]);
+      if (primary.rows.length > 0) {
+        await db.query(
+          `UPDATE customer_addresses SET address = $1, apt_gate_code = $2, updated_at = NOW() WHERE id = $3`,
+          [customer.address, customer.apt_gate_code, primary.rows[0].id]
+        );
+      } else if (customer.address) {
+        await db.query(
+          `INSERT INTO customer_addresses (customer_id, address, apt_gate_code, is_primary) VALUES ($1, $2, $3, true)`,
+          [id, customer.address, customer.apt_gate_code || null]
+        );
+      }
     }
 
     const newStage = req.body.sales_pipeline_stage;
