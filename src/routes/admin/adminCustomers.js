@@ -47,20 +47,27 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
           THEN EXTRACT(DAY FROM NOW() - GREATEST(MAX(o.created_at), ca.last_activity_at))::int
           ELSE NULL
         END AS days_since_last_contact,
-        COALESCE(addr.address_count, 0) AS address_count
+        COALESCE(addr.address_count, 0) AS address_count,
+        h.id AS household_id, h.name AS household_name,
+        (h.primary_customer_id = c.id) AS is_household_primary
       FROM customers c
       LEFT JOIN orders o ON c.id = o.customer_id
+      LEFT JOIN households h ON h.id = c.household_id
       LEFT JOIN LATERAL (
         SELECT MAX(created_at) AS last_activity_at
         FROM customer_activities
         WHERE customer_id = c.id
       ) ca ON true
       LEFT JOIN LATERAL (
+        -- A household member's real address rows live under the primary
+        -- contact's customer_id (see resolveAddressOwner in the address
+        -- routes below) -- count those, not this row's own (usually empty
+        -- once they've joined a household).
         SELECT COUNT(*) AS address_count
         FROM customer_addresses
-        WHERE customer_id = c.id
+        WHERE customer_id = COALESCE(h.primary_customer_id, c.id)
       ) addr ON true
-      GROUP BY c.id, ca.last_activity_at, addr.address_count
+      GROUP BY c.id, ca.last_activity_at, addr.address_count, h.id, h.name, h.primary_customer_id
       ORDER BY
         CASE WHEN c.sales_pipeline_stage = 'active' THEN 0 ELSE 1 END,
         total_meals_ordered DESC
@@ -307,7 +314,13 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
     // back the other way.
     if (req.body.address !== undefined || req.body.apt_gate_code !== undefined) {
       const customer = result.rows[0];
-      const primary = await db.query(`SELECT id FROM customer_addresses WHERE customer_id = $1 AND is_primary`, [id]);
+      // A non-primary household member's address is governed by the
+      // household's primary contact -- redirect the write there instead of
+      // letting this legacy form desync one member's copy from the shared
+      // one, then fan back out so every member (including this one) ends
+      // up matching the shared address again, not whatever was just typed.
+      const { ownerId } = await resolveAddressOwner(id);
+      const primary = await db.query(`SELECT id FROM customer_addresses WHERE customer_id = $1 AND is_primary`, [ownerId]);
       if (primary.rows.length > 0) {
         await db.query(
           `UPDATE customer_addresses SET address = $1, apt_gate_code = $2, updated_at = NOW() WHERE id = $3`,
@@ -316,9 +329,10 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
       } else if (customer.address) {
         await db.query(
           `INSERT INTO customer_addresses (customer_id, address, apt_gate_code, is_primary) VALUES ($1, $2, $3, true)`,
-          [id, customer.address, customer.apt_gate_code || null]
+          [ownerId, customer.address, customer.apt_gate_code || null]
         );
       }
+      await syncPrimaryAddressToCustomer(ownerId);
     }
 
     const newStage = req.body.sales_pipeline_stage;
@@ -369,27 +383,68 @@ router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 // don't need to change. Every write goes through customer_addresses; the
 // two columns on customers are never written to directly anywhere else
 // from this point on.
+//
+// Household sharing: a customer who belongs to a household doesn't keep
+// their own address rows -- they share the household's primary member's
+// customer_addresses, and every /:id/addresses call for any member resolves
+// to that primary's rows first (see resolveAddressOwner). Writes fan out
+// customers.address/apt_gate_code to every member so orders.js/
+// orderingService.js keep working per-member without any changes there.
 // ----------------------------------------------------------------------------
 
-async function syncPrimaryAddressToCustomer(customerId) {
-  const primary = await db.query(
-    `SELECT address, apt_gate_code FROM customer_addresses WHERE customer_id = $1 AND is_primary`,
+// Which customer's customer_addresses rows actually govern this id's
+// delivery address -- itself, unless it's a household member, in which case
+// it's the household's primary_customer_id. Also returns the household
+// (id, name) for the response payload so the frontend can show "shared with
+// household" instead of pretending this is a personal address list.
+async function resolveAddressOwner(customerId) {
+  const result = await db.query(
+    `SELECT c.household_id, h.id AS h_id, h.name AS h_name, h.primary_customer_id
+     FROM customers c
+     LEFT JOIN households h ON h.id = c.household_id
+     WHERE c.id = $1`,
     [customerId]
   );
-  const row = primary.rows[0] || { address: null, apt_gate_code: null };
-  await db.query(
-    `UPDATE customers SET address = $1, apt_gate_code = $2, updated_at = NOW() WHERE id = $3`,
-    [row.address, row.apt_gate_code, customerId]
+  const row = result.rows[0];
+  if (!row || !row.household_id || !row.primary_customer_id) {
+    return { ownerId: customerId, household: null };
+  }
+  return { ownerId: row.primary_customer_id, household: { id: row.h_id, name: row.h_name } };
+}
+
+// Propagates the owner's primary address to every customer who actually
+// shares it: just the owner itself for a standalone customer, or the owner
+// plus every other member of its household when the owner is a household's
+// primary contact.
+async function syncPrimaryAddressToCustomer(ownerId) {
+  const primary = await db.query(
+    `SELECT address, apt_gate_code FROM customer_addresses WHERE customer_id = $1 AND is_primary`,
+    [ownerId]
   );
+  const row = primary.rows[0] || { address: null, apt_gate_code: null };
+
+  const household = await db.query(`SELECT id FROM households WHERE primary_customer_id = $1`, [ownerId]);
+  if (household.rows.length > 0) {
+    await db.query(
+      `UPDATE customers SET address = $1, apt_gate_code = $2, updated_at = NOW() WHERE household_id = $3`,
+      [row.address, row.apt_gate_code, household.rows[0].id]
+    );
+  } else {
+    await db.query(
+      `UPDATE customers SET address = $1, apt_gate_code = $2, updated_at = NOW() WHERE id = $3`,
+      [row.address, row.apt_gate_code, ownerId]
+    );
+  }
 }
 
 router.get('/:id/addresses', requireAuth, requireRole('admin'), async (req, res) => {
   try {
+    const { ownerId, household } = await resolveAddressOwner(req.params.id);
     const result = await db.query(
       `SELECT * FROM customer_addresses WHERE customer_id = $1 ORDER BY is_primary DESC, created_at ASC`,
-      [req.params.id]
+      [ownerId]
     );
-    res.json({ data: result.rows });
+    res.json({ data: result.rows, household });
   } catch (error) {
     console.error('Error fetching customer addresses:', error);
     res.status(500).json({ error: 'Failed to fetch addresses' });
@@ -398,27 +453,27 @@ router.get('/:id/addresses', requireAuth, requireRole('admin'), async (req, res)
 
 router.post('/:id/addresses', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { id } = req.params;
     const { label, address, apt_gate_code, is_primary } = req.body;
     if (!address || !address.trim()) return res.status(400).json({ error: 'address is required' });
+    const { ownerId } = await resolveAddressOwner(req.params.id);
 
-    const existingCount = await db.query('SELECT COUNT(*) FROM customer_addresses WHERE customer_id = $1', [id]);
+    const existingCount = await db.query('SELECT COUNT(*) FROM customer_addresses WHERE customer_id = $1', [ownerId]);
     // The first address for a customer is always primary, whether or not
     // is_primary was explicitly passed -- there's never a legitimate state
     // where a customer has exactly one address and it isn't the primary one.
     const makePrimary = is_primary === true || existingCount.rows[0].count === '0';
 
     if (makePrimary) {
-      await db.query('UPDATE customer_addresses SET is_primary = false WHERE customer_id = $1', [id]);
+      await db.query('UPDATE customer_addresses SET is_primary = false WHERE customer_id = $1', [ownerId]);
     }
 
     const result = await db.query(
       `INSERT INTO customer_addresses (customer_id, label, address, apt_gate_code, is_primary)
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [id, label || null, address.trim(), apt_gate_code || null, makePrimary]
+      [ownerId, label || null, address.trim(), apt_gate_code || null, makePrimary]
     );
 
-    if (makePrimary) await syncPrimaryAddressToCustomer(id);
+    if (makePrimary) await syncPrimaryAddressToCustomer(ownerId);
 
     res.status(201).json({ data: result.rows[0] });
   } catch (error) {
@@ -429,8 +484,9 @@ router.post('/:id/addresses', requireAuth, requireRole('admin'), async (req, res
 
 router.put('/:id/addresses/:addressId', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { id, addressId } = req.params;
+    const { addressId } = req.params;
     const { label, address, apt_gate_code, is_primary } = req.body;
+    const { ownerId } = await resolveAddressOwner(req.params.id);
 
     const fields = [];
     const values = [];
@@ -445,14 +501,14 @@ router.put('/:id/addresses/:addressId', requireAuth, requireRole('admin'), async
     // Unset any other primary first -- required so the partial unique index
     // (one primary per customer) never sees two primary rows at once.
     if (is_primary === true) {
-      await db.query('UPDATE customer_addresses SET is_primary = false WHERE customer_id = $1', [id]);
+      await db.query('UPDATE customer_addresses SET is_primary = false WHERE customer_id = $1', [ownerId]);
       fields.push(`is_primary = true`);
     } else if (is_primary === false) {
       fields.push(`is_primary = false`);
     }
 
     fields.push(`updated_at = NOW()`);
-    values.push(addressId, id);
+    values.push(addressId, ownerId);
     const result = await db.query(
       `UPDATE customer_addresses SET ${fields.join(', ')} WHERE id = $${n++} AND customer_id = $${n} RETURNING *`,
       values
@@ -460,7 +516,7 @@ router.put('/:id/addresses/:addressId', requireAuth, requireRole('admin'), async
     if (result.rows.length === 0) return res.status(404).json({ error: 'Address not found' });
 
     if (is_primary === true || address !== undefined || apt_gate_code !== undefined) {
-      await syncPrimaryAddressToCustomer(id);
+      await syncPrimaryAddressToCustomer(ownerId);
     }
 
     res.json({ data: result.rows[0] });
@@ -472,10 +528,11 @@ router.put('/:id/addresses/:addressId', requireAuth, requireRole('admin'), async
 
 router.delete('/:id/addresses/:addressId', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { id, addressId } = req.params;
+    const { addressId } = req.params;
+    const { ownerId } = await resolveAddressOwner(req.params.id);
     const deleted = await db.query(
       `DELETE FROM customer_addresses WHERE id = $1 AND customer_id = $2 RETURNING is_primary`,
-      [addressId, id]
+      [addressId, ownerId]
     );
     if (deleted.rows.length === 0) return res.status(404).json({ error: 'Address not found' });
 
@@ -486,12 +543,12 @@ router.delete('/:id/addresses/:addressId', requireAuth, requireRole('admin'), as
     if (deleted.rows[0].is_primary) {
       const next = await db.query(
         `SELECT id FROM customer_addresses WHERE customer_id = $1 ORDER BY created_at ASC LIMIT 1`,
-        [id]
+        [ownerId]
       );
       if (next.rows.length > 0) {
         await db.query('UPDATE customer_addresses SET is_primary = true WHERE id = $1', [next.rows[0].id]);
       }
-      await syncPrimaryAddressToCustomer(id);
+      await syncPrimaryAddressToCustomer(ownerId);
     }
 
     res.json({ success: true, message: 'Address deleted' });
