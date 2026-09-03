@@ -46,7 +46,8 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
         CASE WHEN GREATEST(MAX(o.created_at), ca.last_activity_at) IS NOT NULL
           THEN EXTRACT(DAY FROM NOW() - GREATEST(MAX(o.created_at), ca.last_activity_at))::int
           ELSE NULL
-        END AS days_since_last_contact
+        END AS days_since_last_contact,
+        COALESCE(addr.address_count, 0) AS address_count
       FROM customers c
       LEFT JOIN orders o ON c.id = o.customer_id
       LEFT JOIN LATERAL (
@@ -54,7 +55,12 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
         FROM customer_activities
         WHERE customer_id = c.id
       ) ca ON true
-      GROUP BY c.id, ca.last_activity_at
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS address_count
+        FROM customer_addresses
+        WHERE customer_id = c.id
+      ) addr ON true
+      GROUP BY c.id, ca.last_activity_at, addr.address_count
       ORDER BY
         CASE WHEN c.sales_pipeline_stage = 'active' THEN 0 ELSE 1 END,
         total_meals_ordered DESC
@@ -318,6 +324,146 @@ router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   } catch (error) {
     console.error('Error deleting customer:', error);
     res.status(500).json({ error: 'Failed to delete customer' });
+  }
+});
+
+// ----------------------------------------------------------------------------
+// DELIVERY ADDRESSES -- a customer can have more than one (e.g. home +
+// office); customers.address/apt_gate_code stay a denormalized mirror of
+// whichever row here is_primary, since orders.js and orderingService.js's
+// auto-fill-on-first-order already read those two columns directly and
+// don't need to change. Every write goes through customer_addresses; the
+// two columns on customers are never written to directly anywhere else
+// from this point on.
+// ----------------------------------------------------------------------------
+
+async function syncPrimaryAddressToCustomer(customerId) {
+  const primary = await db.query(
+    `SELECT address, apt_gate_code FROM customer_addresses WHERE customer_id = $1 AND is_primary`,
+    [customerId]
+  );
+  const row = primary.rows[0] || { address: null, apt_gate_code: null };
+  await db.query(
+    `UPDATE customers SET address = $1, apt_gate_code = $2, updated_at = NOW() WHERE id = $3`,
+    [row.address, row.apt_gate_code, customerId]
+  );
+}
+
+router.get('/:id/addresses', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT * FROM customer_addresses WHERE customer_id = $1 ORDER BY is_primary DESC, created_at ASC`,
+      [req.params.id]
+    );
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Error fetching customer addresses:', error);
+    res.status(500).json({ error: 'Failed to fetch addresses' });
+  }
+});
+
+router.post('/:id/addresses', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { label, address, apt_gate_code, is_primary } = req.body;
+    if (!address || !address.trim()) return res.status(400).json({ error: 'address is required' });
+
+    const existingCount = await db.query('SELECT COUNT(*) FROM customer_addresses WHERE customer_id = $1', [id]);
+    // The first address for a customer is always primary, whether or not
+    // is_primary was explicitly passed -- there's never a legitimate state
+    // where a customer has exactly one address and it isn't the primary one.
+    const makePrimary = is_primary === true || existingCount.rows[0].count === '0';
+
+    if (makePrimary) {
+      await db.query('UPDATE customer_addresses SET is_primary = false WHERE customer_id = $1', [id]);
+    }
+
+    const result = await db.query(
+      `INSERT INTO customer_addresses (customer_id, label, address, apt_gate_code, is_primary)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [id, label || null, address.trim(), apt_gate_code || null, makePrimary]
+    );
+
+    if (makePrimary) await syncPrimaryAddressToCustomer(id);
+
+    res.status(201).json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Error creating customer address:', error);
+    res.status(500).json({ error: 'Failed to create address' });
+  }
+});
+
+router.put('/:id/addresses/:addressId', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { id, addressId } = req.params;
+    const { label, address, apt_gate_code, is_primary } = req.body;
+
+    const fields = [];
+    const values = [];
+    let n = 1;
+    if (label !== undefined) { fields.push(`label = $${n++}`); values.push(label); }
+    if (address !== undefined) { fields.push(`address = $${n++}`); values.push(address); }
+    if (apt_gate_code !== undefined) { fields.push(`apt_gate_code = $${n++}`); values.push(apt_gate_code); }
+    if (fields.length === 0 && is_primary === undefined) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    // Unset any other primary first -- required so the partial unique index
+    // (one primary per customer) never sees two primary rows at once.
+    if (is_primary === true) {
+      await db.query('UPDATE customer_addresses SET is_primary = false WHERE customer_id = $1', [id]);
+      fields.push(`is_primary = true`);
+    } else if (is_primary === false) {
+      fields.push(`is_primary = false`);
+    }
+
+    fields.push(`updated_at = NOW()`);
+    values.push(addressId, id);
+    const result = await db.query(
+      `UPDATE customer_addresses SET ${fields.join(', ')} WHERE id = $${n++} AND customer_id = $${n} RETURNING *`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Address not found' });
+
+    if (is_primary === true || address !== undefined || apt_gate_code !== undefined) {
+      await syncPrimaryAddressToCustomer(id);
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Error updating customer address:', error);
+    res.status(500).json({ error: 'Failed to update address' });
+  }
+});
+
+router.delete('/:id/addresses/:addressId', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { id, addressId } = req.params;
+    const deleted = await db.query(
+      `DELETE FROM customer_addresses WHERE id = $1 AND customer_id = $2 RETURNING is_primary`,
+      [addressId, id]
+    );
+    if (deleted.rows.length === 0) return res.status(404).json({ error: 'Address not found' });
+
+    // Deleting the primary leaves nobody in charge -- hand it to whichever
+    // address is left standing longest (oldest), same as "the original one
+    // on file", so there's always a sane primary unless the customer has
+    // zero addresses left.
+    if (deleted.rows[0].is_primary) {
+      const next = await db.query(
+        `SELECT id FROM customer_addresses WHERE customer_id = $1 ORDER BY created_at ASC LIMIT 1`,
+        [id]
+      );
+      if (next.rows.length > 0) {
+        await db.query('UPDATE customer_addresses SET is_primary = true WHERE id = $1', [next.rows[0].id]);
+      }
+      await syncPrimaryAddressToCustomer(id);
+    }
+
+    res.json({ success: true, message: 'Address deleted' });
+  } catch (error) {
+    console.error('Error deleting customer address:', error);
+    res.status(500).json({ error: 'Failed to delete address' });
   }
 });
 
