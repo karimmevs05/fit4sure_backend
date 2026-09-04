@@ -105,14 +105,17 @@ async function getUnprocessedReceipts(folderId) {
       });
     }
 
-    // Filter to image files
-    const imageFiles = (allFilesResponse.data.files || []).filter(f =>
-      f.mimeType && f.mimeType.startsWith('image/')
+    // Filter to image files and PDFs -- online-order receipts are commonly
+    // saved/forwarded as PDF invoices rather than photos, and Gemini reads
+    // PDF inlineData the same way it reads an image (see processReceiptWithAI
+    // in receiptProcessor.js, which is already mimeType-agnostic).
+    const receiptFiles = (allFilesResponse.data.files || []).filter(f =>
+      f.mimeType && (f.mimeType.startsWith('image/') || f.mimeType === 'application/pdf')
     );
 
-    console.log(`Filtered to ${imageFiles.length} image files`);
+    console.log(`Filtered to ${receiptFiles.length} receipt file(s) (image/PDF)`);
 
-    return imageFiles;
+    return receiptFiles;
   } catch (error) {
     console.error('Error fetching receipts from Drive:', error);
     throw error;
