@@ -84,21 +84,36 @@ function toGrams(quantity, unit, isLiquid = true) {
 
 const EXTRACTION_SYSTEM_PROMPT = `You extract recipes into strict JSON. Respond with ONLY a JSON object, no markdown fences, no preamble, no commentary.
 
+A single page can describe more than one genuinely distinct, independently-
+makeable recipe -- e.g. a main dish posted together with its own separate
+sauce/marinade/dressing/side, or a "roundup" post listing several recipes.
+When that's the case, extract each one as its own entry in "recipes". Do NOT
+split a single recipe into multiple entries just because it has
+sub-components that are still part of making that one dish (e.g. a
+lasagna's meat sauce, made and used within the same recipe, stays one
+recipe, not two) -- only split when the source itself presents them as
+separate dishes. Most pages have exactly one recipe; return a single-element
+array in that ordinary case.
+
 Schema:
 {
-  "name": string,
-  "category_guess": one of "beef","chicken","turkey","carbohydrates","vegetables","sauces","beverage","breakfast",
-  "servings": number,
-  "prep_time_minutes": number or null,
-  "steps": [
-    { "title": string (short, 2-5 words, e.g. "Brown the turkey" -- can be empty string if the source has no natural step titles), "description": string (what to do, in your own words -- do not copy the source text verbatim), "time_estimate_minutes": number or null (only set this if the source gives or clearly implies a duration for this specific step, e.g. "simmer 20 minutes" -- otherwise null, do not guess), "step_type": one of "prep","cook" (prep = anything before real heat is applied to the food: measuring, seasoning, marinating, chopping, mixing, resting, chilling, staging; cook = the step actually applies heat or is a direct continuation of an already-cooking process: grilling, baking, sautéing, simmering, roasting, basting, flipping, checking doneness. A step with no heat verb but that only makes sense once cooking has started -- e.g. "flip and cook 3 more minutes", "let rest 5 minutes off the heat" -- is still "cook") }
-  ],
-  "ingredients": [
-    { "raw_text": string (the original ingredient line), "name": string (just the ingredient, no quantity/notes), "quantity": number, "unit": one of "g","kg","oz","lb","cup","tbsp","tsp","ml","l","each", "is_liquid": boolean (only matters for cup/tbsp/tsp, where the same volume weighs very differently poured vs scooped -- true for something poured/liquid at room temp: milk, oil, honey, broth, sauce, water, juice, melted butter; false for something scooped/dry: flour, sugar, rice, oats, spices, shredded cheese, chopped vegetables. For g/kg/oz/lb/ml/l/each this doesn't change the conversion, but still set it accurately), "low_confidence": boolean (true if the quantity or unit was ambiguous in the source and you had to guess) }
+  "recipes": [
+    {
+      "name": string,
+      "category_guess": one of "beef","chicken","turkey","carbohydrates","vegetables","sauces","beverage","breakfast",
+      "servings": number,
+      "prep_time_minutes": number or null,
+      "steps": [
+        { "title": string (short, 2-5 words, e.g. "Brown the turkey" -- can be empty string if the source has no natural step titles), "description": string (what to do, in your own words -- do not copy the source text verbatim), "time_estimate_minutes": number or null (only set this if the source gives or clearly implies a duration for this specific step, e.g. "simmer 20 minutes" -- otherwise null, do not guess), "step_type": one of "prep","cook" (prep = anything before real heat is applied to the food: measuring, seasoning, marinating, chopping, mixing, resting, chilling, staging; cook = the step actually applies heat or is a direct continuation of an already-cooking process: grilling, baking, sautéing, simmering, roasting, basting, flipping, checking doneness. A step with no heat verb but that only makes sense once cooking has started -- e.g. "flip and cook 3 more minutes", "let rest 5 minutes off the heat" -- is still "cook") }
+      ],
+      "ingredients": [
+        { "raw_text": string (the original ingredient line), "name": string (just the ingredient, no quantity/notes), "quantity": number, "unit": one of "g","kg","oz","lb","cup","tbsp","tsp","ml","l","each", "is_liquid": boolean (only matters for cup/tbsp/tsp, where the same volume weighs very differently poured vs scooped -- true for something poured/liquid at room temp: milk, oil, honey, broth, sauce, water, juice, melted butter; false for something scooped/dry: flour, sugar, rice, oats, spices, shredded cheese, chopped vegetables. For g/kg/oz/lb/ml/l/each this doesn't change the conversion, but still set it accurately), "low_confidence": boolean (true if the quantity or unit was ambiguous in the source and you had to guess) }
+      ]
+    }
   ]
 }
 
-Split instructions into one step per distinct action (don't merge multiple actions into one step, don't split a single action across two). Be conservative on ingredient quantities: if unclear ("a handful", "to taste", a range like "1-2 tsp"), pick your best single estimate and set low_confidence true rather than leaving it blank.`
+Split instructions into one step per distinct action (don't merge multiple actions into one step, don't split a single action across two). Be conservative on ingredient quantities: if unclear ("a handful", "to taste", a range like "1-2 tsp"), pick your best single estimate and set low_confidence true rather than leaving it blank. Each recipe's own ingredients/steps belong only to that recipe -- never share or duplicate an ingredient/step across two entries in "recipes".`
 
 async function extractFromText(sourceText) {
   return withGeminiRetry(async () => {
@@ -134,23 +149,28 @@ function parseGeminiJson(response) {
 // Look for schema.org Recipe JSON-LD in a fetched page's HTML. Handles the
 // common shapes: a single Recipe object, an array of objects, or a
 // @graph-wrapped object (all seen in the wild across recipe blogs).
-function findRecipeJsonLd(html) {
+//
+// A page with several distinct recipes (a main + its own sauce, a
+// "roundup" post, etc.) commonly ships one JSON-LD Recipe block per
+// recipe -- collects every one found, in document order, rather than
+// just the first (which used to silently discard the rest).
+function findAllRecipeJsonLd(html) {
   const blocks = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)]
+  const recipes = []
   for (const block of blocks) {
     try {
       const parsed = JSON.parse(block[1].trim())
       const candidates = Array.isArray(parsed) ? parsed : parsed['@graph'] ? parsed['@graph'] : [parsed]
-      const recipe = candidates.find((c) => {
+      for (const c of candidates) {
         const type = c['@type']
-        return type === 'Recipe' || (Array.isArray(type) && type.includes('Recipe'))
-      })
-      if (recipe) return recipe
+        if (type === 'Recipe' || (Array.isArray(type) && type.includes('Recipe'))) recipes.push(c)
+      }
     } catch {
       // malformed JSON-LD block -- skip and keep looking
       continue
     }
   }
-  return null
+  return recipes
 }
 
 // Pull a real photo URL for the recipe, cheaply and without an AI call --
@@ -179,17 +199,28 @@ function findImageUrl(html, jsonLdRecipe) {
 // A JSON-LD ingredient/instruction line is free text -- still needs the same
 // splitting the vision path does for screenshots, so route it through the
 // same text extractor rather than writing a second regex parser to maintain.
-async function normalizeJsonLdRecipe(recipe) {
-  const ingredientLines = (recipe.recipeIngredient || []).join('\n')
-  const instructionLines = Array.isArray(recipe.recipeInstructions)
-    ? recipe.recipeInstructions.map((s) => (typeof s === 'string' ? s : s.text)).join('\n')
-    : recipe.recipeInstructions || ''
+//
+// Takes an array because the page may have shipped more than one JSON-LD
+// Recipe block (see findAllRecipeJsonLd) -- the boundary between recipes is
+// already known here (one per input block), so this asks Gemini to
+// structure each one, in order, rather than asking it to (re-)detect splits
+// the way extractFromText has to for a plain-text page.
+async function normalizeJsonLdRecipes(jsonLdRecipes) {
+  const recipeBlocks = jsonLdRecipes
+    .map((recipe, i) => {
+      const ingredientLines = (recipe.recipeIngredient || []).join('\n')
+      const instructionLines = Array.isArray(recipe.recipeInstructions)
+        ? recipe.recipeInstructions.map((s) => (typeof s === 'string' ? s : s.text)).join('\n')
+        : recipe.recipeInstructions || ''
+      return `Recipe ${i + 1}:\nName: ${recipe.name || ''}\nServings: ${recipe.recipeYield || ''}\nIngredients:\n${ingredientLines}\n\nInstructions:\n${instructionLines}`
+    })
+    .join('\n\n---\n\n')
 
   return withGeminiRetry(async () => {
     const genAI = getGeminiClient()
     const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' })
     const response = await model.generateContent([
-      `${EXTRACTION_SYSTEM_PROMPT}\n\nStructure this already-extracted recipe data:\n\nName: ${recipe.name || ''}\nServings: ${recipe.recipeYield || ''}\nIngredients:\n${ingredientLines}\n\nInstructions:\n${instructionLines}`,
+      `${EXTRACTION_SYSTEM_PROMPT}\n\nThe page already contains exactly ${jsonLdRecipes.length} separate recipe(s), pre-identified below -- structure each one into the schema's recipe shape, in the same order, without merging or further splitting them:\n\n${recipeBlocks}`,
     ])
     return parseGeminiJson(response)
   })
@@ -329,23 +360,38 @@ async function importFromUrl(url) {
   if (!pageRes.ok) throw new Error(`Could not fetch page (status ${pageRes.status})`)
   const html = await pageRes.text()
 
-  const jsonLd = findRecipeJsonLd(html)
-  const extracted = jsonLd
-    ? await normalizeJsonLdRecipe(jsonLd)
+  const jsonLdRecipes = findAllRecipeJsonLd(html)
+  const hasJsonLd = jsonLdRecipes.length > 0
+  const { recipes: extractedList } = hasJsonLd
+    ? await normalizeJsonLdRecipes(jsonLdRecipes)
     : await extractFromText(html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' '))
 
-  const ingredients = await matchIngredientsToInventory(extracted.ingredients || [])
-  const image = findImageUrl(html, jsonLd)
-  return { ...extracted, steps: withStepIds(extracted.steps), ingredients, image, source: jsonLd ? 'jsonld' : 'text-fallback' }
+  const pageImage = findImageUrl(html, jsonLdRecipes[0] || null)
+  const recipes = await Promise.all(
+    (extractedList || []).map(async (extracted, i) => {
+      const ingredients = await matchIngredientsToInventory(extracted.ingredients || [])
+      // Prefer this specific recipe's own JSON-LD image (a multi-recipe page
+      // often has a distinct photo per recipe block) before falling back to
+      // the page-level og:image every recipe would otherwise share.
+      const image = (jsonLdRecipes[i] && findImageUrl(html, jsonLdRecipes[i])) || pageImage
+      return { ...extracted, steps: withStepIds(extracted.steps), ingredients, image, source: hasJsonLd ? 'jsonld' : 'text-fallback' }
+    })
+  )
+  return { recipes }
 }
 
 async function importFromImage(base64Data, mimeType) {
-  const extracted = await extractFromImage(base64Data, mimeType)
-  const ingredients = await matchIngredientsToInventory(extracted.ingredients || [])
-  // The input here IS a screenshot (often a Pinterest pin or social share),
-  // not a real recipe photo -- showing it back as "the recipe's image"
-  // would be misleading, so this path never sets one.
-  return { ...extracted, steps: withStepIds(extracted.steps), ingredients, image: null, source: 'vision' }
+  const { recipes: extractedList } = await extractFromImage(base64Data, mimeType)
+  const recipes = await Promise.all(
+    (extractedList || []).map(async (extracted) => {
+      const ingredients = await matchIngredientsToInventory(extracted.ingredients || [])
+      // The input here IS a screenshot (often a Pinterest pin or social share),
+      // not a real recipe photo -- showing it back as "the recipe's image"
+      // would be misleading, so this path never sets one.
+      return { ...extracted, steps: withStepIds(extracted.steps), ingredients, image: null, source: 'vision' }
+    })
+  )
+  return { recipes }
 }
 
 module.exports = { importFromUrl, importFromImage, matchIngredientsToInventory }
