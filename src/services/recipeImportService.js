@@ -100,7 +100,7 @@ Schema:
   "recipes": [
     {
       "name": string,
-      "category_guess": one of "beef","chicken","turkey","carbohydrates","vegetables","sauces","beverage","breakfast",
+      "category_guess": one of "beef","chicken","turkey","pork","carbohydrates","pasta","vegetables","sauces","beverage","breakfast",
       "servings": number,
       "prep_time_minutes": number or null,
       "steps": [
