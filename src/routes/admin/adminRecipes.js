@@ -139,12 +139,18 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
       result.rows.map(async (recipe) => {
         try {
           const ingredientsResult = await pool.query(
-            `SELECT ri.quantity_g, ri.prep_section, i.name, i.unit_price_cents, i.suggested_serving_g, i.store
+            `SELECT ri.quantity_g, ri.prep_section, i.name, i.unit_price_cents, i.suggested_serving_g, i.store, i.allergens
              FROM recipe_ingredients ri
              LEFT JOIN inventory i ON ri.inventory_id = i.id
              WHERE ri.recipe_id = $1`,
             [recipe.recipe_id]
           )
+
+          // Union of every ingredient's tagged allergens (see allergenTagger.js) --
+          // recomputed live here rather than stored on the recipe so it always
+          // reflects the current ingredient list/inventory tags, the same way
+          // cost and macros do below.
+          const allergens = [...new Set(ingredientsResult.rows.flatMap((ing) => ing.allergens || []))]
 
           // Calculate total cost from ingredients -- falls back to the real
           // last-paid receipt price when nothing's on file in inventory.
@@ -174,7 +180,8 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
             cost_per_pound_cents: costPerPoundCents(totalCostCents, totalWeightG),
             total_recipe_cost_cents: totalCostCents,
             suggested_serving_g: mainIngredient ? mainIngredient.suggested_serving_g : null,
-            main_ingredient_store: mainIngredient ? mainIngredient.store : null
+            main_ingredient_store: mainIngredient ? mainIngredient.store : null,
+            allergens,
           }
         } catch (err) {
           console.error(`Error calculating cost for recipe ${recipe.recipe_id}:`, err)
@@ -257,7 +264,7 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
     if (!recipeResult.rows[0]) return res.status(404).json({ error: 'Recipe not found' })
 
     const ingredientsResult = await pool.query(
-      `SELECT ri.id, ri.inventory_id, i.name, i.category, ri.quantity_g, ri.prep_section, ri.cooking_method_id, cm.name AS cooking_method_name, i.unit_price_cents, i.protein_per_100g, i.carbs_per_100g, i.fat_per_100g, i.calories_per_100g
+      `SELECT ri.id, ri.inventory_id, i.name, i.category, ri.quantity_g, ri.prep_section, ri.cooking_method_id, cm.name AS cooking_method_name, i.unit_price_cents, i.protein_per_100g, i.carbs_per_100g, i.fat_per_100g, i.calories_per_100g, i.allergens
        FROM recipe_ingredients ri
        LEFT JOIN cooking_methods cm ON ri.cooking_method_id = cm.id
        LEFT JOIN inventory i ON ri.inventory_id = i.id
@@ -265,6 +272,9 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
        ORDER BY i.name`,
       [req.params.recipe_id]
     )
+
+    // Union of every ingredient's tagged allergens -- see allergenTagger.js.
+    const allergens = [...new Set(ingredientsResult.rows.flatMap((ing) => ing.allergens || []))]
 
     const stepsResult = await pool.query(
       `SELECT id, step_number, title, description, time_estimate_minutes, step_type
@@ -305,7 +315,8 @@ router.get('/:recipe_id', requireAuth, requireRole('admin'), async (req, res) =>
         cost_per_pound_cents: costPerPoundCents(totalCostCents, totalWeightG),
         total_recipe_cost_cents: totalCostCents,
         ingredients: ingredientsWithCosts,
-        steps: stepsResult.rows
+        steps: stepsResult.rows,
+        allergens,
       }
     })
   } catch (err) {

@@ -10,7 +10,7 @@ const PROFILE_FIELDS = [
   'name', 'email', 'phone', 'status', 'sales_pipeline_stage',
   'address', 'apt_gate_code', 'payment_mode', 'household_size', 'occupation',
   'primary_goal', 'biggest_hurdle', 'protein_preference', 'dietary_preference',
-  'foods_to_avoid', 'notes', 'dietary_restrictions',
+  'foods_to_avoid', 'notes', 'dietary_restrictions', 'allergens',
   'engagement_score', 'conversion_probability',
 ];
 
@@ -34,7 +34,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
         c.id, c.name, c.email, c.phone, c.status, c.sales_pipeline_stage,
         c.address, c.apt_gate_code, c.payment_mode, c.household_size, c.occupation,
         c.primary_goal, c.biggest_hurdle, c.protein_preference, c.dietary_preference,
-        c.foods_to_avoid, c.notes, c.dietary_restrictions,
+        c.foods_to_avoid, c.notes, c.dietary_restrictions, c.allergens,
         c.engagement_score, c.conversion_probability_prev,
         c.stage_entered_at,
         c.created_at, c.updated_at,
