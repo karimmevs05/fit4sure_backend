@@ -268,6 +268,61 @@ router.post('/recompute-pipeline', requireAuth, requireRole('admin'), async (req
 });
 
 // PUT /api/admin/customers/:id - Update any combination of profile fields
+// ---- Pipeline working set --------------------------------------------------
+// "Who's actively being worked right now" on the Sales Pipeline tab. Used to
+// live only in one browser tab's React state (gone on refresh, invisible to
+// any other admin/device); now a real shared table so it survives a reload,
+// shows the same list to every admin, and is something a future automation
+// can actually read. Registered here, before the /:id routes below, so
+// "working-pipeline" is never swallowed as a literal :id value.
+
+// GET /api/admin/customers/working-pipeline -- just the ids; the frontend
+// already has full customer objects from GET / and joins locally.
+router.get('/working-pipeline', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query('SELECT customer_id FROM pipeline_working_set ORDER BY added_at ASC');
+    res.json({ data: result.rows.map((r) => r.customer_id) });
+  } catch (error) {
+    console.error('Error fetching working pipeline:', error);
+    res.status(500).json({ error: 'Failed to fetch working pipeline' });
+  }
+});
+
+// POST /api/admin/customers/working-pipeline { customer_ids: number[] }
+router.post('/working-pipeline', requireAuth, requireRole('admin'), async (req, res) => {
+  const { customer_ids } = req.body;
+  if (!Array.isArray(customer_ids) || customer_ids.length === 0) {
+    return res.status(400).json({ error: 'customer_ids is required' });
+  }
+  try {
+    await db.query(
+      `INSERT INTO pipeline_working_set (customer_id, added_by_user_id)
+       SELECT unnest($1::int[]), $2
+       ON CONFLICT (customer_id) DO NOTHING`,
+      [customer_ids, req.userId || null]
+    );
+    res.status(201).json({ success: true });
+  } catch (error) {
+    console.error('Error adding to working pipeline:', error);
+    res.status(500).json({ error: 'Failed to add to working pipeline' });
+  }
+});
+
+// DELETE /api/admin/customers/working-pipeline { customer_ids: number[] }
+router.delete('/working-pipeline', requireAuth, requireRole('admin'), async (req, res) => {
+  const { customer_ids } = req.body;
+  if (!Array.isArray(customer_ids) || customer_ids.length === 0) {
+    return res.status(400).json({ error: 'customer_ids is required' });
+  }
+  try {
+    await db.query('DELETE FROM pipeline_working_set WHERE customer_id = ANY($1::int[])', [customer_ids]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error removing from working pipeline:', error);
+    res.status(500).json({ error: 'Failed to remove from working pipeline' });
+  }
+});
+
 router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { id } = req.params;

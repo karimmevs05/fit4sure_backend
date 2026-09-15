@@ -254,6 +254,21 @@ router.put('/crm-tasks/:id/complete', requireAuth, requireRole('admin'), async (
   }
 })
 
+// PATCH /api/admin/crm-tasks/:id -- edit description in place (the Pipeline
+// tab's "what's the next step?" note on a follow-up task). Only field this
+// needs to touch; title/customer_id are set once at creation.
+router.patch('/crm-tasks/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { description } = req.body
+    const result = await db.query('UPDATE crm_tasks SET description = $1 WHERE id = $2 RETURNING *', [description ?? null, req.params.id])
+    if (!result.rows[0]) return res.status(404).json({ error: 'Task not found' })
+    res.json({ data: result.rows[0] })
+  } catch (error) {
+    console.error('Error updating crm task:', error)
+    res.status(500).json({ error: 'Failed to update task' })
+  }
+})
+
 // POST /api/admin/automations/run-now -- manual scheduler trigger for testing,
 // harmless to leave in place ("run the automations right now" on demand).
 router.post('/automations/run-now', requireAuth, requireRole('admin'), async (req, res) => {
