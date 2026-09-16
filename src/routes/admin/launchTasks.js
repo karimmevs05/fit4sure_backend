@@ -2,14 +2,27 @@ const express = require('express')
 const router = express.Router()
 const pool = require('../../config/db')
 const { requireAuth, requireRole } = require('../../middleware/auth')
-const { urgencyToPriority, tagToDepartment, launchStatusToOpsStatus } = require('../../utils/taskSync')
+const { urgencyToPriority, priorityToUrgency, tagToDepartment, departmentToTag, opsStatusToLaunchStatus, launchStatusToOpsStatus } = require('../../utils/taskSync')
 
 // ============================================================================
 // LAUNCH TASK MANAGEMENT DASHBOARD -- Fit4Sure launch checklist (budget-aware
-// task tracker + investor-facing readiness view). Separate tool from the
-// Operations Hub (adminTasks.js) -- deliberately different table names
-// (launch_*) so the two never collide, even though this dashboard replaces
-// Operations Hub's nav entry.
+// task tracker + investor-facing readiness view).
+//
+// Used to be its own launch_tasks table, kept in sync with the Operations
+// Hub's `tasks` table via a lossy bidirectional mirror. As of 2026-09-15
+// there's one canonical table (`tasks`) for every task in the business --
+// this file just reads/writes it through the same tag/urgency/name/'open'-
+// 'done' vocabulary the frontend has always spoken, translating at the
+// query boundary via src/utils/taskSync.js. Every response shape below is
+// unchanged from before this migration -- see src/lib/launchTasks/types.ts
+// on the frontend, which needed zero edits.
+//
+// A launch task is a `tasks` row with is_ops_task = false (see
+// migrations/add_is_ops_task_flag.sql) UNLESS it originated in Ops Hub, in
+// which case is_ops_task stays true -- either way, every task shows up here
+// exactly as before (this list was always "launch-native tasks + a mirror
+// of every Ops Hub task", so it still queries every row with no
+// is_ops_task filter at all).
 //
 // Owner is a real users.user_id FK (unified identity, decided 2026-08-07) --
 // not free text. Actor attribution (who did this) always comes from the
@@ -34,6 +47,22 @@ function validateEnum(value, allowed, field) {
 
 function isForeignKeyViolation(error) {
   return error.code === '23503'
+}
+
+// Translates one raw `tasks` row into the launch-dashboard-shaped Task the
+// frontend expects (see lib/launchTasks/types.ts) -- name/tag/urgency/status
+// instead of title/department/priority/6-value-status, everything else
+// passed straight through since those columns share the same name on
+// purpose (see migrations/unify_task_systems.sql).
+function toLaunchShape(row) {
+  return {
+    ...row,
+    name: row.title,
+    owner_name: row.owner_name,
+    tag: departmentToTag(row.department),
+    urgency: priorityToUrgency(row.priority),
+    status: opsStatusToLaunchStatus(row.status),
+  }
 }
 
 // `metadata` is what makes an entry actually undoable -- it captures
@@ -75,11 +104,11 @@ async function fetchTaskRow(id) {
          WHEN (t.due_date - $2::date) <= 27 THEN 'week 3-4'
          ELSE 'week 5-8'
        END AS phase
-     FROM launch_tasks t
+     FROM tasks t
      LEFT JOIN users u ON t.owner_id = u.user_id
      LEFT JOIN (
        SELECT task_id, SUM(amount_cents) AS paid_cents, COUNT(*) AS expense_count
-       FROM launch_task_expenses GROUP BY task_id
+       FROM task_expenses GROUP BY task_id
      ) e ON e.task_id = t.id
      WHERE t.id = $1`,
     [id, PROJECT_START]
@@ -87,43 +116,16 @@ async function fetchTaskRow(id) {
   if (result.rows.length === 0) return null
 
   const todosResult = await pool.query(
-    `SELECT * FROM launch_task_todos WHERE task_id = $1 ORDER BY sort_order, id`,
+    `SELECT id, task_id, label AS text, is_completed AS done, urgency, sort_order
+     FROM task_checklist_items WHERE task_id = $1 ORDER BY sort_order, id`,
     [id]
   )
-  return { ...result.rows[0], todos: todosResult.rows }
+  return toLaunchShape({ ...result.rows[0], todos: todosResult.rows })
 }
 
-// Push edits back to the linked Operations Hub task (see adminTasks.js for
-// the other direction). No-op for tasks that didn't originate in Ops Hub
-// (ops_task_id null). See src/utils/taskSync.js for the (lossy) mappings.
-async function pushLaunchTaskToOpsMirror(launchTask, actor) {
-  if (!launchTask.ops_task_id) return
-  const beforeResult = await pool.query(`SELECT status, completed_at FROM tasks WHERE id = $1`, [launchTask.ops_task_id])
-  if (beforeResult.rows.length === 0) return
-  const before = beforeResult.rows[0]
-  const newStatus = launchStatusToOpsStatus(launchTask.status)
-  const completedAt = newStatus === 'completed' ? (before.status === 'completed' ? before.completed_at : new Date()) : null
-
-  await pool.query(
-    `UPDATE tasks SET title = $1, owner_id = $2, department = $3, priority = $4, due_date = $5, status = $6, completed_at = $7, updated_at = NOW()
-     WHERE id = $8`,
-    [launchTask.name, launchTask.owner_id, tagToDepartment(launchTask.tag), urgencyToPriority(launchTask.urgency), launchTask.due_date, newStatus, completedAt, launchTask.ops_task_id]
-  )
-}
-
-// Shared by DELETE /:id and the "undo a task creation" branch of
-// POST /activity-log/:id/undo -- same cascade either way.
-async function deleteLaunchTaskCascade(id) {
-  const existing = await pool.query(`SELECT ops_task_id FROM launch_tasks WHERE id = $1`, [id])
-  if (existing.rows.length === 0) return false
-  // Mirrored from Ops Hub: delete the ops task instead. launch_tasks.ops_task_id
-  // has ON DELETE CASCADE, so that automatically deletes this row too.
-  if (existing.rows[0].ops_task_id) {
-    await pool.query(`DELETE FROM tasks WHERE id = $1`, [existing.rows[0].ops_task_id])
-  } else {
-    await pool.query(`DELETE FROM launch_tasks WHERE id = $1`, [id])
-  }
-  return true
+async function deleteTask(id) {
+  const result = await pool.query(`DELETE FROM tasks WHERE id = $1 RETURNING id`, [id])
+  return result.rows.length > 0
 }
 
 // ----------------------------------------------------------------------------
@@ -141,12 +143,13 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
            WHEN (t.due_date - $1::date) <= 27 THEN 'week 3-4'
            ELSE 'week 5-8'
          END AS phase
-       FROM launch_tasks t
+       FROM tasks t
        LEFT JOIN users u ON t.owner_id = u.user_id
        LEFT JOIN (
          SELECT task_id, SUM(amount_cents) AS paid_cents, COUNT(*) AS expense_count
-         FROM launch_task_expenses GROUP BY task_id
+         FROM task_expenses GROUP BY task_id
        ) e ON e.task_id = t.id
+       WHERE t.due_date IS NOT NULL
        ORDER BY t.due_date ASC, t.id ASC`,
       [PROJECT_START]
     )
@@ -155,7 +158,8 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
     const todosByTask = {}
     if (taskIds.length > 0) {
       const todosResult = await pool.query(
-        `SELECT * FROM launch_task_todos WHERE task_id = ANY($1::int[]) ORDER BY sort_order, id`,
+        `SELECT id, task_id, label AS text, is_completed AS done, urgency, sort_order
+         FROM task_checklist_items WHERE task_id = ANY($1::int[]) ORDER BY sort_order, id`,
         [taskIds]
       )
       for (const todo of todosResult.rows) {
@@ -164,7 +168,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
       }
     }
 
-    const data = result.rows.map((t) => ({ ...t, todos: todosByTask[t.id] || [] }))
+    const data = result.rows.map((t) => toLaunchShape({ ...t, todos: todosByTask[t.id] || [] }))
     res.json({ success: true, data })
   } catch (error) {
     console.error('Error listing launch tasks:', error)
@@ -208,8 +212,8 @@ router.get('/activity-log', requireAuth, requireRole('admin'), async (req, res) 
   try {
     const limit = parseInt(req.query.limit, 10) || 20
     const result = await pool.query(
-      `SELECT l.*, t.name AS task_name FROM launch_activity_log l
-       LEFT JOIN launch_tasks t ON l.task_id = t.id
+      `SELECT l.*, t.title AS task_name FROM launch_activity_log l
+       LEFT JOIN tasks t ON l.task_id = t.id
        ORDER BY l.created_at DESC LIMIT $1`,
       [limit]
     )
@@ -225,7 +229,9 @@ router.get('/activity-log', requireAuth, requireRole('admin'), async (req, res) 
 // (see logActivity/computeCanUndo above) -- never re-derived from the
 // display `text`. Idempotent: a second call on the same entry 404s via the
 // undone_at guard instead of silently double-applying (e.g. re-deleting an
-// expense that undo already deleted once).
+// expense that undo already deleted once). Metadata always stores raw
+// `tasks` column values (department/priority/status), not launch-shaped
+// ones, so every branch here writes straight to `tasks` with no translation.
 router.post('/activity-log/:id/undo', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const logResult = await pool.query(`SELECT * FROM launch_activity_log WHERE id = $1`, [req.params.id])
@@ -244,25 +250,20 @@ router.post('/activity-log/:id/undo', requireAuth, requireRole('admin'), async (
     // already checked task_id != null against the row we just loaded, but
     // acting on a stale read would be a real correctness bug, not a
     // theoretical one, given how easy it is to fire two undos in a row.
-    const taskResult = await pool.query(`SELECT * FROM launch_tasks WHERE id = $1`, [taskId])
+    const taskResult = await pool.query(`SELECT * FROM tasks WHERE id = $1`, [taskId])
     if (taskResult.rows.length === 0) return res.status(400).json({ error: 'The task this belongs to no longer exists' })
-    const task = taskResult.rows[0]
 
     switch (meta.action) {
       case 'delete_task': {
-        await deleteLaunchTaskCascade(taskId)
+        await deleteTask(taskId)
         break
       }
       case 'set_status': {
-        const updated = (await pool.query(
-          `UPDATE launch_tasks SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
-          [meta.value, taskId]
-        )).rows[0]
-        await pushLaunchTaskToOpsMirror(updated, who)
+        await pool.query(`UPDATE tasks SET status = $1, updated_at = NOW() WHERE id = $2`, [meta.value, taskId])
         break
       }
       case 'set_needs_decision': {
-        await pool.query(`UPDATE launch_tasks SET needs_decision = $1, updated_at = NOW() WHERE id = $2`, [meta.value, taskId])
+        await pool.query(`UPDATE tasks SET needs_decision = $1, updated_at = NOW() WHERE id = $2`, [meta.value, taskId])
         break
       }
       case 'restore_fields': {
@@ -271,44 +272,40 @@ router.post('/activity-log/:id/undo', requireAuth, requireRole('admin'), async (
         const params = []
         const setClauses = columns.map((col) => { params.push(meta.fields[col]); return `${col} = $${params.length}` })
         params.push(taskId)
-        const updated = (await pool.query(
-          `UPDATE launch_tasks SET ${setClauses.join(', ')}, updated_at = NOW() WHERE id = $${params.length} RETURNING *`,
-          params
-        )).rows[0]
-        await pushLaunchTaskToOpsMirror(updated, who)
+        await pool.query(`UPDATE tasks SET ${setClauses.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`, params)
         break
       }
       case 'restore_note': {
         await pool.query(
-          `UPDATE launch_tasks SET note = $1, note_updated_at = NOW(), note_updated_by = $2, updated_at = NOW() WHERE id = $3`,
+          `UPDATE tasks SET note = $1, note_updated_at = NOW(), note_updated_by = $2, updated_at = NOW() WHERE id = $3`,
           [meta.value ?? '', who, taskId]
         )
         break
       }
       case 'delete_expense': {
-        await pool.query(`DELETE FROM launch_task_expenses WHERE id = $1 AND task_id = $2`, [meta.expense_id, taskId])
+        await pool.query(`DELETE FROM task_expenses WHERE id = $1 AND task_id = $2`, [meta.expense_id, taskId])
         break
       }
       case 'add_expense': {
         await pool.query(
-          `INSERT INTO launch_task_expenses (task_id, date, description, amount_cents, created_by) VALUES ($1, $2, $3, $4, $5)`,
+          `INSERT INTO task_expenses (task_id, date, description, amount_cents, created_by) VALUES ($1, $2, $3, $4, $5)`,
           [taskId, meta.date, meta.description, meta.amount_cents, who]
         )
         break
       }
       case 'delete_todo': {
-        await pool.query(`DELETE FROM launch_task_todos WHERE id = $1 AND task_id = $2`, [meta.todo_id, taskId])
+        await pool.query(`DELETE FROM task_checklist_items WHERE id = $1 AND task_id = $2`, [meta.todo_id, taskId])
         break
       }
       case 'add_todo': {
         await pool.query(
-          `INSERT INTO launch_task_todos (task_id, text, urgency, sort_order) VALUES ($1, $2, $3, $4)`,
+          `INSERT INTO task_checklist_items (task_id, label, urgency, sort_order) VALUES ($1, $2, $3, $4)`,
           [taskId, meta.text, meta.urgency, meta.sort_order]
         )
         break
       }
       case 'set_todo_done': {
-        await pool.query(`UPDATE launch_task_todos SET done = $1 WHERE id = $2 AND task_id = $3`, [meta.value, meta.todo_id, taskId])
+        await pool.query(`UPDATE task_checklist_items SET is_completed = $1 WHERE id = $2 AND task_id = $3`, [meta.value, meta.todo_id, taskId])
         break
       }
       default:
@@ -353,13 +350,23 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
     if (validationError) return res.status(400).json({ error: validationError })
 
     const result = await pool.query(
-      `INSERT INTO launch_tasks (name, owner_id, tag, urgency, due_date, budget_cents, committed_cents, needs_decision, source_ref)
-       VALUES ($1, $2, $3, COALESCE($4, 'workon'), $5, COALESCE($6, 0), COALESCE($7, 0), COALESCE($8, false), $9)
+      `INSERT INTO tasks (title, department, owner_id, priority, due_date, status, budget_cents, committed_cents, needs_decision, source_ref, is_ops_task)
+       VALUES ($1, $2, $3, $4, $5, 'not_started', COALESCE($6, 0), COALESCE($7, 0), COALESCE($8, false), $9, false)
        RETURNING *`,
-      [name, owner_id, tag, urgency || null, due_date, budget_cents || 0, committed_cents || 0, needs_decision || false, source_ref || null]
+      [
+        name,
+        tagToDepartment(tag),
+        owner_id,
+        urgency ? urgencyToPriority(urgency) : 'medium',
+        due_date,
+        budget_cents || 0,
+        committed_cents || 0,
+        needs_decision || false,
+        source_ref || null,
+      ]
     )
     const task = result.rows[0]
-    await logActivity(task.id, req.userName, 'created', `${req.userName} created ${task.name}`, { action: 'delete_task' })
+    await logActivity(task.id, req.userName, 'created', `${req.userName} created ${task.title}`, { action: 'delete_task' })
 
     const full = await fetchTaskRow(task.id)
     res.status(201).json({ success: true, data: full })
@@ -380,7 +387,7 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
     const validationError = tagError || urgencyError || statusError
     if (validationError) return res.status(400).json({ error: validationError })
 
-    const beforeResult = await pool.query(`SELECT * FROM launch_tasks WHERE id = $1`, [req.params.id])
+    const beforeResult = await pool.query(`SELECT * FROM tasks WHERE id = $1`, [req.params.id])
     if (beforeResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
     const before = beforeResult.rows[0]
 
@@ -389,21 +396,35 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
     const set = (column, value) => { params.push(value); fields.push(`${column} = $${params.length}`) }
 
     // Tracks the pre-change value of every generic field that actually
-    // changed, keyed by column name -- exactly what an 'edit' undo needs to
-    // restore, so it doesn't have to guess from the (lossy) text sentence.
+    // changed, keyed by the real `tasks` column name -- exactly what an
+    // 'edit' undo needs to restore via a plain UPDATE tasks SET, so it
+    // doesn't have to guess from the (lossy) text sentence or re-translate
+    // tag/urgency back from department/priority.
     const changedFieldsOld = {}
     const setEdit = (column, newValue, oldValue) => { set(column, newValue); changedFieldsOld[column] = oldValue }
 
-    if (name !== undefined && name !== before.name) setEdit('name', name, before.name)
+    if (name !== undefined && name !== before.title) setEdit('title', name, before.title)
     if (owner_id !== undefined && owner_id !== before.owner_id) setEdit('owner_id', owner_id, before.owner_id)
-    if (tag !== undefined && tag !== before.tag) setEdit('tag', tag, before.tag)
-    if (urgency !== undefined && urgency !== before.urgency) setEdit('urgency', urgency, before.urgency)
+    if (tag !== undefined) {
+      const newDept = tagToDepartment(tag)
+      if (newDept !== before.department) setEdit('department', newDept, before.department)
+    }
+    if (urgency !== undefined) {
+      const newPriority = urgencyToPriority(urgency)
+      if (newPriority !== before.priority) setEdit('priority', newPriority, before.priority)
+    }
     const beforeDueDate = before.due_date instanceof Date ? before.due_date.toISOString().slice(0, 10) : before.due_date
     if (due_date !== undefined && due_date !== beforeDueDate) setEdit('due_date', due_date, beforeDueDate)
     if (budget_cents !== undefined && budget_cents !== before.budget_cents) setEdit('budget_cents', budget_cents, before.budget_cents)
     if (committed_cents !== undefined && committed_cents !== before.committed_cents) setEdit('committed_cents', committed_cents, before.committed_cents)
     if (source_ref !== undefined && source_ref !== before.source_ref) setEdit('source_ref', source_ref, before.source_ref)
-    if (status !== undefined) set('status', status)
+
+    let newTasksStatus = before.status
+    if (status !== undefined) {
+      newTasksStatus = launchStatusToOpsStatus(status)
+      set('status', newTasksStatus)
+      set('completed_at', newTasksStatus === 'completed' ? new Date() : null)
+    }
     if (needs_decision !== undefined) set('needs_decision', needs_decision)
 
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' })
@@ -412,31 +433,30 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
     params.push(req.params.id)
 
     const result = await pool.query(
-      `UPDATE launch_tasks SET ${fields.join(', ')} WHERE id = $${params.length} RETURNING *`,
+      `UPDATE tasks SET ${fields.join(', ')} WHERE id = $${params.length} RETURNING *`,
       params
     )
     const task = result.rows[0]
     const who = req.userName
 
-    if (status !== undefined && status !== before.status) {
+    if (status !== undefined && newTasksStatus !== before.status) {
       await logActivity(
         task.id, who, status === 'done' ? 'complete' : 'status_change',
-        status === 'done' ? `${who} completed ${task.name}` : `${who} reopened ${task.name}`,
+        status === 'done' ? `${who} completed ${task.title}` : `${who} reopened ${task.title}`,
         { action: 'set_status', value: before.status }
       )
     }
     if (needs_decision !== undefined && needs_decision !== before.needs_decision) {
       await logActivity(
         task.id, who, 'decision_flag',
-        needs_decision ? `${who} flagged ${task.name} as needing a decision` : `${who} cleared the decision flag on ${task.name}`,
+        needs_decision ? `${who} flagged ${task.title} as needing a decision` : `${who} cleared the decision flag on ${task.title}`,
         { action: 'set_needs_decision', value: before.needs_decision }
       )
     }
     if (Object.keys(changedFieldsOld).length > 0) {
-      await logActivity(task.id, who, 'edit', `${who} updated ${task.name}`, { action: 'restore_fields', fields: changedFieldsOld })
+      await logActivity(task.id, who, 'edit', `${who} updated ${task.title}`, { action: 'restore_fields', fields: changedFieldsOld })
     }
 
-    await pushLaunchTaskToOpsMirror(task, who)
     const full = await fetchTaskRow(task.id)
     res.json({ success: true, data: full })
   } catch (error) {
@@ -448,7 +468,7 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 
 router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const deleted = await deleteLaunchTaskCascade(req.params.id)
+    const deleted = await deleteTask(req.params.id)
     if (!deleted) return res.status(404).json({ error: 'Task not found' })
     res.json({ success: true, message: 'Task deleted' })
   } catch (error) {
@@ -465,7 +485,7 @@ router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 router.get('/:id/expenses', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM launch_task_expenses WHERE task_id = $1 ORDER BY date DESC, id DESC`,
+      `SELECT * FROM task_expenses WHERE task_id = $1 ORDER BY date DESC, id DESC`,
       [req.params.id]
     )
     res.json({ success: true, data: result.rows })
@@ -482,12 +502,12 @@ router.post('/:id/expenses', requireAuth, requireRole('admin'), async (req, res)
       return res.status(400).json({ error: 'date, description, and a positive amount_cents are required' })
     }
 
-    const taskResult = await pool.query(`SELECT * FROM launch_tasks WHERE id = $1`, [req.params.id])
+    const taskResult = await pool.query(`SELECT * FROM tasks WHERE id = $1`, [req.params.id])
     if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
     const task = taskResult.rows[0]
 
     const result = await pool.query(
-      `INSERT INTO launch_task_expenses (task_id, date, description, amount_cents, created_by)
+      `INSERT INTO task_expenses (task_id, date, description, amount_cents, created_by)
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
       [req.params.id, date, description, amount_cents, req.userName]
     )
@@ -495,7 +515,7 @@ router.post('/:id/expenses', requireAuth, requireRole('admin'), async (req, res)
     const who = req.userName
     const amountLabel = `$${(amount_cents / 100).toLocaleString()}`
     const budgetLabel = task.budget_cents > 0 ? ` (budgeted $${(task.budget_cents / 100).toLocaleString()})` : ''
-    await logActivity(task.id, who, 'expense', `${who} logged ${amountLabel} paid on ${task.name}${budgetLabel}`, {
+    await logActivity(task.id, who, 'expense', `${who} logged ${amountLabel} paid on ${task.title}${budgetLabel}`, {
       action: 'delete_expense',
       expense_id: result.rows[0].id,
     })
@@ -510,12 +530,12 @@ router.post('/:id/expenses', requireAuth, requireRole('admin'), async (req, res)
 
 router.delete('/:id/expenses/:expId', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const taskResult = await pool.query(`SELECT * FROM launch_tasks WHERE id = $1`, [req.params.id])
+    const taskResult = await pool.query(`SELECT * FROM tasks WHERE id = $1`, [req.params.id])
     if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
     const task = taskResult.rows[0]
 
     const result = await pool.query(
-      `DELETE FROM launch_task_expenses WHERE id = $1 AND task_id = $2 RETURNING *`,
+      `DELETE FROM task_expenses WHERE id = $1 AND task_id = $2 RETURNING *`,
       [req.params.expId, req.params.id]
     )
     if (result.rows.length === 0) return res.status(404).json({ error: 'Expense not found' })
@@ -524,7 +544,7 @@ router.delete('/:id/expenses/:expId', requireAuth, requireRole('admin'), async (
     const deleted = result.rows[0]
     const amountLabel = `$${(deleted.amount_cents / 100).toLocaleString()}`
     const deletedDate = deleted.date instanceof Date ? deleted.date.toISOString().slice(0, 10) : deleted.date
-    await logActivity(task.id, who, 'expense', `${who} removed a ${amountLabel} expense from ${task.name}`, {
+    await logActivity(task.id, who, 'expense', `${who} removed a ${amountLabel} expense from ${task.title}`, {
       action: 'add_expense',
       date: deletedDate,
       description: deleted.description,
@@ -548,18 +568,18 @@ router.patch('/:id/note', requireAuth, requireRole('admin'), async (req, res) =>
     const { note } = req.body
     const who = req.userName
 
-    const beforeResult = await pool.query(`SELECT note FROM launch_tasks WHERE id = $1`, [req.params.id])
+    const beforeResult = await pool.query(`SELECT note, title FROM tasks WHERE id = $1`, [req.params.id])
     if (beforeResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
     const previousNote = beforeResult.rows[0].note
 
     const result = await pool.query(
-      `UPDATE launch_tasks SET note = $1, note_updated_at = NOW(), note_updated_by = $2, updated_at = NOW()
+      `UPDATE tasks SET note = $1, note_updated_at = NOW(), note_updated_by = $2, updated_at = NOW()
        WHERE id = $3 RETURNING *`,
       [note ?? '', who, req.params.id]
     )
     if (result.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
 
-    await logActivity(result.rows[0].id, who, 'note', `${who} added a note to ${result.rows[0].name}`, {
+    await logActivity(result.rows[0].id, who, 'note', `${who} added a note to ${result.rows[0].title}`, {
       action: 'restore_note',
       value: previousNote,
     })
@@ -573,7 +593,8 @@ router.patch('/:id/note', requireAuth, requireRole('admin'), async (req, res) =>
 })
 
 // ----------------------------------------------------------------------------
-// TODOS
+// TODOS -- stored in the shared task_checklist_items table (label/is_completed),
+// aliased back to the text/done names this dashboard has always used.
 // ----------------------------------------------------------------------------
 
 router.post('/:id/todos', requireAuth, requireRole('admin'), async (req, res) => {
@@ -583,20 +604,22 @@ router.post('/:id/todos', requireAuth, requireRole('admin'), async (req, res) =>
     const urgencyError = validateEnum(urgency, URGENCIES, 'urgency')
     if (urgencyError) return res.status(400).json({ error: urgencyError })
 
-    const taskResult = await pool.query(`SELECT * FROM launch_tasks WHERE id = $1`, [req.params.id])
+    const taskResult = await pool.query(`SELECT * FROM tasks WHERE id = $1`, [req.params.id])
     if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
     const task = taskResult.rows[0]
 
     const sortResult = await pool.query(
-      `SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM launch_task_todos WHERE task_id = $1`,
+      `SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM task_checklist_items WHERE task_id = $1`,
       [req.params.id]
     )
     const result = await pool.query(
-      `INSERT INTO launch_task_todos (task_id, text, urgency, sort_order) VALUES ($1, $2, COALESCE($3, 'workon'), $4) RETURNING *`,
+      `INSERT INTO task_checklist_items (task_id, label, urgency, sort_order)
+       VALUES ($1, $2, COALESCE($3, 'workon'), $4)
+       RETURNING id, task_id, label AS text, is_completed AS done, urgency, sort_order`,
       [req.params.id, text, urgency || null, sortResult.rows[0].next_order]
     )
 
-    await logActivity(task.id, req.userName, 'status_change', `${req.userName} added a to-do to ${task.name}`, {
+    await logActivity(task.id, req.userName, 'status_change', `${req.userName} added a to-do to ${task.title}`, {
       action: 'delete_todo',
       todo_id: result.rows[0].id,
     })
@@ -614,26 +637,27 @@ router.patch('/:id/todos/:todoId', requireAuth, requireRole('admin'), async (req
     const urgencyError = validateEnum(urgency, URGENCIES, 'urgency')
     if (urgencyError) return res.status(400).json({ error: urgencyError })
 
-    const taskResult = await pool.query(`SELECT * FROM launch_tasks WHERE id = $1`, [req.params.id])
+    const taskResult = await pool.query(`SELECT * FROM tasks WHERE id = $1`, [req.params.id])
     if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
     const task = taskResult.rows[0]
 
-    const beforeTodoResult = await pool.query(`SELECT done FROM launch_task_todos WHERE id = $1 AND task_id = $2`, [req.params.todoId, req.params.id])
+    const beforeTodoResult = await pool.query(`SELECT is_completed FROM task_checklist_items WHERE id = $1 AND task_id = $2`, [req.params.todoId, req.params.id])
     if (beforeTodoResult.rows.length === 0) return res.status(404).json({ error: 'Todo not found' })
-    const previousDone = beforeTodoResult.rows[0].done
+    const previousDone = beforeTodoResult.rows[0].is_completed
 
     const fields = []
     const params = []
     const set = (column, value) => { params.push(value); fields.push(`${column} = $${params.length}`) }
 
-    if (text !== undefined) set('text', text)
-    if (done !== undefined) set('done', done)
+    if (text !== undefined) set('label', text)
+    if (done !== undefined) set('is_completed', done)
     if (urgency !== undefined) set('urgency', urgency)
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' })
 
     params.push(req.params.todoId, req.params.id)
     const result = await pool.query(
-      `UPDATE launch_task_todos SET ${fields.join(', ')} WHERE id = $${params.length - 1} AND task_id = $${params.length} RETURNING *`,
+      `UPDATE task_checklist_items SET ${fields.join(', ')} WHERE id = $${params.length - 1} AND task_id = $${params.length}
+       RETURNING id, task_id, label AS text, is_completed AS done, urgency, sort_order`,
       params
     )
     if (result.rows.length === 0) return res.status(404).json({ error: 'Todo not found' })
@@ -642,7 +666,7 @@ router.patch('/:id/todos/:todoId', requireAuth, requireRole('admin'), async (req
       const who = req.userName
       await logActivity(
         task.id, who, done ? 'complete' : 'status_change',
-        done ? `${who} completed a to-do on ${task.name}` : `${who} reopened a to-do on ${task.name}`,
+        done ? `${who} completed a to-do on ${task.title}` : `${who} reopened a to-do on ${task.title}`,
         { action: 'set_todo_done', todo_id: Number(req.params.todoId), value: previousDone }
       )
     }
@@ -656,18 +680,19 @@ router.patch('/:id/todos/:todoId', requireAuth, requireRole('admin'), async (req
 
 router.delete('/:id/todos/:todoId', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const taskResult = await pool.query(`SELECT * FROM launch_tasks WHERE id = $1`, [req.params.id])
+    const taskResult = await pool.query(`SELECT * FROM tasks WHERE id = $1`, [req.params.id])
     if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
     const task = taskResult.rows[0]
 
     const result = await pool.query(
-      `DELETE FROM launch_task_todos WHERE id = $1 AND task_id = $2 RETURNING *`,
+      `DELETE FROM task_checklist_items WHERE id = $1 AND task_id = $2
+       RETURNING id, task_id, label AS text, is_completed AS done, urgency, sort_order`,
       [req.params.todoId, req.params.id]
     )
     if (result.rows.length === 0) return res.status(404).json({ error: 'Todo not found' })
 
     const deleted = result.rows[0]
-    await logActivity(task.id, req.userName, 'status_change', `${req.userName} removed a to-do from ${task.name}`, {
+    await logActivity(task.id, req.userName, 'status_change', `${req.userName} removed a to-do from ${task.title}`, {
       action: 'add_todo',
       text: deleted.text,
       urgency: deleted.urgency,

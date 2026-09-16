@@ -194,22 +194,27 @@ router.delete('/customer-lists/:id', requireAuth, requireRole('admin'), async (r
   }
 })
 
-// ---- Tasks (crm_tasks) ------------------------------------------------------
+// ---- Tasks (customer follow-ups) -------------------------------------------
 //
-// Routed at /crm-tasks, not /tasks -- the real Operations Hub already owns
-// /api/admin/tasks (adminTasksRoutes) with a completely different schema.
+// Routed at /crm-tasks for backward compatibility with the frontend, but as
+// of 2026-09-15 these are just `tasks` rows with source_type = 'customer'
+// and is_ops_task = false -- one canonical task table for the whole
+// business (see migrations/unify_task_systems.sql), not a separate schema.
+// Response shape is unchanged (id, customer_id, title, description,
+// completed_at, system_source, source_automation_rule_id, customer_name).
 
 // GET /api/admin/crm-tasks?status=open|completed|all
 router.get('/crm-tasks', requireAuth, requireRole('admin'), async (req, res) => {
   const status = req.query.status || 'open'
   try {
-    const where = status === 'open' ? 'WHERE t.completed_at IS NULL' : status === 'completed' ? 'WHERE t.completed_at IS NOT NULL' : ''
+    const statusClause = status === 'open' ? 'AND t.completed_at IS NULL' : status === 'completed' ? 'AND t.completed_at IS NOT NULL' : ''
     const result = await db.query(`
-      SELECT t.*, c.name AS customer_name
-      FROM crm_tasks t
-      LEFT JOIN customers c ON c.id = t.customer_id
-      ${where}
-      ORDER BY t.due_at ASC NULLS LAST, t.created_at DESC
+      SELECT t.id, t.source_id AS customer_id, t.title, t.description, t.completed_at,
+             t.system_source, t.source_automation_rule_id, t.created_at, c.name AS customer_name
+      FROM tasks t
+      LEFT JOIN customers c ON c.id = t.source_id
+      WHERE t.source_type = 'customer' ${statusClause}
+      ORDER BY t.due_date ASC NULLS LAST, t.created_at DESC
     `)
     res.json({ data: result.rows })
   } catch (error) {
@@ -219,21 +224,22 @@ router.get('/crm-tasks', requireAuth, requireRole('admin'), async (req, res) => 
 })
 
 // POST /api/admin/crm-tasks -- the manual-create path. Everything else that
-// writes to this table (executeStep() in automationEngine, and the cron
-// auto-flags below) inserts directly; this is what lets a human, or the
-// frontend's quick-add, create one from outside that flow. Leaving
-// system_source and source_automation_rule_id both null is exactly how a
-// manually-added task is told apart from a system-generated one.
+// writes a customer-follow-up task (executeStep() in automationEngine, and
+// the cron auto-flags in pipelineAutoFlags.js) inserts directly; this is
+// what lets a human, or the frontend's quick-add, create one from outside
+// that flow. Leaving system_source and source_automation_rule_id both null
+// is exactly how a manually-added task is told apart from a
+// system-generated one.
 router.post('/crm-tasks', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { customer_id, title, description } = req.body
     if (!title || !title.trim()) return res.status(400).json({ error: 'title is required' })
 
     const result = await db.query(
-      `INSERT INTO crm_tasks (customer_id, title, description)
-       VALUES ($1, $2, $3)
-       RETURNING *`,
-      [customer_id || null, title.trim(), description || null]
+      `INSERT INTO tasks (title, description, department, source_type, source_id, is_ops_task)
+       VALUES ($1, $2, 'Customer Success', 'customer', $3, false)
+       RETURNING id, source_id AS customer_id, title, description, completed_at, system_source, source_automation_rule_id, created_at`,
+      [title.trim(), description || null, customer_id || null]
     )
     res.status(201).json({ data: result.rows[0] })
   } catch (error) {
@@ -245,7 +251,12 @@ router.post('/crm-tasks', requireAuth, requireRole('admin'), async (req, res) =>
 // PUT /api/admin/crm-tasks/:id/complete
 router.put('/crm-tasks/:id/complete', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const result = await db.query('UPDATE crm_tasks SET completed_at = NOW() WHERE id = $1 RETURNING *', [req.params.id])
+    const result = await db.query(
+      `UPDATE tasks SET status = 'completed', completed_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND source_type = 'customer'
+       RETURNING id, source_id AS customer_id, title, description, completed_at, system_source, source_automation_rule_id, created_at`,
+      [req.params.id]
+    )
     if (!result.rows[0]) return res.status(404).json({ error: 'Task not found' })
     res.json({ data: result.rows[0] })
   } catch (error) {
@@ -260,7 +271,12 @@ router.put('/crm-tasks/:id/complete', requireAuth, requireRole('admin'), async (
 router.patch('/crm-tasks/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { description } = req.body
-    const result = await db.query('UPDATE crm_tasks SET description = $1 WHERE id = $2 RETURNING *', [description ?? null, req.params.id])
+    const result = await db.query(
+      `UPDATE tasks SET description = $1, updated_at = NOW()
+       WHERE id = $2 AND source_type = 'customer'
+       RETURNING id, source_id AS customer_id, title, description, completed_at, system_source, source_automation_rule_id, created_at`,
+      [description ?? null, req.params.id]
+    )
     if (!result.rows[0]) return res.status(404).json({ error: 'Task not found' })
     res.json({ data: result.rows[0] })
   } catch (error) {

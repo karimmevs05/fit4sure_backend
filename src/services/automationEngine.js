@@ -8,9 +8,10 @@
 //   - checkTimeTriggers() / checkStageTrigger(customerId, newStage) -- find
 //     customers who should be auto-enrolled based on a rule's trigger.
 //
-// The human-task side writes to `crm_tasks`, not `tasks` -- the real,
-// already-live Operations Hub owns the `tasks` table (owner_id, priority,
-// status, due_date, ...), which is a completely different schema.
+// The human-task side writes to the shared `tasks` table (source_type =
+// 'customer', is_ops_task = false) -- as of 2026-09-15 this is the one
+// canonical task table for the whole business, not a separate crm_tasks
+// schema (see migrations/unify_task_systems.sql).
 
 const db = require('../config/db')
 const { sendEmail, sendSms, mergeTags } = require('./communicationService')
@@ -43,9 +44,9 @@ async function enrollCustomers(ruleId, customerIds, source) {
 async function executeStep(enrollment, step, customer) {
   if (step.action_type === 'create_task') {
     await db.query(
-      `INSERT INTO crm_tasks (customer_id, title, description, due_at, source_automation_rule_id)
-       VALUES ($1, $2, $3, NOW(), $4)`,
-      [customer.id, mergeTags(step.task_title, customer), mergeTags(step.task_description, customer), enrollment.rule_id]
+      `INSERT INTO tasks (title, description, department, due_date, source_type, source_id, source_automation_rule_id, is_ops_task)
+       VALUES ($1, $2, 'Customer Success', CURRENT_DATE, 'customer', $3, $4, false)`,
+      [mergeTags(step.task_title, customer), mergeTags(step.task_description, customer), customer.id, enrollment.rule_id]
     )
     return
   }

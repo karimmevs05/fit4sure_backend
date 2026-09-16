@@ -3,7 +3,6 @@ const router = express.Router()
 const pool = require('../../config/db')
 const { requireAuth, requireRole } = require('../../middleware/auth')
 const { getRecipeIngredientNeeds } = require('../../utils/recipeCost')
-const { priorityToUrgency, departmentToTag, opsStatusToLaunchStatus, deriveDueDate } = require('../../utils/taskSync')
 
 // ============================================================================
 // OPERATIONS HUB -- generic cross-department task manager. Replaces the old
@@ -49,63 +48,20 @@ async function fetchTaskWithDetails(taskId) {
 }
 
 // ----------------------------------------------------------------------------
-// TASK MANAGEMENT SYNC -- every Ops Hub task automatically gets a mirrored
-// launch_tasks row (Task Management dashboard), kept in sync both ways via
-// ops_task_id. See src/utils/taskSync.js for the (lossy) field mappings.
+// TASK MANAGEMENT ACTIVITY LOG -- Ops Hub tasks and Task Management
+// ("launch") tasks used to be two tables kept in sync via a lossy mirror
+// (see git history / src/utils/taskSync.js); they're now one row in
+// `tasks`, so there's nothing left to mirror. This just keeps writing the
+// same launch_activity_log entries the mirror used to produce, so the Task
+// Management dashboard's activity feed still shows Ops Hub task activity
+// exactly as before.
 // ----------------------------------------------------------------------------
 
-async function createLaunchMirror(opsTask, actor) {
-  const dueDate = deriveDueDate(opsTask)
-  if (!dueDate) return null // launch_tasks.due_date is NOT NULL -- nothing to derive from, skip the mirror
-
-  const result = await pool.query(
-    `INSERT INTO launch_tasks (name, owner_id, tag, urgency, due_date, status, source_ref, ops_task_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     RETURNING *`,
-    [
-      opsTask.title,
-      opsTask.owner_id,
-      departmentToTag(opsTask.department),
-      priorityToUrgency(opsTask.priority),
-      dueDate,
-      opsStatusToLaunchStatus(opsTask.status),
-      `Operations Hub task #${opsTask.id}`,
-      opsTask.id,
-    ]
-  )
-  const launchTask = result.rows[0]
+async function logTaskActivity(taskId, actor, type, text) {
   await pool.query(
-    `INSERT INTO launch_activity_log (task_id, actor, type, text) VALUES ($1, $2, 'status_change', $3)`,
-    [launchTask.id, actor, `${actor} created ${launchTask.name} (from Operations Hub)`]
+    `INSERT INTO launch_activity_log (task_id, actor, type, text) VALUES ($1, $2, $3, $4)`,
+    [taskId, actor, type, text]
   )
-  return launchTask
-}
-
-async function pushOpsTaskToLaunchMirror(opsTask, actor) {
-  const existing = await pool.query(`SELECT * FROM launch_tasks WHERE ops_task_id = $1`, [opsTask.id])
-  if (existing.rows.length === 0) return
-  const before = existing.rows[0]
-
-  const dueDate = deriveDueDate(opsTask) || before.due_date
-  const status = opsStatusToLaunchStatus(opsTask.status)
-  const result = await pool.query(
-    `UPDATE launch_tasks SET name = $1, owner_id = $2, tag = $3, urgency = $4, due_date = $5, status = $6, updated_at = NOW()
-     WHERE ops_task_id = $7 RETURNING *`,
-    [opsTask.title, opsTask.owner_id, departmentToTag(opsTask.department), priorityToUrgency(opsTask.priority), dueDate, status, opsTask.id]
-  )
-  const launchTask = result.rows[0]
-
-  if (status !== before.status) {
-    await pool.query(
-      `INSERT INTO launch_activity_log (task_id, actor, type, text) VALUES ($1, $2, $3, $4)`,
-      [launchTask.id, actor, status === 'done' ? 'complete' : 'status_change', status === 'done' ? `${actor} completed ${launchTask.name}` : `${actor} reopened ${launchTask.name}`]
-    )
-  } else {
-    await pool.query(
-      `INSERT INTO launch_activity_log (task_id, actor, type, text) VALUES ($1, $2, 'status_change', $3)`,
-      [launchTask.id, actor, `${actor} updated ${launchTask.name} (from Operations Hub)`]
-    )
-  }
 }
 
 // ----------------------------------------------------------------------------
@@ -116,7 +72,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { department, owner_id, priority, status, due_date, due_date_from, due_date_to, week_start, source_type, source_id, q, sort_by, sort_dir, limit } = req.query
 
-    const conditions = []
+    const conditions = ['is_ops_task = true']
     const params = []
 
     if (department) { params.push(department); conditions.push(`department = $${params.length}`) }
@@ -179,7 +135,7 @@ router.get('/summary', requireAuth, requireRole('admin'), async (req, res) => {
          department,
          COUNT(*) AS department_count
        FROM tasks
-       WHERE due_date >= $1::date AND due_date < ($1::date + interval '7 days')
+       WHERE is_ops_task = true AND due_date >= $1::date AND due_date < ($1::date + interval '7 days')
        GROUP BY GROUPING SETS ((due_date), (due_date, department))`,
       [week_start]
     )
@@ -216,7 +172,7 @@ router.get('/today-overview', requireAuth, requireRole('admin'), async (req, res
          COUNT(*) FILTER (WHERE status != 'completed' AND due_date < $1::date) AS overdue,
          COALESCE(SUM(estimated_minutes), 0) AS estimated_minutes
        FROM tasks
-       WHERE due_date = $1::date`,
+       WHERE is_ops_task = true AND due_date = $1::date`,
       [date]
     )
 
@@ -247,7 +203,7 @@ router.get('/my-focus', requireAuth, requireRole('admin'), async (req, res) => {
       `SELECT t.*, s.display_name AS owner_name
        FROM tasks t
        LEFT JOIN users s ON t.owner_id = s.user_id
-       WHERE t.owner_id = $1 AND t.status NOT IN ('completed', 'cancelled')
+       WHERE t.is_ops_task = true AND t.owner_id = $1 AND t.status NOT IN ('completed', 'cancelled')
        ORDER BY ${PRIORITY_RANK_SQL}, t.due_date ASC NULLS LAST
        LIMIT $2`,
       [owner_id, parseInt(limit, 10) || 5]
@@ -622,7 +578,7 @@ router.post('/templates/generate-week/:weekStart', requireAuth, requireRole('adm
         await pool.query(`INSERT INTO task_checklist_items (task_id, label, sort_order) VALUES ($1, $2, $3)`, [task.id, item.label, item.sort_order])
       }
 
-      await createLaunchMirror(task, req.userName)
+      await logTaskActivity(task.id, req.userName, 'status_change', `${req.userName} created ${task.title} (recurring template)`)
       created.push(task)
     }
 
@@ -663,7 +619,7 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
       [title, description || null, department, owner_id || null, priority || null, status || null, due_date || null, operational_day || null, week_start || null, estimated_minutes || null, source_type || null, source_id || null]
     )
 
-    await createLaunchMirror(result.rows[0], req.userName)
+    await logTaskActivity(result.rows[0].id, req.userName, 'status_change', `${req.userName} created ${result.rows[0].title}`)
     res.status(201).json({ success: true, data: result.rows[0] })
   } catch (error) {
     console.error('Error creating task:', error)
@@ -707,7 +663,7 @@ router.post('/recurring', requireAuth, requireRole('admin'), async (req, res) =>
       [title, description || null, department, owner_id || null, priority || null, dueDate, operational_day, week_start, estimated_minutes || null, template.id]
     )
 
-    await createLaunchMirror(taskResult.rows[0], req.userName)
+    await logTaskActivity(taskResult.rows[0].id, req.userName, 'status_change', `${req.userName} created ${taskResult.rows[0].title}`)
     res.status(201).json({ success: true, data: { template, task: taskResult.rows[0] } })
   } catch (error) {
     console.error('Error creating recurring task:', error)
@@ -749,6 +705,8 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' })
 
+    const before = await pool.query(`SELECT status, title FROM tasks WHERE id = $1`, [req.params.id])
+
     fields.push(`updated_at = NOW()`)
     params.push(req.params.id)
 
@@ -758,8 +716,16 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res) => {
     )
     if (result.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
 
-    await pushOpsTaskToLaunchMirror(result.rows[0], req.userName)
-    res.json({ success: true, data: result.rows[0] })
+    const updated = result.rows[0]
+    if (before.rows[0] && status !== undefined && status !== before.rows[0].status) {
+      await logTaskActivity(
+        updated.id, req.userName, updated.status === 'completed' ? 'complete' : 'status_change',
+        updated.status === 'completed' ? `${req.userName} completed ${updated.title}` : `${req.userName} reopened ${updated.title}`
+      )
+    } else {
+      await logTaskActivity(updated.id, req.userName, 'status_change', `${req.userName} updated ${updated.title}`)
+    }
+    res.json({ success: true, data: updated })
   } catch (error) {
     console.error('Error updating task:', error)
     res.status(500).json({ error: error.message })
@@ -775,8 +741,12 @@ router.post('/:id/complete', requireAuth, requireRole('admin'), async (req, res)
     )
     if (result.rows.length === 0) return res.status(404).json({ error: 'Task not found' })
 
-    await pushOpsTaskToLaunchMirror(result.rows[0], req.userName)
-    res.json({ success: true, data: result.rows[0] })
+    const updated = result.rows[0]
+    await logTaskActivity(
+      updated.id, req.userName, completed ? 'complete' : 'status_change',
+      completed ? `${req.userName} completed ${updated.title}` : `${req.userName} reopened ${updated.title}`
+    )
+    res.json({ success: true, data: updated })
   } catch (error) {
     console.error('Error completing task:', error)
     res.status(500).json({ error: error.message })
@@ -805,7 +775,7 @@ router.post('/:id/duplicate', requireAuth, requireRole('admin'), async (req, res
       )
     }
 
-    await createLaunchMirror(clone, req.userName)
+    await logTaskActivity(clone.id, req.userName, 'status_change', `${req.userName} created ${clone.title} (duplicate)`)
     const full = await fetchTaskWithDetails(clone.id)
     res.status(201).json({ success: true, data: full })
   } catch (error) {

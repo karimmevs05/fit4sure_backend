@@ -34,15 +34,15 @@ async function checkStaleDeals() {
   let created = 0
   for (const c of stale.rows) {
     const existing = await db.query(
-      `SELECT 1 FROM crm_tasks WHERE customer_id = $1 AND system_source = 'stale_flag' AND completed_at IS NULL`,
+      `SELECT 1 FROM tasks WHERE source_type = 'customer' AND source_id = $1 AND system_source = 'stale_flag' AND completed_at IS NULL`,
       [c.id]
     )
     if (existing.rows.length > 0) continue
 
     await db.query(
-      `INSERT INTO crm_tasks (customer_id, title, description, system_source)
-       VALUES ($1, $2, $3, 'stale_flag')`,
-      [c.id, `Follow up with ${c.name}`, `${c.sales_pipeline_stage} stage — quiet ${c.days_since_last_contact} days`]
+      `INSERT INTO tasks (title, description, department, source_type, source_id, system_source, is_ops_task)
+       VALUES ($1, $2, 'Customer Success', 'customer', $3, 'stale_flag', false)`,
+      [`Follow up with ${c.name}`, `${c.sales_pipeline_stage} stage — quiet ${c.days_since_last_contact} days`, c.id]
     )
     created++
   }
@@ -60,16 +60,16 @@ async function checkWinProbabilityDrops() {
   let created = 0
   for (const c of dropped.rows) {
     const existing = await db.query(
-      `SELECT 1 FROM crm_tasks WHERE customer_id = $1 AND system_source = 'win_probability_drop' AND completed_at IS NULL`,
+      `SELECT 1 FROM tasks WHERE source_type = 'customer' AND source_id = $1 AND system_source = 'win_probability_drop' AND completed_at IS NULL`,
       [c.id]
     )
     if (existing.rows.length > 0) continue
 
     const drop = c.conversion_probability_prev - c.conversion_probability
     await db.query(
-      `INSERT INTO crm_tasks (customer_id, title, description, system_source)
-       VALUES ($1, $2, $3, 'win_probability_drop')`,
-      [c.id, `Check in with ${c.name}`, `Win Probability dropped ${drop}pts this week`]
+      `INSERT INTO tasks (title, description, department, source_type, source_id, system_source, is_ops_task)
+       VALUES ($1, $2, 'Customer Success', 'customer', $3, 'win_probability_drop', false)`,
+      [`Check in with ${c.name}`, `Win Probability dropped ${drop}pts this week`, c.id]
     )
     created++
   }
