@@ -6,6 +6,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai')
 const { calculateRecipeMacros } = require('./adminRecipes')
 const { renderCarouselCard, renderStoryCard } = require('../../services/contentImageRenderer')
 const { listImagesInFolder, downloadImageBuffer } = require('../../services/googleDriveSync')
+const { editFoodPhoto } = require('../../services/photoEditor')
 
 // ============================================================================
 // MARKETING -- content generation for this week's featured proteins.
@@ -387,11 +388,15 @@ router.get('/:recipe_id/story.png', requireAuth, requireRole('admin'), async (re
 // frequently doesn't match what's actually plated.
 async function getRenderablePhoto(fileId, recipeId) {
   const { buffer, mimeType } = await downloadImageBuffer(fileId)
-  const [vision, macros] = await Promise.all([
+  const [vision, macros, edited] = await Promise.all([
     getVisionDetails(buffer, mimeType),
     getRecipeMacros(recipeId),
+    editFoodPhoto(buffer, mimeType).catch((error) => {
+      console.error('Photo edit failed, falling back to the raw upload:', error.message)
+      return { buffer }
+    }),
   ])
-  return { name: vision.name, photoSource: { buffer }, protein_g: macros ? macros.protein_g : null }
+  return { name: vision.name, photoSource: { buffer: edited.buffer }, protein_g: macros ? macros.protein_g : null }
 }
 
 // GET /api/admin/marketing/photo/:file_id/carousel.png?recipe_id=123 --
