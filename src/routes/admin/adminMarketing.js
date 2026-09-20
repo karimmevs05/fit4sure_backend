@@ -89,6 +89,33 @@ hashtags: always include #Fit4Sure #TampaBay #HighProteinMeals, and rotate in 1-
 
 Respond with ONLY a JSON array of exactly 3 strings, no markdown fences, no commentary.`
 
+// These are real served plates (a protein plus whatever sides landed on it
+// that day), not single-dish recipe photos -- a recipe name picked to link
+// macros often doesn't describe what's actually plated. So the name shown
+// in the rendered image, and the caption's framing, come from looking at
+// the photo itself rather than trusting the linked recipe's name.
+async function getVisionDetails(buffer, mimeType) {
+  const genAI = getGeminiClient()
+  const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' })
+  const response = await model.generateContent([
+    { inlineData: { data: buffer.toString('base64'), mimeType } },
+    `Look at this photo of a real prepared meal from Fit4Sure, a high-protein meal prep company. Respond with ONLY a JSON object, no markdown fences: {"name": "...", "description": "..."}.
+"name" is a short, punchy dish name (2-5 words, Title Case, no quotes) describing exactly what's visibly on the plate -- the protein and how it looks prepared, plus a standout side if there's room. Write it the way a real meal-prep menu names dishes (e.g. "Garlic Herb Chicken", "Braised Beef Rice Bowl", "Sweet Potato Steak"). Only name what you can actually see -- don't guess a specific recipe or invent ingredients not visible.
+"description" is one sentence describing what's actually on the plate (protein, sides, any visible prep/garnish) for someone writing marketing copy about it.`,
+  ])
+  const text = response.response.text()
+  const jsonMatch = text.match(/```json\n?([\s\S]*?)\n?```/)
+  return JSON.parse(jsonMatch ? jsonMatch[1] : text)
+}
+
+async function getRecipeMacros(recipeId) {
+  if (!recipeId) return null
+  const recipeResult = await db.query('SELECT recipe_id, servings FROM recipes WHERE recipe_id = $1', [recipeId])
+  const recipe = recipeResult.rows[0]
+  if (!recipe) return null
+  return calculateRecipeMacros(recipeId, recipe.servings)
+}
+
 async function getCurrentWeekStart() {
   const result = await db.query(`SELECT (date_trunc('week', NOW() + interval '1 day') - interval '1 day')::date AS sunday`)
   return result.rows[0].sunday
@@ -264,26 +291,40 @@ router.get('/photo/:file_id/assign', requireAuth, requireRole('admin'), async (r
   }
 })
 
-// POST /api/admin/marketing/generate-captions { recipe_id }
+// POST /api/admin/marketing/generate-captions { file_id?, recipe_id? } --
+// at least one is required. file_id (a real uploaded plate photo) is the
+// primary path: Gemini looks at the actual photo rather than trusting a
+// linked recipe's name/ingredient list, which often doesn't match what's
+// really plated. recipe_id is optional and only adds real macro numbers
+// into the prompt when a recipe has been linked for that purpose.
 router.post('/generate-captions', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { recipe_id } = req.body
-    if (!recipe_id) return res.status(400).json({ error: 'recipe_id is required' })
+    const { file_id, recipe_id } = req.body
+    if (!file_id && !recipe_id) return res.status(400).json({ error: 'file_id or recipe_id is required' })
 
-    const recipeResult = await db.query('SELECT recipe_id, name, category, servings FROM recipes WHERE recipe_id = $1', [recipe_id])
-    if (!recipeResult.rows[0]) return res.status(404).json({ error: 'Recipe not found' })
-    const recipe = recipeResult.rows[0]
+    let dishName = null
+    let macrosLine = 'not available -- do not state specific numbers, speak generally about being high-protein'
+    const visionParts = []
 
-    const [macros, topIngredients] = await Promise.all([
-      calculateRecipeMacros(recipe_id, recipe.servings),
-      getTopIngredients(recipe_id),
-    ])
+    if (file_id) {
+      const { buffer, mimeType } = await downloadImageBuffer(file_id)
+      const vision = await getVisionDetails(buffer, mimeType)
+      dishName = vision.name
+      visionParts.push({ inlineData: { data: buffer.toString('base64'), mimeType } })
+    }
+
+    if (recipe_id) {
+      const macros = await getRecipeMacros(recipe_id)
+      if (macros) macrosLine = `${macros.calories} cal, ${macros.protein_g}g protein, ${macros.carbs_g}g carbs, ${macros.fat_g}g fat`
+    }
+
+    const prompt = file_id
+      ? `${CAPTION_SYSTEM_PROMPT}\n\nWrite about the actual plate in the attached photo${dishName ? ` (it's a ${dishName})` : ''}. Macros per serving: ${macrosLine}`
+      : `${CAPTION_SYSTEM_PROMPT}\n\nMacros per serving: ${macrosLine}`
 
     const genAI = getGeminiClient()
     const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' })
-    const response = await model.generateContent([
-      `${CAPTION_SYSTEM_PROMPT}\n\nRecipe: ${recipe.name}\nCategory: ${recipe.category}\nTop ingredients: ${topIngredients.join(', ') || 'not listed'}\nMacros per serving: ${macros.calories} cal, ${macros.protein_g}g protein, ${macros.carbs_g}g carbs, ${macros.fat_g}g fat`,
-    ])
+    const response = await model.generateContent([...visionParts, prompt])
 
     const text = response.response.text()
     let jsonStr = text
@@ -291,7 +332,7 @@ router.post('/generate-captions', requireAuth, requireRole('admin'), async (req,
     if (jsonMatch) jsonStr = jsonMatch[1]
     const captions = JSON.parse(jsonStr)
 
-    res.json({ success: true, data: { recipe_id, recipe_name: recipe.name, captions } })
+    res.json({ success: true, data: { recipe_id: recipe_id || null, dish_name: dishName, captions } })
   } catch (error) {
     console.error('Error generating captions:', error)
     res.status(500).json({ error: error.message || 'Failed to generate captions' })
@@ -338,27 +379,26 @@ router.get('/:recipe_id/story.png', requireAuth, requireRole('admin'), async (re
   }
 })
 
-// Builds the render payload from a real uploaded Drive photo + its matched
-// recipe's macros -- the primary path (see /uploaded-photos above).
+// Builds the render payload from a real uploaded Drive photo. recipe_id is
+// optional and, when given, only supplies real protein-gram macros for the
+// headline -- the dish name itself always comes from Gemini looking at the
+// actual photo (see getVisionDetails above), since these are real served
+// plates rather than single-recipe photos and the linked recipe's name
+// frequently doesn't match what's actually plated.
 async function getRenderablePhoto(fileId, recipeId) {
-  const recipeResult = await db.query('SELECT recipe_id, name, category, servings FROM recipes WHERE recipe_id = $1', [recipeId])
-  const recipe = recipeResult.rows[0]
-  if (!recipe) return null
-
-  const [macros, { buffer }] = await Promise.all([
-    calculateRecipeMacros(recipeId, recipe.servings),
-    downloadImageBuffer(fileId),
+  const { buffer, mimeType } = await downloadImageBuffer(fileId)
+  const [vision, macros] = await Promise.all([
+    getVisionDetails(buffer, mimeType),
+    getRecipeMacros(recipeId),
   ])
-  return { name: recipe.name, category: recipe.category, photoSource: { buffer }, calories: macros.calories, protein_g: macros.protein_g, carbs_g: macros.carbs_g, fat_g: macros.fat_g }
+  return { name: vision.name, photoSource: { buffer }, protein_g: macros ? macros.protein_g : null }
 }
 
-// GET /api/admin/marketing/photo/:file_id/carousel.png?recipe_id=123
+// GET /api/admin/marketing/photo/:file_id/carousel.png?recipe_id=123 --
+// recipe_id is optional (adds real protein macros to the headline if given).
 router.get('/photo/:file_id/carousel.png', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const recipeId = req.query.recipe_id
-    if (!recipeId) return res.status(400).json({ error: 'recipe_id query param is required' })
-    const protein = await getRenderablePhoto(req.params.file_id, recipeId)
-    if (!protein) return res.status(404).json({ error: 'Recipe not found' })
+    const protein = await getRenderablePhoto(req.params.file_id, req.query.recipe_id)
     const png = await renderCarouselCard(protein)
     res.set('Content-Type', 'image/png')
     res.send(png)
@@ -368,13 +408,10 @@ router.get('/photo/:file_id/carousel.png', requireAuth, requireRole('admin'), as
   }
 })
 
-// GET /api/admin/marketing/photo/:file_id/story.png?recipe_id=123
+// GET /api/admin/marketing/photo/:file_id/story.png?recipe_id=123 -- see note above.
 router.get('/photo/:file_id/story.png', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const recipeId = req.query.recipe_id
-    if (!recipeId) return res.status(400).json({ error: 'recipe_id query param is required' })
-    const protein = await getRenderablePhoto(req.params.file_id, recipeId)
-    if (!protein) return res.status(404).json({ error: 'Recipe not found' })
+    const protein = await getRenderablePhoto(req.params.file_id, req.query.recipe_id)
     const png = await renderStoryCard(protein)
     res.set('Content-Type', 'image/png')
     res.send(png)

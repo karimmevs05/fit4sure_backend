@@ -152,7 +152,7 @@ function buildTree({ width, height, photoDataUri, name, proteinG, seed, photoHei
                   children: name.toUpperCase(),
                 },
               },
-              {
+              proteinG != null && {
                 type: 'div',
                 props: {
                   style: {
@@ -172,7 +172,7 @@ function buildTree({ width, height, photoDataUri, name, proteinG, seed, photoHei
                   children: 'Ready in 2 minutes',
                 },
               },
-            ],
+            ].filter(Boolean),
           },
         },
         // Photo card -- tilted, rounded, oversized so it bleeds past the
@@ -261,7 +261,9 @@ async function renderCarouselCard(protein) {
   const width = 1080
   const height = 1350
   const tree = buildTree({
-    width, height, photoDataUri, name: protein.name, proteinG: Math.round(parseFloat(protein.protein_g)), seed: protein.name,
+    width, height, photoDataUri, name: protein.name,
+    proteinG: protein.protein_g != null ? Math.round(parseFloat(protein.protein_g)) : null,
+    seed: protein.name,
     // Smaller headline + earlier, shorter photo card than the Story format --
     // 4:5 has much less vertical room than 9:16, so the same font/spacing
     // ratios that work for Story push the photo into the tagline bar here.
@@ -276,7 +278,9 @@ async function renderStoryCard(protein) {
   const width = 1080
   const height = 1920
   const tree = buildTree({
-    width, height, photoDataUri, name: protein.name, proteinG: Math.round(parseFloat(protein.protein_g)), seed: protein.name,
+    width, height, photoDataUri, name: protein.name,
+    proteinG: protein.protein_g != null ? Math.round(parseFloat(protein.protein_g)) : null,
+    seed: protein.name,
     headlineScale: 0.108, subheadlineScale: 0.062,
     photoHeight: Math.round(height * 0.435), photoTop: Math.round(height * 0.345),
   })
