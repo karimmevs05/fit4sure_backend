@@ -35,17 +35,23 @@ async function getFonts() {
   ]
 }
 
-// Fetches a recipe photo (any real URL) and returns it as a data URI --
-// satori has no network access of its own, every image it renders has to
-// already be a data URI or inline SVG. Downscaled first (sharp) to roughly
-// the card's own hero-photo size -- CSS on the <img> node only controls
-// display size, not how many bytes satori has to embed/parse, so a
-// multi-MB source photo would otherwise bloat every render for no visible
-// gain at 1080px wide.
-async function imageToDataUri(url, maxWidth = 1400) {
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`Could not fetch image (status ${res.status})`)
-  const buffer = Buffer.from(await res.arrayBuffer())
+// Resolves a photo source -- either { url } (a plain recipe.image URL) or
+// { buffer } (real bytes already downloaded, e.g. from a matched Drive
+// photo -- see adminMarketing.js) -- to a data URI. satori has no network
+// access of its own, every image it renders has to already be a data URI
+// or inline SVG. Downscaled first (sharp) to roughly the card's own
+// hero-photo size -- CSS on the <img> node only controls display size, not
+// how many bytes satori has to embed/parse, so a multi-MB source photo
+// would otherwise bloat every render for no visible gain at 1080px wide.
+async function imageToDataUri(source, maxWidth = 1400) {
+  let buffer
+  if (source.buffer) {
+    buffer = source.buffer
+  } else {
+    const res = await fetch(source.url)
+    if (!res.ok) throw new Error(`Could not fetch image (status ${res.status})`)
+    buffer = Buffer.from(await res.arrayBuffer())
+  }
   const resized = await sharp(buffer)
     .resize({ width: maxWidth, withoutEnlargement: true })
     .jpeg({ quality: 88 })
@@ -225,10 +231,17 @@ async function renderPng(tree, width, height) {
   return resvg.render().asPng()
 }
 
+// protein.photoSource is { url } (falls back to the recipe's own
+// recipe.image) or { buffer } (a real photo already downloaded from Drive
+// -- see findDrivePhotoForRecipe in adminMarketing.js). Preferring a real
+// Drive photo over the recipe's reference image is the whole point --
+// content built from an actual product photo is what's expected to
+// perform, not a generic recipe-lookup image.
+
 // 1080x1350 (4:5) -- Instagram's tallest allowed feed/carousel ratio, gives
 // the most room to both the photo and the macro panel.
 async function renderCarouselCard(protein) {
-  const photoDataUri = await imageToDataUri(protein.image)
+  const photoDataUri = await imageToDataUri(protein.photoSource)
   const width = 1080
   const height = 1350
   const tree = buildTree({ width, height, photoHeight: 840, photoDataUri, ...protein })
@@ -237,7 +250,7 @@ async function renderCarouselCard(protein) {
 
 // 1080x1920 (9:16) -- full-screen Story ratio.
 async function renderStoryCard(protein) {
-  const photoDataUri = await imageToDataUri(protein.image)
+  const photoDataUri = await imageToDataUri(protein.photoSource)
   const width = 1080
   const height = 1920
   const tree = buildTree({ width, height, photoHeight: 1360, photoDataUri, cta: 'TAP TO ORDER', ...protein })

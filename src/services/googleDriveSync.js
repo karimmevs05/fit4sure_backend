@@ -142,6 +142,39 @@ async function downloadImageAsBase64(fileId) {
   }
 }
 
+// Download image from Google Drive as a raw Buffer (not base64) -- for
+// callers like the Marketing content renderer that hand bytes straight to
+// an image-processing library instead of embedding a base64 string. Also
+// returns the file's real mimeType so callers serving it back over HTTP
+// (e.g. a thumbnail proxy route) can set the right Content-Type instead of
+// guessing.
+async function downloadImageBuffer(fileId) {
+  if (!drive) initializeDrive();
+  const [metaResponse, mediaResponse] = await Promise.all([
+    drive.files.get({ fileId, fields: 'mimeType' }),
+    drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' }),
+  ]);
+  return { buffer: Buffer.from(mediaResponse.data), mimeType: metaResponse.data.mimeType || 'image/jpeg' };
+}
+
+// Generic image listing for any Drive folder, not just the receipts inbox
+// -- used by Marketing to find real product photos uploaded for a given
+// featured recipe. Unlike getUnprocessedReceipts, this doesn't filter to
+// image/PDF only receipts-style, just plain images, and returns
+// createdTime so callers can pick the most recent match when a recipe has
+// more than one candidate photo.
+async function listImagesInFolder(folderId) {
+  if (!drive) initializeDrive();
+  const response = await drive.files.list({
+    q: `'${folderId}' in parents and trashed=false and mimeType contains 'image/'`,
+    spaces: 'drive',
+    fields: 'files(id, name, mimeType, createdTime)',
+    pageSize: 200,
+    orderBy: 'createdTime desc',
+  });
+  return response.data.files || [];
+}
+
 /**
  * A stable link back to the receipt image in Drive's own viewer -- captured
  * at parse time and stored, so the expense summary can link straight to the
@@ -508,6 +541,8 @@ module.exports = {
   getOrCreateReceiptsFolder,
   getUnprocessedReceipts,
   downloadImageAsBase64,
+  downloadImageBuffer,
+  listImagesInFolder,
   archiveReceipt,
   parseReceiptsFromDrive,
   confirmAndSaveReceipts,
