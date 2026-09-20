@@ -4,6 +4,7 @@ const db = require('../../config/db')
 const { requireAuth, requireRole } = require('../../middleware/auth')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
 const { calculateRecipeMacros } = require('./adminRecipes')
+const { renderCarouselCard, renderStoryCard } = require('../../services/contentImageRenderer')
 
 // ============================================================================
 // MARKETING -- content generation for this week's featured proteins.
@@ -19,10 +20,10 @@ const { calculateRecipeMacros } = require('./adminRecipes')
 // import and receipt scanning (GOOGLE_GEMINI_API_KEY) -- no new API/billing
 // setup needed.
 //
-// Image generation (carousel/story cards) is NOT built yet -- deliberately
-// deferred until there's a real Canva Connect API app + Brand Template IDs
-// to build against, rather than faking it with a throwaway renderer. See
-// the "Image export" card on the Marketing page.
+// Carousel/story images are rendered server-side (satori + resvg, see
+// services/contentImageRenderer.js) rather than through Canva -- no Connect
+// API app or paid plan required, and it's built specifically to match
+// Fit4Sure's own brand colors/category tags rather than a generic template.
 // ============================================================================
 
 const PROTEIN_CATEGORIES = ['beef', 'chicken', 'turkey', 'pork']
@@ -136,6 +137,44 @@ router.post('/generate-captions', requireAuth, requireRole('admin'), async (req,
   } catch (error) {
     console.error('Error generating captions:', error)
     res.status(500).json({ error: error.message || 'Failed to generate captions' })
+  }
+})
+
+async function getRenderableProtein(recipeId) {
+  const recipeResult = await db.query('SELECT recipe_id, name, category, image, servings FROM recipes WHERE recipe_id = $1', [recipeId])
+  const recipe = recipeResult.rows[0]
+  if (!recipe) return null
+  if (!recipe.image) throw new Error('This recipe has no photo set yet')
+
+  const macros = await calculateRecipeMacros(recipeId, recipe.servings)
+  return { name: recipe.name, category: recipe.category, image: recipe.image, calories: macros.calories, protein_g: macros.protein_g, carbs_g: macros.carbs_g, fat_g: macros.fat_g }
+}
+
+// GET /api/admin/marketing/:recipe_id/carousel.png
+router.get('/:recipe_id/carousel.png', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const protein = await getRenderableProtein(req.params.recipe_id)
+    if (!protein) return res.status(404).json({ error: 'Recipe not found' })
+    const png = await renderCarouselCard(protein)
+    res.set('Content-Type', 'image/png')
+    res.send(png)
+  } catch (error) {
+    console.error('Error rendering carousel card:', error)
+    res.status(500).json({ error: error.message || 'Failed to render image' })
+  }
+})
+
+// GET /api/admin/marketing/:recipe_id/story.png
+router.get('/:recipe_id/story.png', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const protein = await getRenderableProtein(req.params.recipe_id)
+    if (!protein) return res.status(404).json({ error: 'Recipe not found' })
+    const png = await renderStoryCard(protein)
+    res.set('Content-Type', 'image/png')
+    res.send(png)
+  } catch (error) {
+    console.error('Error rendering story card:', error)
+    res.status(500).json({ error: error.message || 'Failed to render image' })
   }
 })
 

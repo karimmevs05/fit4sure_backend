@@ -14,6 +14,7 @@
     "@anthropic-ai/sdk": "^0.112.3",
     "@google-cloud/vision": "^5.3.7",
     "@google/generative-ai": "^0.24.1",
+    "@resvg/resvg-js": "^2.6.2",
     "apple-signin-auth": "^2.0.0",
     "axios": "^1.18.1",
     "bcryptjs": "^3.0.3",
@@ -27,6 +28,8 @@
     "node-cron": "^4.6.0",
     "node-fetch": "^2.7.0",
     "pg": "^8.22.0",
+    "satori": "^0.33.4",
+    "sharp": "^0.35.4",
     "stripe": "^22.3.0"
   },
   "devDependencies": {
