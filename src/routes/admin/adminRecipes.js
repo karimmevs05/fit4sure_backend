@@ -394,3 +394,4 @@ router.delete('/:recipe_id', requireAuth, requireRole('admin'), async (req, res)
 })
 
 module.exports = router
+module.exports.calculateRecipeMacros = calculateRecipeMacros
