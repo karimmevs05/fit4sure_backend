@@ -96,6 +96,27 @@ function pick(list, seed) {
   return list[hashString(seed) % list.length]
 }
 
+// A slim double-chevron, drawn as two thin stroked V shapes (not a bold
+// glyph) so it reads as an icon rather than punctuation -- matches the
+// real template's light "swipe" indicator instead of a heavy `»`.
+function chevron(barHeight, direction) {
+  const s = Math.round(barHeight * 0.46)
+  const paths = direction === 'right'
+    ? ['M2 2 L10 9 L2 16', 'M8 2 L16 9 L8 16']
+    : ['M14 2 L6 9 L14 16', 'M8 2 L0 9 L8 16']
+  return {
+    type: 'svg',
+    props: {
+      width: s, height: s, viewBox: '0 0 16 18',
+      style: { display: 'flex' },
+      children: paths.map((d, i) => ({
+        type: 'path',
+        props: { d, stroke: TEXT_CREAM, strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', fill: 'none', opacity: i === 0 ? 1 : 0.55 },
+      })),
+    },
+  }
+}
+
 function buildTree({ width, height, photoDataUri, name, proteinG, seed, photoHeight, photoTop, headlineScale, subheadlineScale }) {
   const bg = pick(BG_PALETTE, seed)
   const tagline = pick(TAGLINES, seed + '-tag')
@@ -104,11 +125,12 @@ function buildTree({ width, height, photoDataUri, name, proteinG, seed, photoHei
   // (roughly +/-7 to +/-16deg) rather than using one fixed angle.
   const tilt = (hashString(seed + '-tilt') % 2 === 0 ? 1 : -1) * (7 + (hashString(seed + '-tilt2') % 8))
 
-  // Sized generously enough to hold a two-line wrap (long taglines like
-  // "FOOD THAT KEEPS UP WITH YOU" don't fit one line at this width) without
-  // the text spilling past the pill's rounded edge.
-  const barHeight = Math.round(height * 0.15)
-  const barY = height - barHeight - Math.round(height * 0.018)
+  // A thin outlined pill, not a thick block -- text size is driven off
+  // width (not barHeight) so the bar itself can stay slim like the real
+  // template's while still comfortably fitting a one-line tagline.
+  const barHeight = Math.round(height * 0.088)
+  const barY = height - barHeight - Math.round(height * 0.022)
+  const barFontSize = Math.round(width * 0.031)
 
   return {
     type: 'div',
@@ -148,6 +170,7 @@ function buildTree({ width, height, photoDataUri, name, proteinG, seed, photoHei
                   style: {
                     display: 'flex', fontFamily: 'Baloo 2', fontWeight: 800, fontSize: Math.round(width * headlineScale),
                     color: TEXT_CREAM, lineHeight: 1.16, textAlign: 'center', letterSpacing: 0.5,
+                    textShadow: '0 8px 20px rgba(0,0,0,0.3)',
                   },
                   children: name.toUpperCase(),
                 },
@@ -158,6 +181,7 @@ function buildTree({ width, height, photoDataUri, name, proteinG, seed, photoHei
                   style: {
                     display: 'flex', fontFamily: 'Baloo 2', fontWeight: 800, fontSize: Math.round(width * headlineScale),
                     color: TEXT_CREAM, lineHeight: 1.16, textAlign: 'center', marginTop: 4,
+                    textShadow: '0 8px 20px rgba(0,0,0,0.3)',
                   },
                   children: `${proteinG}G PROTEIN`,
                 },
@@ -167,7 +191,7 @@ function buildTree({ width, height, photoDataUri, name, proteinG, seed, photoHei
                 props: {
                   style: {
                     display: 'flex', fontFamily: 'Caveat', fontWeight: 700, fontSize: Math.round(width * subheadlineScale),
-                    color: TEXT_CREAM, marginTop: Math.round(height * 0.012),
+                    color: TEXT_CREAM, marginTop: Math.round(height * 0.012), textShadow: '0 4px 10px rgba(0,0,0,0.25)',
                   },
                   children: 'Ready in 2 minutes',
                 },
@@ -182,51 +206,41 @@ function buildTree({ width, height, photoDataUri, name, proteinG, seed, photoHei
           type: 'div',
           props: {
             style: {
-              display: 'flex', position: 'absolute', top: photoTop, left: width * 0.5 - (width * 0.98) / 2,
-              width: width * 0.98, height: photoHeight, borderRadius: 28,
+              display: 'flex', position: 'absolute', top: photoTop, left: width * 0.5 - (width * 1.02) / 2,
+              width: width * 1.02, height: photoHeight, borderRadius: 28,
               transform: `rotate(${tilt}deg)`, overflow: 'hidden', boxShadow: '0 30px 60px rgba(0,0,0,0.35)',
             },
             children: {
               type: 'img',
-              props: { src: photoDataUri, width: width * 0.98, height: photoHeight, style: { objectFit: 'cover' } },
+              props: { src: photoDataUri, width: width * 1.02, height: photoHeight, style: { objectFit: 'cover' } },
             },
           },
         },
-        // Bottom tagline bar
+        // Bottom tagline bar -- a slim outlined pill (not a thick block),
+        // with real thin chevron shapes rather than bold text characters.
         {
           type: 'div',
           props: {
             style: {
               display: 'flex', position: 'absolute', left: Math.round(width * 0.03), top: barY,
               width: width - Math.round(width * 0.06), height: barHeight, borderRadius: barHeight / 2,
-              backgroundColor: 'rgba(20,14,8,0.55)', alignItems: 'center', justifyContent: 'center',
-              padding: `0 ${Math.round(width * 0.045)}px`,
+              backgroundColor: 'rgba(20,14,8,0.5)', border: '2px solid rgba(255,231,194,0.35)',
+              alignItems: 'center', justifyContent: 'center', padding: `0 ${Math.round(width * 0.05)}px`,
             },
             children: [
-              {
-                type: 'div',
-                props: {
-                  style: { display: 'flex', color: TEXT_CREAM, fontFamily: 'Baloo 2', fontWeight: 800, fontSize: Math.round(barHeight * 0.28), marginRight: 10 },
-                  children: '»',
-                },
-              },
+              chevron(barHeight, 'right'),
               {
                 type: 'div',
                 props: {
                   style: {
-                    display: 'flex', color: TEXT_CREAM, fontFamily: 'Baloo 2', fontWeight: 600, lineHeight: 1.15,
-                    fontSize: Math.round(barHeight * 0.18), letterSpacing: 0.5, textAlign: 'center', flex: 1, justifyContent: 'center',
+                    display: 'flex', color: TEXT_CREAM, fontFamily: 'Baloo 2', fontWeight: 500, lineHeight: 1.1,
+                    fontSize: barFontSize, letterSpacing: 0.5, textAlign: 'center', flex: 1, justifyContent: 'center',
+                    marginLeft: 16, marginRight: 16,
                   },
                   children: tagline,
                 },
               },
-              {
-                type: 'div',
-                props: {
-                  style: { display: 'flex', color: TEXT_CREAM, fontFamily: 'Baloo 2', fontWeight: 800, fontSize: Math.round(barHeight * 0.28), marginLeft: 10 },
-                  children: '«',
-                },
-              },
+              chevron(barHeight, 'left'),
             ],
           },
         },
@@ -268,7 +282,7 @@ async function renderCarouselCard(protein) {
     // 4:5 has much less vertical room than 9:16, so the same font/spacing
     // ratios that work for Story push the photo into the tagline bar here.
     headlineScale: 0.082, subheadlineScale: 0.05,
-    photoHeight: Math.round(height * 0.46), photoTop: Math.round(height * 0.42),
+    photoHeight: Math.round(height * 0.53), photoTop: Math.round(height * 0.37),
   })
   return renderPng(tree, width, height)
 }
@@ -282,7 +296,7 @@ async function renderStoryCard(protein) {
     proteinG: protein.protein_g != null ? Math.round(parseFloat(protein.protein_g)) : null,
     seed: protein.name,
     headlineScale: 0.108, subheadlineScale: 0.062,
-    photoHeight: Math.round(height * 0.435), photoTop: Math.round(height * 0.345),
+    photoHeight: Math.round(height * 0.5), photoTop: Math.round(height * 0.3),
   })
   return renderPng(tree, width, height)
 }
