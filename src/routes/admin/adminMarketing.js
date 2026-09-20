@@ -362,52 +362,14 @@ router.post('/generate-captions', requireAuth, requireRole('admin'), async (req,
   }
 })
 
-async function getRenderableProtein(recipeId) {
-  const recipeResult = await db.query('SELECT recipe_id, name, category, image, servings FROM recipes WHERE recipe_id = $1', [recipeId])
-  const recipe = recipeResult.rows[0]
-  if (!recipe) return null
-  if (!recipe.image) throw new Error('This recipe has no photo set yet')
-
-  const macros = await calculateRecipeMacros(recipeId, recipe.servings)
-  return { name: recipe.name, category: recipe.category, photoSource: { url: recipe.image }, calories: macros.calories, protein_g: macros.protein_g, carbs_g: macros.carbs_g, fat_g: macros.fat_g }
-}
-
-// GET /api/admin/marketing/:recipe_id/carousel.png -- fallback path, builds
-// from the recipe database's own reference photo. Prefer the /photo/...
-// routes below (a real uploaded product photo) whenever one exists.
-router.get('/:recipe_id/carousel.png', requireAuth, requireRole('admin'), async (req, res) => {
-  try {
-    const protein = await getRenderableProtein(req.params.recipe_id)
-    if (!protein) return res.status(404).json({ error: 'Recipe not found' })
-    const png = await renderCarouselCard(protein)
-    res.set('Content-Type', 'image/png')
-    res.send(png)
-  } catch (error) {
-    console.error('Error rendering carousel card:', error)
-    res.status(500).json({ error: error.message || 'Failed to render image' })
-  }
-})
-
-// GET /api/admin/marketing/:recipe_id/story.png -- see note above.
-router.get('/:recipe_id/story.png', requireAuth, requireRole('admin'), async (req, res) => {
-  try {
-    const protein = await getRenderableProtein(req.params.recipe_id)
-    if (!protein) return res.status(404).json({ error: 'Recipe not found' })
-    const png = await renderStoryCard(protein)
-    res.set('Content-Type', 'image/png')
-    res.send(png)
-  } catch (error) {
-    console.error('Error rendering story card:', error)
-    res.status(500).json({ error: error.message || 'Failed to render image' })
-  }
-})
-
 // Builds the render payload from a real uploaded Drive photo. recipe_id is
 // optional and, when given, only supplies real protein-gram macros for the
 // headline -- the dish name itself always comes from Gemini looking at the
 // actual photo (see getVisionDetails above), since these are real served
 // plates rather than single-recipe photos and the linked recipe's name
-// frequently doesn't match what's actually plated.
+// frequently doesn't match what's actually plated. The subject-aware crop
+// and title autofit happen inside the renderer itself (contentImageRenderer.js)
+// since the target box is a layout concern it already owns.
 async function getRenderablePhoto(fileId, recipeId) {
   const { buffer, mimeType } = await downloadImageBuffer(fileId)
   const [vision, macros, edited] = await Promise.all([
@@ -415,10 +377,31 @@ async function getRenderablePhoto(fileId, recipeId) {
     getRecipeMacros(recipeId),
     editFoodPhoto(buffer, mimeType).catch((error) => {
       console.error('Photo edit failed, falling back to the raw upload:', error.message)
-      return { buffer }
+      return { buffer, mimeType }
     }),
   ])
-  return { name: vision.name, photoSource: { buffer: edited.buffer }, protein_g: macros ? macros.protein_g : null }
+  return {
+    name: vision.name,
+    photoBuffer: edited.buffer,
+    photoMimeType: edited.mimeType || 'image/png',
+    protein_g: macros ? macros.protein_g : null,
+  }
+}
+
+// Pre-publish validation (spec item 5): a card only gets served as a PNG
+// when the title actually fit within its box AND the branded tag is
+// visible in the source photo. Otherwise the card is flagged for manual
+// review (422 + reason) instead of auto-serving a broken or incomplete
+// result.
+function respondWithCard(res, result) {
+  if (!result.fits || !result.tagVisible) {
+    const reasons = []
+    if (!result.fits) reasons.push('dish name did not fit within 2 lines at the minimum font size')
+    if (!result.tagVisible) reasons.push('branded tag was not visible in the source photo')
+    return res.status(422).json({ success: false, needs_review: true, reason: reasons.join('; ') })
+  }
+  res.set('Content-Type', 'image/png')
+  res.send(result.png)
 }
 
 // GET /api/admin/marketing/photo/:file_id/carousel.png?recipe_id=123 --
@@ -426,9 +409,7 @@ async function getRenderablePhoto(fileId, recipeId) {
 router.get('/photo/:file_id/carousel.png', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const protein = await getRenderablePhoto(req.params.file_id, req.query.recipe_id)
-    const png = await renderCarouselCard(protein)
-    res.set('Content-Type', 'image/png')
-    res.send(png)
+    respondWithCard(res, await renderCarouselCard(protein))
   } catch (error) {
     console.error('Error rendering carousel card from photo:', error)
     res.status(500).json({ error: error.message || 'Failed to render image' })
@@ -439,9 +420,7 @@ router.get('/photo/:file_id/carousel.png', requireAuth, requireRole('admin'), as
 router.get('/photo/:file_id/story.png', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const protein = await getRenderablePhoto(req.params.file_id, req.query.recipe_id)
-    const png = await renderStoryCard(protein)
-    res.set('Content-Type', 'image/png')
-    res.send(png)
+    respondWithCard(res, await renderStoryCard(protein))
   } catch (error) {
     console.error('Error rendering story card from photo:', error)
     res.status(500).json({ error: error.message || 'Failed to render image' })
