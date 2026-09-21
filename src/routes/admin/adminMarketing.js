@@ -259,6 +259,118 @@ router.get('/uploaded-photos', requireAuth, requireRole('admin'), async (req, re
   }
 })
 
+// ============================================================================
+// PROJECTS -- a named grouping of content pieces ("This Week's Breakfast
+// Push", etc). One tab per project, each holding multiple content pieces
+// (an uploaded photo + optional recipe link), instead of one flat grid of
+// every photo in the Drive folder.
+// ============================================================================
+
+// GET /api/admin/marketing/projects
+router.get('/projects', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT p.id, p.name, p.created_at, COUNT(i.id)::int AS item_count
+      FROM marketing_projects p
+      LEFT JOIN marketing_project_items i ON i.project_id = p.id
+      GROUP BY p.id
+      ORDER BY p.created_at DESC
+    `)
+    res.json({ success: true, data: result.rows })
+  } catch (error) {
+    console.error('Error listing marketing projects:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// POST /api/admin/marketing/projects { name }
+router.post('/projects', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { name } = req.body
+    if (!name || !name.trim()) return res.status(400).json({ error: 'name is required' })
+    const result = await db.query(
+      `INSERT INTO marketing_projects (name, created_by_user_id) VALUES ($1, $2) RETURNING id, name, created_at`,
+      [name.trim(), req.userId]
+    )
+    res.json({ success: true, data: { ...result.rows[0], item_count: 0 } })
+  } catch (error) {
+    console.error('Error creating marketing project:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// DELETE /api/admin/marketing/projects/:id
+router.delete('/projects/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    await db.query('DELETE FROM marketing_projects WHERE id = $1', [req.params.id])
+    res.json({ success: true })
+  } catch (error) {
+    console.error('Error deleting marketing project:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// GET /api/admin/marketing/projects/:id/items -- each item is one uploaded
+// Drive photo (optionally recipe-linked for macros), same shape as
+// /uploaded-photos entries so the frontend can reuse the same photo card.
+router.get('/projects/:id/items', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const itemsResult = await db.query(
+      `SELECT id, drive_file_id, recipe_id, added_at FROM marketing_project_items WHERE project_id = $1 ORDER BY added_at`,
+      [req.params.id]
+    )
+    const items = await Promise.all(
+      itemsResult.rows.map(async (item) => {
+        let recipeName = null
+        if (item.recipe_id) {
+          const r = await db.query('SELECT name FROM recipes WHERE recipe_id = $1', [item.recipe_id])
+          recipeName = r.rows[0]?.name || null
+        }
+        return {
+          item_id: item.id,
+          file_id: item.drive_file_id,
+          recipe_id: item.recipe_id,
+          recipe_name: recipeName,
+        }
+      })
+    )
+    res.json({ success: true, data: items })
+  } catch (error) {
+    console.error('Error listing project items:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// POST /api/admin/marketing/projects/:id/items { drive_file_id, recipe_id? }
+router.post('/projects/:id/items', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { drive_file_id, recipe_id } = req.body
+    if (!drive_file_id) return res.status(400).json({ error: 'drive_file_id is required' })
+    const result = await db.query(
+      `INSERT INTO marketing_project_items (project_id, drive_file_id, recipe_id)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (project_id, drive_file_id) DO UPDATE SET recipe_id = EXCLUDED.recipe_id
+       RETURNING id`,
+      [req.params.id, drive_file_id, recipe_id || null]
+    )
+    res.json({ success: true, data: { item_id: result.rows[0].id } })
+  } catch (error) {
+    console.error('Error adding project item:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// DELETE /api/admin/marketing/projects/:id/items/:itemId
+router.delete('/projects/:id/items/:itemId', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    await db.query('DELETE FROM marketing_project_items WHERE id = $1 AND project_id = $2', [req.params.itemId, req.params.id])
+    res.json({ success: true })
+  } catch (error) {
+    console.error('Error removing project item:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
 // GET /api/admin/marketing/photo/:file_id/thumbnail.jpg -- lets the
 // frontend show what was actually uploaded (an <img> tag can't carry the
 // Authorization header this route needs, so the frontend fetches it as an
