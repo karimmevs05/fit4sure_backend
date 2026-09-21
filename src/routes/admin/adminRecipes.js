@@ -5,22 +5,6 @@ const { getReceiptFallbackPriceCents } = require('../../utils/recipeCost')
 
 const router = express.Router()
 
-// Unit conversion helper - convert any unit to grams
-function convertToGrams(quantity, unit) {
-  const conversions = {
-    'g': 1,
-    'kg': 1000,
-    'oz': 28.3495,
-    'lb': 453.592,
-    'cup': 240,
-    'tbsp': 15,
-    'tsp': 5,
-    'ml': 1,
-    'l': 1000,
-  }
-  return (quantity || 0) * (conversions[unit?.toLowerCase()] || 1)
-}
-
 // Calculate cost in cents from inventory.unit_price_cents (price per POUND, in cents)
 // Matches the formula already used in adminPrep.js so cost figures agree app-wide.
 function calculateIngredientCost(unitPriceCents, quantityG) {

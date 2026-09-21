@@ -61,8 +61,15 @@ const UNIT_TO_GRAMS = {
   lb: 453.592,
   ml: 1,
   l: 1000,
-  each: 100, // countable items (e.g. "2 eggs") with no weight given -- rough placeholder, always flagged low-confidence
 }
+
+// Fallback only for "each" when the model somehow omits grams_per_unit --
+// should be rare now that the prompt requires a per-ingredient estimate,
+// but a single flat number here was the actual bug: right for something
+// lemon-sized, absurd for a bay leaf (real ~0.2g) or a garlic clove (real
+// ~5g). Real data showed exactly this -- "Bay Leaf: 100g", "Fresh Garlic:
+// 100g" -- a ~500x and ~20x overestimate respectively.
+const EACH_FALLBACK_GRAMS = 100
 
 // Water-density volume conversion, for liquids/pourables (milk, oil, honey,
 // broth, sauce).
@@ -74,10 +81,18 @@ const WET_VOLUME_TO_GRAMS = { cup: 240, tbsp: 15, tsp: 5 }
 // instead of pour.
 const DRY_VOLUME_TO_GRAMS = { cup: 120, tbsp: 7.5, tsp: 2.5 }
 
-function toGrams(quantity, unit, isLiquid = true) {
+function toGrams(quantity, unit, isLiquid, gramsPerUnit) {
   const q = Number(quantity) || 0
   const normalizedUnit = (unit || 'g').toLowerCase()
-  const volumeTable = isLiquid ? WET_VOLUME_TO_GRAMS : DRY_VOLUME_TO_GRAMS
+  if (normalizedUnit === 'each') {
+    return Math.round(q * (Number(gramsPerUnit) || EACH_FALLBACK_GRAMS))
+  }
+  // isLiquid defaults to the lighter dry table when the model's answer is
+  // missing/ambiguous -- only an explicit true should reach for the
+  // heavier wet-volume numbers, since defaulting toward the larger value
+  // silently doubled every dry cup/tbsp/tsp ingredient whose is_liquid
+  // field came back anything other than exactly `false`.
+  const volumeTable = isLiquid === true ? WET_VOLUME_TO_GRAMS : DRY_VOLUME_TO_GRAMS
   const factor = UNIT_TO_GRAMS[normalizedUnit] ?? volumeTable[normalizedUnit] ?? 1
   return Math.round(q * factor)
 }
@@ -107,7 +122,7 @@ Schema:
         { "title": string (short, 2-5 words, e.g. "Brown the turkey" -- can be empty string if the source has no natural step titles), "description": string (what to do, in your own words -- do not copy the source text verbatim), "time_estimate_minutes": number or null (only set this if the source gives or clearly implies a duration for this specific step, e.g. "simmer 20 minutes" -- otherwise null, do not guess), "step_type": one of "prep","cook" (prep = anything before real heat is applied to the food: measuring, seasoning, marinating, chopping, mixing, resting, chilling, staging; cook = the step actually applies heat or is a direct continuation of an already-cooking process: grilling, baking, sautéing, simmering, roasting, basting, flipping, checking doneness. A step with no heat verb but that only makes sense once cooking has started -- e.g. "flip and cook 3 more minutes", "let rest 5 minutes off the heat" -- is still "cook") }
       ],
       "ingredients": [
-        { "raw_text": string (the original ingredient line), "name": string (just the ingredient, no quantity/notes), "quantity": number, "unit": one of "g","kg","oz","lb","cup","tbsp","tsp","ml","l","each", "is_liquid": boolean (only matters for cup/tbsp/tsp, where the same volume weighs very differently poured vs scooped -- true for something poured/liquid at room temp: milk, oil, honey, broth, sauce, water, juice, melted butter; false for something scooped/dry: flour, sugar, rice, oats, spices, shredded cheese, chopped vegetables. For g/kg/oz/lb/ml/l/each this doesn't change the conversion, but still set it accurately), "low_confidence": boolean (true if the quantity or unit was ambiguous in the source and you had to guess) }
+        { "raw_text": string (the original ingredient line), "name": string (just the ingredient, no quantity/notes), "quantity": number, "unit": one of "g","kg","oz","lb","cup","tbsp","tsp","ml","l","each", "is_liquid": boolean (only matters for cup/tbsp/tsp, where the same volume weighs very differently poured vs scooped -- true for something poured/liquid at room temp: milk, oil, honey, broth, sauce, water, juice, melted butter; false for something scooped/dry: flour, sugar, rice, oats, spices, shredded cheese, chopped vegetables. For g/kg/oz/lb/ml/l/each this doesn't change the conversion, but still set it accurately), "grams_per_unit": number or null (REQUIRED whenever unit is "each" -- your own best real-world estimate of how much ONE unit of THIS SPECIFIC ingredient weighs in grams. Think about the actual thing: a garlic clove is about 5g, a bay leaf is about 0.2g, a lemon is about 100g, a medium onion is about 150g, a large egg is about 50g. Never reuse a generic number across different ingredients -- estimate each one on its own. null for every other unit), "low_confidence": boolean (true if the quantity or unit was ambiguous in the source and you had to guess) }
       ]
     }
   ]
@@ -322,8 +337,8 @@ async function matchIngredientsToInventory(extractedIngredients) {
     return {
       raw_text: ing.raw_text,
       name: ing.name,
-      quantity_g: toGrams(ing.quantity, ing.unit, ing.is_liquid !== false),
-      is_liquid: ing.is_liquid !== false,
+      quantity_g: toGrams(ing.quantity, ing.unit, ing.is_liquid === true, ing.grams_per_unit),
+      is_liquid: ing.is_liquid === true,
       low_confidence: !!ing.low_confidence,
       match:
         confidence === 'none'
