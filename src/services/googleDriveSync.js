@@ -157,6 +157,30 @@ async function downloadImageBuffer(fileId) {
   return { buffer: Buffer.from(mediaResponse.data), mimeType: metaResponse.data.mimeType || 'image/jpeg' };
 }
 
+// Uploads a real file (e.g. a photo picked from the user's device on the
+// Marketing page) straight into a Drive folder via the service account --
+// lets "Create piece" accept a direct upload, not just photos someone
+// already dropped in the synced folder by hand.
+async function uploadImageToFolder(buffer, mimeType, filename, folderId) {
+  if (!drive) initializeDrive()
+  const { Readable } = require('stream')
+  const response = await drive.files.create({
+    resource: { name: filename, parents: [folderId] },
+    media: { mimeType, body: Readable.from(buffer) },
+    fields: 'id, name, mimeType, createdTime',
+  })
+  return response.data
+}
+
+// Resolves a Drive file's metadata by ID -- used to validate/label a file
+// pasted in as a raw Drive share link, which may live anywhere the service
+// account has been shared access to, not just the synced Marketing folder.
+async function getFileMetadata(fileId) {
+  if (!drive) initializeDrive()
+  const response = await drive.files.get({ fileId, fields: 'id, name, mimeType, createdTime' })
+  return response.data
+}
+
 // Generic image listing for any Drive folder, not just the receipts inbox
 // -- used by Marketing to find real product photos uploaded for a given
 // featured recipe. Unlike getUnprocessedReceipts, this doesn't filter to
@@ -543,6 +567,8 @@ module.exports = {
   downloadImageAsBase64,
   downloadImageBuffer,
   listImagesInFolder,
+  uploadImageToFolder,
+  getFileMetadata,
   archiveReceipt,
   parseReceiptsFromDrive,
   confirmAndSaveReceipts,

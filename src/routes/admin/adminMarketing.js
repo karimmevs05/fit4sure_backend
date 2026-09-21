@@ -5,7 +5,7 @@ const { requireAuth, requireRole } = require('../../middleware/auth')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
 const { calculateRecipeMacros } = require('./adminRecipes')
 const { renderCarouselCard, renderStoryCard } = require('../../services/contentImageRenderer')
-const { listImagesInFolder, downloadImageBuffer } = require('../../services/googleDriveSync')
+const { listImagesInFolder, downloadImageBuffer, uploadImageToFolder, getFileMetadata } = require('../../services/googleDriveSync')
 const { editFoodPhoto } = require('../../services/photoEditor')
 
 // ============================================================================
@@ -256,6 +256,61 @@ router.get('/uploaded-photos', requireAuth, requireRole('admin'), async (req, re
   } catch (error) {
     console.error('Error listing uploaded photos:', error)
     res.status(500).json({ error: error.message })
+  }
+})
+
+// POST /api/admin/marketing/upload-photo { imageBase64, mimeType, filename? }
+// -- "Create piece" -> "Upload a photo": accepts a photo straight from the
+// user's device (same base64-in-JSON pattern as receipt scanning) and
+// writes it into the synced Marketing Drive folder, returning a real
+// file_id the frontend can immediately add as a project item.
+router.post('/upload-photo', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    if (!MARKETING_PHOTOS_FOLDER_ID) return res.status(400).json({ error: 'No Drive folder configured' })
+    const { imageBase64, mimeType, filename } = req.body
+    if (!imageBase64) return res.status(400).json({ error: 'imageBase64 is required' })
+
+    const cleanBase64 = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64
+    const buffer = Buffer.from(cleanBase64, 'base64')
+    const name = filename || `upload-${Date.now()}.jpg`
+
+    const file = await uploadImageToFolder(buffer, mimeType || 'image/jpeg', name, MARKETING_PHOTOS_FOLDER_ID)
+    res.json({ success: true, data: { file_id: file.id, filename: file.name } })
+  } catch (error) {
+    console.error('Error uploading photo:', error)
+    res.status(500).json({ error: error.message || 'Failed to upload photo' })
+  }
+})
+
+// Pulls a Drive file ID out of any of the common share-link shapes, or
+// accepts a bare file ID pasted directly.
+function extractDriveFileId(input) {
+  const trimmed = (input || '').trim()
+  const fileMatch = trimmed.match(/\/d\/([a-zA-Z0-9_-]{10,})/)
+  if (fileMatch) return fileMatch[1]
+  const idParamMatch = trimmed.match(/[?&]id=([a-zA-Z0-9_-]{10,})/)
+  if (idParamMatch) return idParamMatch[1]
+  if (/^[a-zA-Z0-9_-]{10,}$/.test(trimmed)) return trimmed
+  return null
+}
+
+// POST /api/admin/marketing/resolve-drive-link { url } -- "Create piece" ->
+// "Link from Drive": accepts a pasted Google Drive share link (or a bare
+// file ID) for a photo that lives anywhere the service account has been
+// shared access to -- not limited to the one synced Marketing folder.
+router.post('/resolve-drive-link', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const fileId = extractDriveFileId(req.body.url)
+    if (!fileId) return res.status(400).json({ error: "Couldn't find a Drive file ID in that link" })
+
+    const meta = await getFileMetadata(fileId)
+    if (!meta.mimeType || !meta.mimeType.startsWith('image/')) {
+      return res.status(400).json({ error: 'That Drive file is not an image' })
+    }
+    res.json({ success: true, data: { file_id: meta.id, filename: meta.name } })
+  } catch (error) {
+    console.error('Error resolving Drive link:', error)
+    res.status(400).json({ error: "Couldn't access that Drive file -- make sure it's shared with fit4sure-drive-access@fit4sure.iam.gserviceaccount.com" })
   }
 })
 
