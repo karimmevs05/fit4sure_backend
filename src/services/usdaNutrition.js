@@ -27,26 +27,68 @@ const CANONICAL_DATA_TYPES = 'Foundation,SR Legacy';
 
 const STOPWORDS = new Set(['a', 'an', 'and', 'or', 'the', 'of', 'with', 'raw']);
 
-function significantWords(text) {
-  return new Set(
-    (text || '')
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, ' ')
-      .split(/\s+/)
-      .filter((w) => w && !STOPWORDS.has(w))
-  );
+// Lightweight singularization so "Chicken Thighs" (a typical inventory/
+// receipt name) matches "chicken thigh, meat and skin" (USDA's own entries
+// are almost always singular) on equal footing. Without this, the plain
+// correct match scored *worse* than a "Chicken, skin (drumsticks and
+// thighs), raw" entry -- literally just skin -- purely because that
+// pathological description happened to contain the exact plural "thighs"
+// while the correct one used singular "thigh". Real production bug: an
+// inventory item ended up with 9.58g protein / 44.2g fat per 100g (a skin
+// profile) instead of ~17g protein / 13g fat (real chicken thigh).
+function singularize(word) {
+  if (word.length > 4 && word.endsWith('ies')) return word.slice(0, -3) + 'y'
+  if (word.length > 3 && word.endsWith('es')) return word.slice(0, -2)
+  if (word.length > 2 && word.endsWith('s') && !word.endsWith('ss')) return word.slice(0, -1)
+  return word
 }
 
-// How many words in the candidate description aren't in the query -- e.g.
-// for query "chicken breast", "Chicken, breast, boneless, skinless, raw"
-// scores 1 ("boneless"/"skinless" both count) while "Chicken breast tenders,
-// breaded, uncooked" scores 3. Lower is a plainer, more representative match.
-function embellishmentScore(query, description) {
-  const queryWords = significantWords(query);
-  const descWords = significantWords(description);
-  let extra = 0;
-  for (const w of descWords) if (!queryWords.has(w)) extra++;
-  return extra;
+// Words indicating the food has been transformed into a fundamentally
+// different product form -- a single one of these buried among otherwise
+// few "extra" words was enough to make a wrong match look "plainer" than
+// the real one (real bug: query "Tomatoes" ranked "Tomato powder" above
+// "Tomatoes, red, ripe, raw" purely on extra-word count, since "powder" is
+// only 1 extra word vs "red, ripe" being 2). Heavily penalized unless the
+// query itself asked for that form.
+const FORM_PENALTY_WORDS = new Set([
+  'powder', 'flour', 'extract', 'juice', 'sauce', 'oil', 'dried', 'dehydrated',
+  'concentrate', 'syrup', 'paste', 'chip', 'flake', 'bagel', 'chip', 'cracker',
+])
+
+function significantWordList(text) {
+  return (text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w && !STOPWORDS.has(w))
+    .map(singularize)
+}
+
+// USDA descriptions always lead with the base food identity, in order
+// ("Chicken, thigh, meat and skin, raw" / "Egg, whole, raw"), so whether
+// the query's words line up with the description's words *in the same
+// position* is a far stronger signal of "is this actually the same food"
+// than just counting extra words. Real bug this fixes: "Chicken Thighs"
+// matched "Chicken, skin (drumsticks and thighs), raw" -- chicken SKIN,
+// not chicken thigh meat -- because that description happened to be
+// shorter (fewer "extra" words) even though its own primary identity
+// (skin) isn't what was asked for; "Eggs" matched "Bagels, egg" the same
+// way. Lower score is a better match.
+function matchScore(query, description) {
+  const queryWords = significantWordList(query)
+  const descWords = significantWordList(description)
+  const queryWordSet = new Set(queryWords)
+  const descWordSet = new Set(descWords)
+
+  let positionMismatch = 0
+  for (let i = 0; i < queryWords.length; i++) {
+    if (descWords[i] !== queryWords[i]) positionMismatch++
+  }
+  const missing = queryWords.filter((w) => !descWordSet.has(w)).length
+  const extra = descWords.filter((w) => !queryWordSet.has(w)).length
+  const formPenalty = descWords.filter((w) => FORM_PENALTY_WORDS.has(w) && !queryWordSet.has(w)).length
+
+  return positionMismatch * 1000 + missing * 200 + formPenalty * 100 + extra
 }
 
 // Runs one USDA search and, among up to `pageSize` results, picks the one
@@ -55,7 +97,7 @@ function embellishmentScore(query, description) {
 // sometimes a specific preparation (breaded, pickled, deli-sliced) even
 // though a same-relevance plain/raw version is a few rows down.
 async function searchOnce(query, dataType) {
-  const params = { query, api_key: USDA_API_KEY, pageSize: 5 };
+  const params = { query, api_key: USDA_API_KEY, pageSize: 15 };
   if (dataType) params.dataType = dataType;
 
   const response = await axios.get(USDA_BASE_URL, { params, timeout: 5000 });
@@ -71,7 +113,7 @@ async function searchOnce(query, dataType) {
     // food. Treat as incomplete so a real candidate (or a later fallback
     // attempt) gets picked instead of silently storing broken data.
     if (nutrients.protein === 0 && nutrients.carbs === 0 && nutrients.fat === 0 && nutrients.calories === 0) continue;
-    const score = embellishmentScore(query, food.description);
+    const score = matchScore(query, food.description);
     if (score < bestScore) {
       bestScore = score;
       best = { food, nutrients };
