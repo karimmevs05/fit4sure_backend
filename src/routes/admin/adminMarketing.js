@@ -5,7 +5,7 @@ const { requireAuth, requireRole } = require('../../middleware/auth')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
 const { calculateRecipeMacros } = require('./adminRecipes')
 const { renderCarouselCard, renderStoryCard } = require('../../services/contentImageRenderer')
-const { listImagesInFolder, downloadImageBuffer, uploadImageToFolder, getFileMetadata } = require('../../services/googleDriveSync')
+const { listImagesInFolder, downloadImageBuffer, getFileMetadata } = require('../../services/googleDriveSync')
 const { editFoodPhoto } = require('../../services/photoEditor')
 
 // ============================================================================
@@ -259,23 +259,40 @@ router.get('/uploaded-photos', requireAuth, requireRole('admin'), async (req, re
   }
 })
 
+// Every piece's image bytes are fetched through this, whichever source they
+// came from -- a real Drive file (Google file IDs are never prefixed) or a
+// direct upload stored in Postgres (id of the form 'local:<row id>', see
+// /upload-photo below -- a Google service account can't create files in a
+// personal Drive folder, it has zero storage quota, so direct uploads are
+// stored here instead rather than silently failing against Drive).
+async function getPhotoBuffer(fileId) {
+  if (fileId.startsWith('local:')) {
+    const id = fileId.slice('local:'.length)
+    const result = await db.query('SELECT mime_type, data FROM marketing_uploaded_photos WHERE id = $1', [id])
+    if (!result.rows[0]) throw new Error('Uploaded photo not found')
+    return { buffer: result.rows[0].data, mimeType: result.rows[0].mime_type }
+  }
+  return downloadImageBuffer(fileId)
+}
+
 // POST /api/admin/marketing/upload-photo { imageBase64, mimeType, filename? }
 // -- "Create piece" -> "Upload a photo": accepts a photo straight from the
 // user's device (same base64-in-JSON pattern as receipt scanning) and
-// writes it into the synced Marketing Drive folder, returning a real
-// file_id the frontend can immediately add as a project item.
+// stores it directly in Postgres, returning a 'local:<id>' file_id the
+// frontend can immediately add as a project item like any other photo.
 router.post('/upload-photo', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    if (!MARKETING_PHOTOS_FOLDER_ID) return res.status(400).json({ error: 'No Drive folder configured' })
     const { imageBase64, mimeType, filename } = req.body
     if (!imageBase64) return res.status(400).json({ error: 'imageBase64 is required' })
 
     const cleanBase64 = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64
     const buffer = Buffer.from(cleanBase64, 'base64')
-    const name = filename || `upload-${Date.now()}.jpg`
 
-    const file = await uploadImageToFolder(buffer, mimeType || 'image/jpeg', name, MARKETING_PHOTOS_FOLDER_ID)
-    res.json({ success: true, data: { file_id: file.id, filename: file.name } })
+    const result = await db.query(
+      'INSERT INTO marketing_uploaded_photos (mime_type, data, filename) VALUES ($1, $2, $3) RETURNING id',
+      [mimeType || 'image/jpeg', buffer, filename || null]
+    )
+    res.json({ success: true, data: { file_id: `local:${result.rows[0].id}`, filename: filename || `upload-${result.rows[0].id}` } })
   } catch (error) {
     console.error('Error uploading photo:', error)
     res.status(500).json({ error: error.message || 'Failed to upload photo' })
@@ -517,7 +534,7 @@ router.delete('/projects/:id/items/:itemId', requireAuth, requireRole('admin'), 
 // authenticated blob, same pattern as the carousel/story renders below).
 router.get('/photo/:file_id/thumbnail.jpg', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { buffer, mimeType } = await downloadImageBuffer(req.params.file_id)
+    const { buffer, mimeType } = await getPhotoBuffer(req.params.file_id)
     res.set('Content-Type', mimeType)
     res.send(buffer)
   } catch (error) {
@@ -582,7 +599,7 @@ router.post('/generate-captions', requireAuth, requireRole('admin'), async (req,
     const visionParts = []
 
     if (file_id) {
-      const { buffer, mimeType } = await downloadImageBuffer(file_id)
+      const { buffer, mimeType } = await getPhotoBuffer(file_id)
       const vision = await getVisionDetails(buffer, mimeType)
       dishName = vision.name
       visionParts.push({ inlineData: { data: buffer.toString('base64'), mimeType } })
@@ -623,7 +640,7 @@ router.post('/generate-captions', requireAuth, requireRole('admin'), async (req,
 // and title autofit happen inside the renderer itself (contentImageRenderer.js)
 // since the target box is a layout concern it already owns.
 async function getRenderablePhoto(fileId, recipeId) {
-  const { buffer, mimeType } = await downloadImageBuffer(fileId)
+  const { buffer, mimeType } = await getPhotoBuffer(fileId)
   const [vision, macros, edited] = await Promise.all([
     getVisionDetails(buffer, mimeType),
     getRecipeMacros(recipeId),
