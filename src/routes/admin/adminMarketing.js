@@ -302,6 +302,10 @@ router.post('/projects', requireAuth, requireRole('admin'), async (req, res) => 
 // DELETE /api/admin/marketing/projects/:id
 router.delete('/projects/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
+    await db.query(
+      `DELETE FROM tasks WHERE id IN (SELECT task_id FROM marketing_project_items WHERE project_id = $1 AND task_id IS NOT NULL)`,
+      [req.params.id]
+    )
     await db.query('DELETE FROM marketing_projects WHERE id = $1', [req.params.id])
     res.json({ success: true })
   } catch (error) {
@@ -316,7 +320,8 @@ router.delete('/projects/:id', requireAuth, requireRole('admin'), async (req, re
 router.get('/projects/:id/items', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const itemsResult = await db.query(
-      `SELECT id, drive_file_id, recipe_id, added_at FROM marketing_project_items WHERE project_id = $1 ORDER BY added_at`,
+      `SELECT id, drive_file_id, recipe_id, format, size, template_link, status, price_cents, scheduled_date, notes, task_id, added_at
+       FROM marketing_project_items WHERE project_id = $1 ORDER BY added_at`,
       [req.params.id]
     )
     const items = await Promise.all(
@@ -331,12 +336,90 @@ router.get('/projects/:id/items', requireAuth, requireRole('admin'), async (req,
           file_id: item.drive_file_id,
           recipe_id: item.recipe_id,
           recipe_name: recipeName,
+          format: item.format,
+          size: item.size,
+          template_link: item.template_link,
+          status: item.status,
+          price_cents: item.price_cents,
+          scheduled_date: item.scheduled_date,
+          notes: item.notes,
+          task_id: item.task_id,
         }
       })
     )
     res.json({ success: true, data: items })
   } catch (error) {
     console.error('Error listing project items:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+const PIECE_FORMATS = ['flyer', 'business_card', 'promo_card', 'billboard', 'static_post', 'promo_video', 'reel', 'story']
+const PIECE_STATUSES = ['idea', 'in_progress', 'review', 'approved', 'scheduled', 'published']
+
+// PATCH /api/admin/marketing/projects/:id/items/:itemId -- the "template"
+// details for a piece: format, size, a reference link, its status in the
+// flow, a price, and an optional schedule date. Setting/clearing
+// scheduled_date creates/updates/removes a real row in the unified `tasks`
+// table (department='Marketing') so a scheduled piece actually shows up on
+// the existing Operations Hub dashboard -- not a separate, disconnected
+// calendar.
+router.patch('/projects/:id/items/:itemId', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { format, size, template_link, status, price_cents, scheduled_date, notes } = req.body
+    if (format !== undefined && format !== null && !PIECE_FORMATS.includes(format)) {
+      return res.status(400).json({ error: `format must be one of: ${PIECE_FORMATS.join(', ')}` })
+    }
+    if (status !== undefined && status !== null && !PIECE_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `status must be one of: ${PIECE_STATUSES.join(', ')}` })
+    }
+
+    const fields = { format, size, template_link, status, price_cents, scheduled_date, notes }
+    const setClauses = []
+    const values = []
+    for (const [key, value] of Object.entries(fields)) {
+      if (value === undefined) continue
+      values.push(value)
+      setClauses.push(`${key} = $${values.length}`)
+    }
+    if (setClauses.length === 0) return res.status(400).json({ error: 'no fields to update' })
+
+    values.push(req.params.itemId, req.params.id)
+    const result = await db.query(
+      `UPDATE marketing_project_items SET ${setClauses.join(', ')} WHERE id = $${values.length - 1} AND project_id = $${values.length} RETURNING *`,
+      values
+    )
+    const item = result.rows[0]
+    if (!item) return res.status(404).json({ error: 'Item not found' })
+
+    if (scheduled_date !== undefined) {
+      if (scheduled_date) {
+        const projectResult = await db.query('SELECT name FROM marketing_projects WHERE id = $1', [req.params.id])
+        const projectName = projectResult.rows[0]?.name || 'Marketing'
+        const title = `${(item.format || 'Content piece').replace(/_/g, ' ')} -- ${projectName}`.replace(/^\w/, (c) => c.toUpperCase())
+        const taskStatus = item.status === 'published' ? 'completed' : 'not_started'
+
+        if (item.task_id) {
+          await db.query('UPDATE tasks SET title = $1, due_date = $2, status = $3, updated_at = NOW() WHERE id = $4', [title, scheduled_date, taskStatus, item.task_id])
+        } else {
+          const taskResult = await db.query(
+            `INSERT INTO tasks (title, department, due_date, status, source_type, source_id, is_ops_task)
+             VALUES ($1, 'Marketing', $2, $3, 'marketing_piece', $4, true) RETURNING id`,
+            [title, scheduled_date, taskStatus, item.id]
+          )
+          await db.query('UPDATE marketing_project_items SET task_id = $1 WHERE id = $2', [taskResult.rows[0].id, item.id])
+          item.task_id = taskResult.rows[0].id
+        }
+      } else if (item.task_id) {
+        await db.query('DELETE FROM tasks WHERE id = $1', [item.task_id])
+        await db.query('UPDATE marketing_project_items SET task_id = NULL WHERE id = $1', [item.id])
+        item.task_id = null
+      }
+    }
+
+    res.json({ success: true, data: { item_id: item.id, task_id: item.task_id } })
+  } catch (error) {
+    console.error('Error updating project item:', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -363,6 +446,8 @@ router.post('/projects/:id/items', requireAuth, requireRole('admin'), async (req
 // DELETE /api/admin/marketing/projects/:id/items/:itemId
 router.delete('/projects/:id/items/:itemId', requireAuth, requireRole('admin'), async (req, res) => {
   try {
+    const existing = await db.query('SELECT task_id FROM marketing_project_items WHERE id = $1 AND project_id = $2', [req.params.itemId, req.params.id])
+    if (existing.rows[0]?.task_id) await db.query('DELETE FROM tasks WHERE id = $1', [existing.rows[0].task_id])
     await db.query('DELETE FROM marketing_project_items WHERE id = $1 AND project_id = $2', [req.params.itemId, req.params.id])
     res.json({ success: true })
   } catch (error) {
