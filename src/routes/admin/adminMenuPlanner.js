@@ -634,7 +634,7 @@ function groupByCategory(recipes) {
 // Proteins first, then carbs/veg/sauces -- purely cosmetic ordering so the
 // SOP page's columns cluster same-category recipes together left-to-right
 // even though they're all one task now.
-const CATEGORY_ORDER = ['beef', 'chicken', 'turkey', 'pork', 'carbohydrates', 'pasta', 'vegetables', 'sauces', 'beverage', 'breakfast', 'custom'];
+const CATEGORY_ORDER = ['beef', 'chicken', 'turkey', 'pork', 'carbohydrates', 'pasta', 'vegetables', 'sauces', 'marinades', 'beverage', 'breakfast', 'custom'];
 
 // One Kitchen task per operational day/phase for the whole block -- every
 // category combined into a single section (still individually color-coded

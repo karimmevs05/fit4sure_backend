@@ -115,7 +115,7 @@ Schema:
   "recipes": [
     {
       "name": string,
-      "category_guess": one of "beef","chicken","turkey","pork","carbohydrates","pasta","vegetables","sauces","beverage","breakfast",
+      "category_guess": one of "beef","chicken","turkey","pork","carbohydrates","pasta","vegetables","sauces","marinades","beverage","breakfast" ("marinades" is for a marinade/brine meant to be used on a separate protein and containing no meat/protein ingredient itself -- a recipe that includes real meat/poultry along with marinade ingredients is still that protein's category, not "marinades"),
       "servings": number,
       "prep_time_minutes": number or null,
       "steps": [
