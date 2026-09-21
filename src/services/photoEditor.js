@@ -1,32 +1,28 @@
-// Professionally retouches a real uploaded plate photo before it goes into
-// a carousel/story render -- raw camera photos (uneven kitchen lighting,
-// flat color) don't look like ready-to-post content on their own. Uses
-// Gemini's image model (the same GOOGLE_GEMINI_API_KEY already wired up
-// elsewhere) as an actual photo editor: same plate, same framing, same
-// food -- just lit, color-graded, and sharpened the way a skilled editor
-// would before publishing.
+// Retouches a real uploaded plate photo before it goes into a
+// carousel/story render -- raw camera photos (uneven kitchen lighting,
+// flat color) don't look like ready-to-post content on their own.
+//
+// This used to call Gemini's image model to "retouch" the photo, but that
+// was unreliable in practice: compared side by side against the raw photo,
+// the AI edit was often barely distinguishable -- sometimes it made a real
+// change, sometimes almost none, with no way to control or guarantee the
+// result. A deterministic pipeline (sharp: auto white-balance/contrast
+// stretch, saturation/contrast boost, sharpening) is controllable and
+// applies the same real improvement every time, with no extra API latency
+// or cost per render.
 
-const { GoogleGenerativeAI } = require('@google/generative-ai')
-
-function getGeminiClient() {
-  const apiKey = process.env.GOOGLE_GEMINI_API_KEY
-  if (!apiKey) throw new Error('GOOGLE_GEMINI_API_KEY not configured in .env')
-  return new GoogleGenerativeAI(apiKey)
-}
-
-const EDIT_PROMPT = `Professionally retouch this real food photo for an Instagram post: correct white balance, boost appetizing warmth and contrast, sharpen detail, clean even lighting, remove harsh shadows. Keep it 100% realistic -- do not add, remove, or change any food items, do not restyle the plate or container. Same framing and composition.`
+const sharp = require('sharp')
 
 async function editFoodPhoto(buffer, mimeType) {
-  const genAI = getGeminiClient()
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-image' })
-  const result = await model.generateContent([
-    { inlineData: { data: buffer.toString('base64'), mimeType } },
-    EDIT_PROMPT,
-  ])
-  const parts = result.response.candidates?.[0]?.content?.parts || []
-  const imgPart = parts.find((p) => p.inlineData)
-  if (!imgPart) throw new Error('Photo edit did not return an image')
-  return { buffer: Buffer.from(imgPart.inlineData.data, 'base64'), mimeType: imgPart.inlineData.mimeType }
+  const edited = await sharp(buffer)
+    .rotate() // respect EXIF orientation before any processing
+    .normalize() // stretches the histogram -- fixes flat/washed-out lighting
+    .modulate({ saturation: 1.22, brightness: 1.05 })
+    .linear(1.1, -10) // slight contrast boost
+    .sharpen({ sigma: 1.1 })
+    .jpeg({ quality: 92 })
+    .toBuffer()
+  return { buffer: edited, mimeType: 'image/jpeg' }
 }
 
 module.exports = { editFoodPhoto }
