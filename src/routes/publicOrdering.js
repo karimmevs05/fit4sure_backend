@@ -18,6 +18,7 @@ const {
   findOrCreateCustomerByContact,
   getWeeklyMenu,
 } = require('../services/orderingService');
+const { createOrderCheckoutSession } = require('../services/stripeService');
 
 // GET /api/public/menu - same shape as the admin picker's weekly-menu, no auth.
 router.get('/menu', async (req, res) => {
@@ -40,7 +41,7 @@ router.get('/menu', async (req, res) => {
 // patterns, e.g. importOrderRow) so one bad line doesn't block the others;
 // the response reports exactly what saved and what didn't.
 router.post('/orders', async (req, res) => {
-  const { customerName, phone, email, address, items } = req.body;
+  const { customerName, phone, email, address, items, origin } = req.body;
 
   const cleanName = (customerName || '').trim();
   const cleanPhone = (phone || '').trim();
@@ -106,9 +107,15 @@ router.post('/orders', async (req, res) => {
           totalPrice = price != null ? price * quantity : null;
         }
 
+        // payment_status defaults to 'paid' at the table level (that default
+        // predates real payment collection, matching how revenue was
+        // counted before Stripe existed) -- a public order isn't actually
+        // paid yet, so this must override it to 'pending' explicitly. The
+        // Stripe webhook (payments.js) is the only thing that flips it to
+        // 'paid', once the customer actually completes checkout.
         const result = await db.query(
-          `INSERT INTO orders (customer_id, menu_id, quantity, day_of_week, total_price, source, notes, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, 'form', $6, NOW(), NOW())
+          `INSERT INTO orders (customer_id, menu_id, quantity, day_of_week, total_price, source, notes, payment_status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, 'form', $6, 'pending', NOW(), NOW())
            RETURNING id, quantity, day_of_week, total_price`,
           [customerId, menuId, quantity, day, totalPrice, item.notes || null]
         );
@@ -124,7 +131,39 @@ router.post('/orders', async (req, res) => {
     }
 
     const total = saved.reduce((sum, o) => sum + (Number(o.total_price) || 0), 0);
-    res.status(201).json({ data: { customerId, orders: saved, total, errors: errors.length ? errors : undefined } });
+
+    // Real checkout: one Stripe Checkout Session covers every row from this
+    // submission (a cart can contain several plates -> several order rows).
+    // `origin` is the ordering page's own window.location.origin, sent by
+    // the client -- built here rather than hardcoded so it keeps working
+    // regardless of which domain/subdomain the page is actually served
+    // from. Stripe isn't configured as a hard requirement for placing an
+    // order (STRIPE_SECRET_KEY may not be set yet, or Stripe may hiccup) --
+    // the order itself is already saved above, so a Stripe failure here is
+    // reported but doesn't roll that back.
+    let checkoutUrl = null;
+    const checkoutOrigin = origin || process.env.PUBLIC_SITE_URL;
+    if (total > 0 && checkoutOrigin) {
+      try {
+        const session = await createOrderCheckoutSession({
+          orderIds: saved.map((o) => o.id),
+          amountCents: Math.round(total * 100),
+          customerEmail: email || undefined,
+          description: `Fit4Sure order for ${cleanName}`,
+          successUrl: `${checkoutOrigin}/order/?paid=1`,
+          cancelUrl: `${checkoutOrigin}/order/?cancelled=1`,
+        });
+        checkoutUrl = session.url;
+        await db.query(
+          'UPDATE orders SET stripe_checkout_session_id = $1, updated_at = NOW() WHERE id = ANY($2::int[])',
+          [session.id, saved.map((o) => o.id)]
+        );
+      } catch (stripeError) {
+        console.error('Error creating Stripe checkout session for public order:', stripeError);
+      }
+    }
+
+    res.status(201).json({ data: { customerId, orders: saved, total, checkoutUrl, errors: errors.length ? errors : undefined } });
   } catch (error) {
     console.error('Error submitting public order:', error);
     res.status(500).json({ error: 'Failed to submit order' });

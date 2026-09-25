@@ -5,6 +5,7 @@ const { requireAuth, requireRole } = require('../../middleware/auth');
 const { google } = require('googleapis');
 const { CATEGORY_PRICES, ADD_ON_FORMATS, ADD_ON_FREE_PRICE, ADD_ON_EXTRA_PRICE, findOrCreateMenu, getWeeklyMenu } = require('../../services/orderingService');
 const { getRecipeIngredientNeeds } = require('../../utils/recipeCost');
+const { createOrderCheckoutSession } = require('../../services/stripeService');
 
 // The Google Sheet behind the weekly order Form. The "Order_Details" tab is
 // already cleaned into (Timestamp, Client, Category, Meal Name, Qty, Notes)
@@ -678,6 +679,51 @@ router.patch('/:id/mark-pending', requireAuth, requireRole('admin'), async (req,
   } catch (error) {
     console.error('Error marking order pending:', error);
     res.status(500).json({ error: 'Failed to mark order pending' });
+  }
+});
+
+// POST /api/admin/orders/:id/payment-link - Real Stripe checkout for a
+// single order, for staff taking a phone/in-person order: creates a
+// Checkout Session and hands back a URL staff can text/email/read to the
+// customer. No card data ever touches this server or staff's screen --
+// the customer pays on Stripe's own hosted page. The order isn't marked
+// paid here; only the Stripe webhook (payments.js), once the customer
+// actually completes checkout, does that.
+router.post('/:id/payment-link', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const orderResult = await db.query(
+      `SELECT o.id, o.total_price, c.name AS customer_name, c.email AS customer_email
+       FROM orders o LEFT JOIN customers c ON c.id = o.customer_id
+       WHERE o.id = $1`,
+      [req.params.id]
+    );
+    const order = orderResult.rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (!order.total_price || Number(order.total_price) <= 0) {
+      return res.status(400).json({ error: 'Order has no charge amount' });
+    }
+    if (!process.env.PUBLIC_SITE_URL) {
+      return res.status(500).json({ error: 'PUBLIC_SITE_URL is not configured' });
+    }
+
+    const session = await createOrderCheckoutSession({
+      orderIds: [order.id],
+      amountCents: Math.round(Number(order.total_price) * 100),
+      customerEmail: order.customer_email || undefined,
+      description: `Fit4Sure order for ${order.customer_name || 'customer'}`,
+      successUrl: `${process.env.PUBLIC_SITE_URL}/order/?paid=1`,
+      cancelUrl: `${process.env.PUBLIC_SITE_URL}/order/?cancelled=1`,
+    });
+
+    await db.query(
+      'UPDATE orders SET stripe_checkout_session_id = $1, updated_at = NOW() WHERE id = $2',
+      [session.id, order.id]
+    );
+
+    res.json({ data: { url: session.url } });
+  } catch (error) {
+    console.error('Error creating payment link:', error);
+    res.status(500).json({ error: 'Failed to create payment link' });
   }
 });
 
