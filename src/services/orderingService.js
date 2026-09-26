@@ -91,7 +91,7 @@ function normalizePhone(phone) {
 // name. Fills in phone/email if the matched record is missing them, same
 // never-overwrite rule used everywhere else in this app. Creates a new
 // prospect if nothing matches.
-async function findOrCreateCustomerByContact({ name, phone, email, address }) {
+async function findOrCreateCustomerByContact({ name, phone, email, address, smsConsent }) {
   const cleanName = (name || '').trim();
   if (!cleanName) return null;
   const normalizedPhone = normalizePhone(phone);
@@ -123,6 +123,14 @@ async function findOrCreateCustomerByContact({ name, phone, email, address }) {
     if (!existing.phone && phone) { sets.push(`phone = $${n++}`); values.push(phone); }
     if (!existing.email && cleanEmail) { sets.push(`email = $${n++}`); values.push(cleanEmail); }
     if (!existing.address && cleanAddress) { sets.push(`address = $${n++}`); values.push(cleanAddress); }
+    // A2P 10DLC compliance -- checking the order page's consent box is a
+    // real, explicit opt-in event, so it's allowed to both set
+    // sms_consent_at the first time and clear a prior sms_opt_out (e.g. a
+    // customer who texted STOP once but is now knowingly opting back in by
+    // placing a new order and checking the box again).
+    if (smsConsent) {
+      sets.push(`sms_consent_at = NOW()`, `sms_opt_out = false`);
+    }
     if (sets.length > 0) {
       sets.push(`updated_at = NOW()`);
       values.push(existing.id);
@@ -132,9 +140,9 @@ async function findOrCreateCustomerByContact({ name, phone, email, address }) {
   }
 
   const created = await db.query(
-    `INSERT INTO customers (name, phone, email, address, status, sales_pipeline_stage, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, 'prospect', 'prospect', NOW(), NOW()) RETURNING id`,
-    [cleanName, phone || null, cleanEmail, cleanAddress]
+    `INSERT INTO customers (name, phone, email, address, status, sales_pipeline_stage, sms_consent_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, 'prospect', 'prospect', $5, NOW(), NOW()) RETURNING id`,
+    [cleanName, phone || null, cleanEmail, cleanAddress, smsConsent ? new Date() : null]
   );
   return created.rows[0].id;
 }

@@ -41,13 +41,18 @@ router.get('/menu', async (req, res) => {
 // patterns, e.g. importOrderRow) so one bad line doesn't block the others;
 // the response reports exactly what saved and what didn't.
 router.post('/orders', async (req, res) => {
-  const { customerName, phone, email, address, items, origin } = req.body;
+  const { customerName, phone, email, address, items, origin, smsConsent } = req.body;
 
   const cleanName = (customerName || '').trim();
   const cleanPhone = (phone || '').trim();
   if (!cleanName) return res.status(400).json({ error: 'Name is required' });
   if (!cleanPhone) return res.status(400).json({ error: 'Phone number is required' });
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'At least one item is required' });
+  // A2P 10DLC compliance -- order confirmation and payment-link texts are
+  // core to this flow, so real consent is required server-side too, not
+  // just enforced by the order page's own checkbox (a direct POST could
+  // otherwise skip it entirely).
+  if (!smsConsent) return res.status(400).json({ error: 'You must agree to receive order and payment texts to place an order' });
 
   try {
     const menu = await getWeeklyMenu();
@@ -65,7 +70,7 @@ router.post('/orders', async (req, res) => {
       thursday: new Set(menu.thursday.map((r) => r.name)),
     };
 
-    const customerId = await findOrCreateCustomerByContact({ name: cleanName, phone: cleanPhone, email, address });
+    const customerId = await findOrCreateCustomerByContact({ name: cleanName, phone: cleanPhone, email, address, smsConsent });
     if (!customerId) return res.status(500).json({ error: 'Could not resolve customer' });
 
     const saved = [];
