@@ -41,6 +41,7 @@ const adminCustomDietsRoutes = require('./routes/admin/adminCustomDiets')
 const publicOrderingRoutes = require('./routes/publicOrdering')
 const adminSalesAssetsRoutes = require('./routes/admin/adminSalesAssets')
 const publicAssetShareRoutes = require('./routes/publicAssetShare')
+const twilioRoutes = require('./routes/twilio')
 
 const app = express()
 
@@ -90,6 +91,7 @@ app.use('/api/admin/custom-diets', adminCustomDietsRoutes)
 app.use('/api/public', publicOrderingRoutes)
 app.use('/api/admin', adminSalesAssetsRoutes)
 app.use('/s', publicAssetShareRoutes)
+app.use('/api/twilio', twilioRoutes)
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }))
 

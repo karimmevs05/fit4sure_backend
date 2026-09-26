@@ -65,6 +65,13 @@ async function executeStep(enrollment, step, customer) {
     const result = await sendEmail({ to: customer.email, subject: subject || '(no subject)', body })
     status = result.success ? 'sent' : 'failed'
     if (!result.success) metadata = { error: result.error }
+  } else if (step.action_type === 'send_sms' && customer.sms_opt_out) {
+    // A2P 10DLC compliance -- a STOP reply (see twilio.js inbound webhook)
+    // must actually stop this app from sending, not just rely on the
+    // carrier-level block. Logged as 'skipped' rather than silently
+    // dropped so the activity feed shows why no text went out.
+    status = 'skipped'
+    metadata = { error: 'Customer has opted out of SMS' }
   } else if (step.action_type === 'send_sms' && customer.phone) {
     const result = await sendSms({ to: customer.phone, body })
     status = result.success ? 'sent' : 'failed'
@@ -83,7 +90,7 @@ async function executeStep(enrollment, step, customer) {
 
 async function runDueSteps() {
   const dueResult = await db.query(
-    `SELECT ae.*, c.id AS c_id, c.name AS c_name, c.email AS c_email, c.phone AS c_phone
+    `SELECT ae.*, c.id AS c_id, c.name AS c_name, c.email AS c_email, c.phone AS c_phone, c.sms_opt_out AS c_sms_opt_out
      FROM automation_enrollments ae
      JOIN customers c ON c.id = ae.customer_id
      WHERE ae.status = 'active' AND ae.next_run_at <= NOW()`
@@ -102,7 +109,7 @@ async function runDueSteps() {
       continue
     }
 
-    const customer = { id: row.c_id, name: row.c_name, email: row.c_email, phone: row.c_phone }
+    const customer = { id: row.c_id, name: row.c_name, email: row.c_email, phone: row.c_phone, sms_opt_out: row.c_sms_opt_out }
     try {
       await executeStep(row, stepToRun, customer)
       executed++

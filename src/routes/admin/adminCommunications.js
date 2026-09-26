@@ -31,7 +31,7 @@ router.post('/customers/:id/activities', requireAuth, requireRole('admin'), asyn
   if (!type || !body) return res.status(400).json({ error: 'type and body are required' })
 
   try {
-    const customerResult = await db.query('SELECT id, name, email, phone FROM customers WHERE id = $1', [req.params.id])
+    const customerResult = await db.query('SELECT id, name, email, phone, sms_opt_out FROM customers WHERE id = $1', [req.params.id])
     const customer = customerResult.rows[0]
     if (!customer) return res.status(404).json({ error: 'Customer not found' })
 
@@ -47,6 +47,7 @@ router.post('/customers/:id/activities', requireAuth, requireRole('admin'), asyn
       if (!result.success) metadata = { error: result.error }
     } else if (type === 'sms') {
       if (!customer.phone) return res.status(400).json({ error: 'Customer has no phone on file' })
+      if (customer.sms_opt_out) return res.status(400).json({ error: 'Customer has opted out of SMS' })
       const result = await sendSms({ to: customer.phone, body: mergedBody })
       status = result.success ? 'sent' : 'failed'
       if (!result.success) metadata = { error: result.error }
