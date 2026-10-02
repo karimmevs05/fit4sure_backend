@@ -4,8 +4,7 @@ const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const { computeYieldCorrectedRecipe } = require('./adminCookingMethods');
 const { getReceiptFallbackPriceCents } = require('../../utils/recipeCost');
-
-const CATEGORY_PRICES = { Regular: 13.79, Large: 16.79 };
+const { getCategoryPrices } = require('../../services/plateConfig');
 
 async function getNextWeekDates() {
   const result = await db.query(`
@@ -1069,11 +1068,12 @@ router.post('/plates', requireAuth, requireRole('admin'), async (req, res) => {
     }
 
     const { sunday } = await getNextWeekDates();
+    const categoryPrices = await getCategoryPrices();
 
     const regularMenu = await db.query(
       `INSERT INTO menus (name, category, price, planned_week_start, delivery_day, created_at, updated_at)
        VALUES ($1, 'Regular', $2, $3, $4, NOW(), NOW()) RETURNING id`,
-      [name, CATEGORY_PRICES.Regular, sunday, day]
+      [name, categoryPrices.Regular, sunday, day]
     );
     const regularMenuId = regularMenu.rows[0].id;
 
@@ -1089,7 +1089,7 @@ router.post('/plates', requireAuth, requireRole('admin'), async (req, res) => {
       const largeMenu = await db.query(
         `INSERT INTO menus (name, category, price, planned_week_start, delivery_day, large_variant_of, created_at, updated_at)
          VALUES ($1, 'Large', $2, $3, $4, $5, NOW(), NOW()) RETURNING id`,
-        [name, CATEGORY_PRICES.Large, sunday, day, regularMenuId]
+        [name, categoryPrices.Large, sunday, day, regularMenuId]
       );
       largeMenuId = largeMenu.rows[0].id;
 
@@ -1145,10 +1145,11 @@ router.put('/plates/:id', requireAuth, requireRole('admin'), async (req, res) =>
       if (!targetLargeId) {
         const delivery_day = menuResult.rows[0].delivery_day;
         const { sunday } = await getNextWeekDates();
+        const categoryPrices = await getCategoryPrices();
         const largeMenu = await db.query(
           `INSERT INTO menus (name, category, price, planned_week_start, delivery_day, large_variant_of, created_at, updated_at)
            VALUES ($1, 'Large', $2, $3, $4, $5, NOW(), NOW()) RETURNING id`,
-          [name, CATEGORY_PRICES.Large, sunday, delivery_day, id]
+          [name, categoryPrices.Large, sunday, delivery_day, id]
         );
         targetLargeId = largeMenu.rows[0].id;
       } else {

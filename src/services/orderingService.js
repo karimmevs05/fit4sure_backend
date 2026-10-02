@@ -6,49 +6,43 @@
 // can't accidentally leave the two pickers disagreeing with each other.
 
 const db = require('../config/db');
+const plateConfig = require('./plateConfig');
 
-// Known price tiers (fit4sure.net). Placeholder figures for the three
-// recipe-plan formats (High Protein / Low Carb / 1 Pound) -- swap for real
-// numbers once confirmed; nothing else needs to change since every caller
-// reads this table directly rather than hardcoding prices of its own.
-// Not real customer-facing "formats" -- carb/veggie sides and sauces added
-// under a selected protein are add-ons, each with their own free allowance
-// (sides: first 2 free; sauces: first 1 free) before every one after costs
-// $ADD_ON_EXTRA_PRICE (tracked per-group client-side, since which ones in a
-// batch are "first" depends on tap order within that specific plate).
-// Because the same (name, format) menu row can't hold two different prices
-// for two different orders, these two formats are the one case where the
-// client's submitted price is trusted (see publicOrdering.js) rather than
-// looked up from CATEGORY_PRICES -- but only ever exactly ADD_ON_FREE_PRICE
-// or ADD_ON_EXTRA_PRICE, never an arbitrary client-supplied number.
+// Real prices and portion sizes live in the plate_formats / by_the_pound_prices
+// / addon_rules tables now (see migrations/create_plate_config.sql and
+// src/services/plateConfig.js), editable from the admin dashboard's
+// Operations Hub -- not hardcoded here anymore. This file only keeps the
+// stable identifiers (category/format NAME strings), never price data.
+//
+// Carb/veggie sides and sauces added under a selected protein are add-ons,
+// each with their own free allowance before every one after costs real
+// money (tracked per-group client-side, since which ones in a batch are
+// "first" depends on tap order within that specific plate). Because the
+// same (name, format) menu row can't hold two different prices for two
+// different orders, these two formats are the one case where the client's
+// submitted price is trusted (see publicOrdering.js) rather than looked up
+// from plate_formats -- but only ever exactly the configured free price or
+// extra price for that specific addon type, never an arbitrary
+// client-supplied number (see getAddonPricing below).
 const SIDE_FORMAT = 'Included Side';
 const SAUCE_ADDON_FORMAT = 'Sauce Add-On';
 const ADD_ON_FORMATS = [SIDE_FORMAT, SAUCE_ADDON_FORMAT];
-const ADD_ON_FREE_PRICE = 0;
-const ADD_ON_EXTRA_PRICE = 2.5;
+const ADD_ON_FREE_PRICE = 0; // "free" is free by definition, not an editable config value
 
-const CATEGORY_PRICES = {
-  Regular: 13.79,
-  Large: 16.79,
-  'High Protein': 17.79,
-  'Low Carb': 13.79,
-  '1 Pound': 19.79,
-  Breakfast: 11.30,
-  [SIDE_FORMAT]: ADD_ON_FREE_PRICE,
-  [SAUCE_ADDON_FORMAT]: ADD_ON_FREE_PRICE,
-};
-
-// The five formats offered per live recipe, sourced from the Weekly Recipe
-// Plan.
-const RECIPE_FORMATS = ['Regular', 'Large', 'High Protein', 'Low Carb', '1 Pound'];
-
-// "By The LB" isn't one flat price -- it's always exactly 1lb of a single
-// chosen item, priced by what type of item it is (fit4sure.net/category/all-products).
-const BY_THE_LB_PRICES = {
-  Protein: 20.0,
-  Vegetable: 10.0,
-  Carbohydrate: 5.0,
-};
+// Per-addon-format free/extra pricing, keyed by the format label
+// (SIDE_FORMAT/SAUCE_ADDON_FORMAT) rather than the DB's internal
+// included_side/sauce_addon keys, so callers that already branch on
+// `category` (the format label) can look this up directly. Side and sauce
+// can have genuinely different extra prices now (the old hardcoded
+// ADD_ON_EXTRA_PRICE constant couldn't express that) -- always look up the
+// specific addon type being validated, never assume one shared number.
+async function getAddonPricing() {
+  const rules = await plateConfig.getAddonRules();
+  return {
+    [SIDE_FORMAT]: { freePrice: ADD_ON_FREE_PRICE, freeCount: rules.included_side?.freeCount ?? 0, extraPrice: rules.included_side?.extraPrice ?? 0 },
+    [SAUCE_ADDON_FORMAT]: { freePrice: ADD_ON_FREE_PRICE, freeCount: rules.sauce_addon?.freeCount ?? 0, extraPrice: rules.sauce_addon?.extraPrice ?? 0 },
+  };
+}
 
 function guessByTheLbType(name) {
   const lower = (name || '').toLowerCase();
@@ -69,7 +63,14 @@ async function findOrCreateMenu(name, category) {
   );
   if (existing.rows.length > 0) return existing.rows[0].id;
 
-  const price = cleanCategory === 'By The LB' ? BY_THE_LB_PRICES[guessByTheLbType(cleanName)] : CATEGORY_PRICES[cleanCategory] ?? null;
+  let price;
+  if (cleanCategory === 'By The LB') {
+    const byThePoundPrices = await plateConfig.getByThePoundPrices();
+    price = byThePoundPrices[guessByTheLbType(cleanName)] ?? null;
+  } else {
+    const categoryPrices = await plateConfig.getCategoryPrices();
+    price = categoryPrices[cleanCategory] ?? null;
+  }
 
   const created = await db.query(
     `INSERT INTO menus (name, category, price, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) RETURNING id`,
@@ -217,6 +218,8 @@ async function getWeeklyMenu() {
   `);
 
   const macrosByRecipe = await getPerPoundMacrosByRecipe(planResult.rows.map((r) => r.recipe_id));
+  const recipeFormatLabels = await plateConfig.getRecipeFormatLabels();
+  const categoryPrices = await plateConfig.getCategoryPrices();
 
   const buildBlock = (block) =>
     planResult.rows
@@ -226,10 +229,10 @@ async function getWeeklyMenu() {
         name: r.name,
         category: r.category,
         perPound: macrosByRecipe[r.recipe_id] || null,
-        formats: RECIPE_FORMATS.map((label) => ({
+        formats: recipeFormatLabels.map((label) => ({
           id: label.toLowerCase().replace(/\s+/g, ''),
           label,
-          price: CATEGORY_PRICES[label],
+          price: categoryPrices[label],
         })),
       }));
 
@@ -255,14 +258,10 @@ async function getWeeklyMenu() {
 }
 
 module.exports = {
-  CATEGORY_PRICES,
-  RECIPE_FORMATS,
   SIDE_FORMAT,
   SAUCE_ADDON_FORMAT,
   ADD_ON_FORMATS,
-  ADD_ON_FREE_PRICE,
-  ADD_ON_EXTRA_PRICE,
-  BY_THE_LB_PRICES,
+  getAddonPricing,
   guessByTheLbType,
   findOrCreateMenu,
   findOrCreateCustomerByContact,

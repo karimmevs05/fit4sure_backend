@@ -3,7 +3,7 @@ const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const { google } = require('googleapis');
-const { CATEGORY_PRICES, ADD_ON_FORMATS, ADD_ON_FREE_PRICE, ADD_ON_EXTRA_PRICE, findOrCreateMenu, getWeeklyMenu } = require('../../services/orderingService');
+const { ADD_ON_FORMATS, getAddonPricing, findOrCreateMenu, getWeeklyMenu } = require('../../services/orderingService');
 const { getRecipeIngredientNeeds } = require('../../utils/recipeCost');
 const { createOrderCheckoutSession } = require('../../services/stripeService');
 
@@ -425,7 +425,7 @@ router.get('/non-responders', requireAuth, requireRole('admin'), async (req, res
 // from THIS delivery week, shaped for the "Add Order" picker grid: every
 // recipe the chef marked live per block in the Weekly Recipe Plan, each
 // offered in all 5 standing formats (Regular/Large/High Protein/Low
-// Carb/1 Pound) priced from CATEGORY_PRICES -- plus standing Breakfast
+// Carb/1 Pound) priced from plate_formats (editable in Operations Hub) -- plus standing Breakfast
 // items that have actually been ordered before (keeps stale/test menu
 // entries with no real order history out of the Breakfast list).
 //
@@ -539,14 +539,16 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
     const { customerId, customerName, mealName, category, quantity, dayOfWeek, notes, price: submittedPrice } = req.body;
 
     // Sides/sauces are add-ons whose real price depends on how many others
-    // are already in that day's order (sides: first 2 free; sauces: first 1
-    // free; every one after that is +$2.50) -- same reasoning as
-    // publicOrdering.js. CATEGORY_PRICES can't represent that, so for these
-    // two formats only, trust the admin picker's computed price, clamped to
-    // exactly one of the two legitimate values.
+    // are already in that day's order (free allowance, then a configured
+    // extra price per addon type -- see plate_formats/addon_rules in
+    // Operations Hub) -- same reasoning as publicOrdering.js. A flat
+    // category price can't represent that, so for these two formats only,
+    // trust the admin picker's computed price, clamped to exactly one of
+    // this specific addon type's two legitimate values.
     if (ADD_ON_FORMATS.includes(category)) {
+      const addonPricing = await getAddonPricing();
       const clean = Number(submittedPrice);
-      if (clean !== ADD_ON_FREE_PRICE && clean !== ADD_ON_EXTRA_PRICE) {
+      if (clean !== addonPricing[category].freePrice && clean !== addonPricing[category].extraPrice) {
         return res.status(400).json({ error: 'invalid add-on price' });
       }
     }

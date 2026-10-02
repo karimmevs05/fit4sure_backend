@@ -8,17 +8,16 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
 const {
-  RECIPE_FORMATS,
   SIDE_FORMAT,
   SAUCE_ADDON_FORMAT,
   ADD_ON_FORMATS,
-  ADD_ON_FREE_PRICE,
-  ADD_ON_EXTRA_PRICE,
+  getAddonPricing,
   findOrCreateMenu,
   findOrCreateCustomerByContact,
   getWeeklyMenu,
 } = require('../services/orderingService');
 const { createOrderCheckoutSession } = require('../services/stripeService');
+const { getRecipeFormatLabels } = require('../services/plateConfig');
 
 // GET /api/public/menu - same shape as the admin picker's weekly-menu, no auth.
 router.get('/menu', async (req, res) => {
@@ -69,6 +68,8 @@ router.post('/orders', async (req, res) => {
       monday: new Set(menu.monday.map((r) => r.name)),
       thursday: new Set(menu.thursday.map((r) => r.name)),
     };
+    const recipeFormatLabels = await getRecipeFormatLabels();
+    const addonPricing = await getAddonPricing();
 
     const customerId = await findOrCreateCustomerByContact({ name: cleanName, phone: cleanPhone, email, address, smsConsent });
     if (!customerId) return res.status(500).json({ error: 'Could not resolve customer' });
@@ -83,19 +84,20 @@ router.post('/orders', async (req, res) => {
       const recipeName = (item.recipeName || '').trim();
 
       if (!['monday', 'thursday'].includes(day)) { errors.push({ item, reason: 'invalid day' }); continue; }
-      if (!RECIPE_FORMATS.includes(format) && format !== SIDE_FORMAT && format !== SAUCE_ADDON_FORMAT) { errors.push({ item, reason: 'invalid format' }); continue; }
+      if (!recipeFormatLabels.includes(format) && format !== SIDE_FORMAT && format !== SAUCE_ADDON_FORMAT) { errors.push({ item, reason: 'invalid format' }); continue; }
       if (!quantity || quantity <= 0) { errors.push({ item, reason: 'invalid quantity' }); continue; }
       if (!recipeName || !liveRecipesByDay[day].has(recipeName)) { errors.push({ item, reason: 'recipe is not on this week\'s live menu' }); continue; }
 
-      // Sides/sauces are add-ons whose real price depends on tap order within
-      // this specific plate (sides: first 2 free; sauces: first 1 free;
-      // every one after that is +$2.50) -- that can't be looked up from the
-      // fixed CATEGORY_PRICES table, so for these two formats only, trust
-      // the client's submitted price, but strictly clamp it to one of the
-      // two legitimate values first.
+      // Sides/sauces are add-ons whose real price depends on tap order
+      // within this specific plate (free allowance, then a configured extra
+      // price per addon type -- see plate_formats/addon_rules in Operations
+      // Hub) -- that can't be looked up from the fixed format-price table,
+      // so for these two formats only, trust the client's submitted price,
+      // but strictly clamp it to one of this specific addon type's two
+      // legitimate values first.
       if (ADD_ON_FORMATS.includes(format)) {
         const submittedPrice = Number(item.price);
-        if (submittedPrice !== ADD_ON_FREE_PRICE && submittedPrice !== ADD_ON_EXTRA_PRICE) {
+        if (submittedPrice !== addonPricing[format].freePrice && submittedPrice !== addonPricing[format].extraPrice) {
           errors.push({ item, reason: 'invalid add-on price' });
           continue;
         }
