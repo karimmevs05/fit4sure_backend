@@ -536,7 +536,7 @@ router.post('/sync-google-sheets', requireAuth, requireRole('admin'), async (req
 // for a non-responding customer)
 router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { customerId, customerName, mealName, category, quantity, dayOfWeek, notes, price: submittedPrice } = req.body;
+    const { customerId, customerName, mealName, category, quantity, dayOfWeek, notes, price: submittedPrice, recipeId } = req.body;
 
     // Sides/sauces are add-ons whose real price depends on how many others
     // are already in that day's order (free allowance, then a configured
@@ -554,7 +554,12 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
     }
 
     const resolvedCustomerId = customerId || await findOrCreateCustomer(customerName);
-    const menuId = await findOrCreateMenu(mealName, category);
+    // recipeId (when the admin order picker has one, i.e. picking from this
+    // week's live menu rather than a free-text manual entry) lets
+    // findOrCreateMenu check for a per-recipe price override -- same
+    // "only affects a genuinely new menus row" caveat as the shared
+    // standard price (see orderingService.js).
+    const menuId = await findOrCreateMenu(mealName, category, recipeId);
 
     if (!resolvedCustomerId || !menuId || !quantity) {
       return res.status(400).json({ error: 'customer, meal, and quantity are required' });

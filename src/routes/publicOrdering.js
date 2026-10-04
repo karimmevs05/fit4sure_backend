@@ -64,9 +64,13 @@ router.post('/orders', async (req, res) => {
     if (!menu.menuReady) {
       return res.status(403).json({ error: "This week's menu hasn't been published yet -- check back soon to order." });
     }
+    // Maps name -> recipeId (not just a Set of names) so a per-recipe price
+    // override (recipe_format_overrides) can be resolved server-side from
+    // the already-validated recipe name -- never trust a client-submitted
+    // recipeId directly.
     const liveRecipesByDay = {
-      monday: new Set(menu.monday.map((r) => r.name)),
-      thursday: new Set(menu.thursday.map((r) => r.name)),
+      monday: new Map(menu.monday.map((r) => [r.name, r.recipeId])),
+      thursday: new Map(menu.thursday.map((r) => [r.name, r.recipeId])),
     };
     const recipeFormatLabels = await getRecipeFormatLabels();
     const addonPricing = await getAddonPricing();
@@ -104,7 +108,8 @@ router.post('/orders', async (req, res) => {
       }
 
       try {
-        const menuId = await findOrCreateMenu(recipeName, format);
+        const recipeId = liveRecipesByDay[day].get(recipeName);
+        const menuId = await findOrCreateMenu(recipeName, format, recipeId);
         let totalPrice;
         if (ADD_ON_FORMATS.includes(format)) {
           totalPrice = Number(item.price) * quantity;

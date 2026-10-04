@@ -52,7 +52,15 @@ function guessByTheLbType(name) {
 }
 
 // Find an existing menu matching (name, category), or create one.
-async function findOrCreateMenu(name, category) {
+// `recipeId`, when known, is checked against recipe_format_overrides before
+// falling back to the shared standard price -- but ONLY on first creation
+// of this exact (name, category) menus row, same limitation the shared
+// plate_formats prices already have: a menus row's price is set once and
+// never recomputed afterward (see migrations/create_plate_config.sql), so
+// an override set AFTER "this recipe in this format" has already been
+// ordered once has no effect on that existing row, only on a genuinely new
+// one.
+async function findOrCreateMenu(name, category, recipeId) {
   const cleanName = (name || '').trim();
   const cleanCategory = (category || '').trim();
   if (!cleanName) return null;
@@ -68,8 +76,13 @@ async function findOrCreateMenu(name, category) {
     const byThePoundPrices = await plateConfig.getByThePoundPrices();
     price = byThePoundPrices[guessByTheLbType(cleanName)] ?? null;
   } else {
-    const categoryPrices = await plateConfig.getCategoryPrices();
-    price = categoryPrices[cleanCategory] ?? null;
+    const overridePrice = await plateConfig.getOverridePriceForRecipe(recipeId, cleanCategory);
+    if (overridePrice != null) {
+      price = overridePrice;
+    } else {
+      const categoryPrices = await plateConfig.getCategoryPrices();
+      price = categoryPrices[cleanCategory] ?? null;
+    }
   }
 
   const created = await db.query(
@@ -220,6 +233,12 @@ async function getWeeklyMenu() {
   const macrosByRecipe = await getPerPoundMacrosByRecipe(planResult.rows.map((r) => r.recipe_id));
   const recipeFormatLabels = await plateConfig.getRecipeFormatLabels();
   const categoryPrices = await plateConfig.getCategoryPrices();
+  // Per-recipe price overrides (recipe_format_overrides) -- "mostly comes
+  // as standard unless checked and changed" in the admin panel. Only
+  // affects price here; portion sizes for recipe-servings math are
+  // overridden separately, at the point a specific recipe is being edited
+  // (see adminRecipes.js / Recipes.tsx), not in this shared weekly-menu view.
+  const overridesByRecipe = await plateConfig.getOverridesForRecipes(planResult.rows.map((r) => r.recipe_id));
 
   const buildBlock = (block) =>
     planResult.rows
@@ -229,11 +248,14 @@ async function getWeeklyMenu() {
         name: r.name,
         category: r.category,
         perPound: macrosByRecipe[r.recipe_id] || null,
-        formats: recipeFormatLabels.map((label) => ({
-          id: label.toLowerCase().replace(/\s+/g, ''),
-          label,
-          price: categoryPrices[label],
-        })),
+        formats: recipeFormatLabels.map((label) => {
+          const override = overridesByRecipe[`${r.recipe_id}:${label}`];
+          return {
+            id: label.toLowerCase().replace(/\s+/g, ''),
+            label,
+            price: override ? override.priceCents / 100 : categoryPrices[label],
+          };
+        }),
       }));
 
   const monday = buildBlock('monday');

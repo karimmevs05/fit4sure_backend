@@ -12,6 +12,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
+const plateConfig = require('../../services/plateConfig');
 
 // GET /api/admin/plate-config -- everything the editor needs in one call.
 router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
@@ -158,6 +159,74 @@ router.put('/addons', requireAuth, requireRole('admin'), async (req, res) => {
     res.status(500).json({ error: 'Failed to update addon rules' });
   } finally {
     client.release();
+  }
+});
+
+// GET /recipe-overrides/:recipeId -- every format for one recipe, each
+// merged with the shared standard (so the UI can show "standard" as a
+// placeholder/fallback and whether a custom value is currently active).
+// "Mostly comes as standard unless checked and changed" -- a recipe with no
+// override rows at all just returns active: null for every format.
+router.get('/recipe-overrides/:recipeId', requireAuth, requireRole('admin'), async (req, res) => {
+  const recipeId = Number(req.params.recipeId);
+  if (!Number.isInteger(recipeId)) {
+    return res.status(400).json({ error: 'recipeId must be an integer' });
+  }
+  try {
+    const overrides = await plateConfig.getRecipeOverrides(recipeId);
+    res.json({ data: overrides });
+  } catch (error) {
+    console.error('Error fetching recipe overrides:', error);
+    res.status(500).json({ error: 'Failed to fetch recipe overrides' });
+  }
+});
+
+// PUT /recipe-overrides/:recipeId -- bulk upsert every format's override
+// state for one recipe. Body: { overrides: [{ format_key, protein_oz,
+// carbs_g, veggies_g, price_cents, active }] }. `active: false` keeps the
+// row (not deleted) so unchecking then rechecking later restores the last
+// custom value instead of losing it -- only rows with active = true are
+// ever honored by real pricing (getWeeklyMenu, findOrCreateMenu).
+router.put('/recipe-overrides/:recipeId', requireAuth, requireRole('admin'), async (req, res) => {
+  const recipeId = Number(req.params.recipeId);
+  if (!Number.isInteger(recipeId)) {
+    return res.status(400).json({ error: 'recipeId must be an integer' });
+  }
+  const { overrides } = req.body;
+  if (!Array.isArray(overrides) || overrides.length === 0) {
+    return res.status(400).json({ error: 'overrides array is required' });
+  }
+  for (const o of overrides) {
+    if (typeof o.format_key !== 'string' || !o.format_key) {
+      return res.status(400).json({ error: 'Each override needs a format_key' });
+    }
+    if (!Number.isInteger(o.price_cents) || o.price_cents <= 0) {
+      return res.status(400).json({ error: `${o.format_key}: price_cents must be a positive integer (cents, not dollars)` });
+    }
+    for (const field of ['protein_oz', 'carbs_g', 'veggies_g']) {
+      if (typeof o[field] !== 'number' || o[field] < 0) {
+        return res.status(400).json({ error: `${o.format_key}: ${field} must be a non-negative number` });
+      }
+    }
+  }
+
+  try {
+    await plateConfig.upsertRecipeOverrides(
+      recipeId,
+      overrides.map((o) => ({
+        formatKey: o.format_key,
+        proteinOz: o.protein_oz,
+        carbsG: o.carbs_g,
+        veggiesG: o.veggies_g,
+        priceCents: o.price_cents,
+        active: !!o.active,
+      }))
+    );
+    const updated = await plateConfig.getRecipeOverrides(recipeId);
+    res.json({ data: updated });
+  } catch (error) {
+    console.error('Error updating recipe overrides:', error);
+    res.status(500).json({ error: 'Failed to update recipe overrides' });
   }
 });
 

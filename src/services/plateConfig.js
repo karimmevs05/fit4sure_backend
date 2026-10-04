@@ -86,4 +86,122 @@ async function getAddonRules() {
   return rules;
 }
 
-module.exports = { getPlateFormats, getCategoryPrices, getRecipeFormatLabels, getByThePoundPrices, getAddonRules };
+// Per-recipe overrides on top of the shared standard above
+// (migrations/create_recipe_format_overrides.sql) -- "mostly comes as
+// standard unless checked and changed" per the business requirement this
+// was built for. A recipe defaults to the shared plate_formats price/
+// portion sizes everywhere unless an active override row exists for that
+// (recipe_id, format) pair.
+
+// Bulk lookup for getWeeklyMenu() -- { "<recipeId>:<formatLabel>": {...} }
+// for every ACTIVE override among the given recipe ids. Keyed by format
+// LABEL (not the DB's format_key slug) since that's what callers building
+// a recipe's formats[] array already have on hand.
+async function getOverridesForRecipes(recipeIds) {
+  if (!recipeIds || recipeIds.length === 0) return {};
+  const formats = await getPlateFormats();
+  const labelByKey = Object.fromEntries(formats.map((f) => [f.key, f.label]));
+  const result = await db.query(
+    `SELECT recipe_id, format_key, protein_oz, carbs_g, veggies_g, price_cents
+     FROM recipe_format_overrides WHERE recipe_id = ANY($1) AND active = true`,
+    [recipeIds]
+  );
+  const map = {};
+  for (const row of result.rows) {
+    const label = labelByKey[row.format_key];
+    if (!label) continue;
+    map[`${row.recipe_id}:${label}`] = {
+      proteinOz: parseFloat(row.protein_oz),
+      carbsG: parseFloat(row.carbs_g),
+      veggiesG: parseFloat(row.veggies_g),
+      priceCents: row.price_cents,
+    };
+  }
+  return map;
+}
+
+// For the admin panel: every format for ONE recipe, each merged with the
+// shared standard so the UI can show what "standard" means here and
+// whether a custom value is currently active -- one row per format,
+// always present even if no override has ever been saved for it.
+async function getRecipeOverrides(recipeId) {
+  const formats = await getPlateFormats();
+  const result = await db.query(
+    `SELECT format_key, protein_oz, carbs_g, veggies_g, price_cents, active
+     FROM recipe_format_overrides WHERE recipe_id = $1`,
+    [recipeId]
+  );
+  const overrideByKey = Object.fromEntries(result.rows.map((r) => [r.format_key, r]));
+  return formats.map((f) => {
+    const o = overrideByKey[f.key];
+    return {
+      formatKey: f.key,
+      formatLabel: f.label,
+      standard: { proteinOz: f.proteinOz, carbsG: f.carbsG, veggiesG: f.veggiesG, priceCents: f.priceCents },
+      override: o
+        ? {
+            proteinOz: parseFloat(o.protein_oz),
+            carbsG: parseFloat(o.carbs_g),
+            veggiesG: parseFloat(o.veggies_g),
+            priceCents: o.price_cents,
+            active: o.active,
+          }
+        : null,
+    };
+  });
+}
+
+// Upsert every format's override state for one recipe in one transaction.
+// `active: false` still keeps the row (rather than deleting it) so a
+// previously-entered custom value isn't lost if staff uncheck then recheck
+// later -- every consumer (getOverridesForRecipes, findOrCreateMenu) only
+// ever honors rows where active = true.
+async function upsertRecipeOverrides(recipeId, overrides) {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    for (const o of overrides) {
+      await client.query(
+        `INSERT INTO recipe_format_overrides (recipe_id, format_key, protein_oz, carbs_g, veggies_g, price_cents, active)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (recipe_id, format_key)
+         DO UPDATE SET protein_oz = $3, carbs_g = $4, veggies_g = $5, price_cents = $6, active = $7, updated_at = NOW()`,
+        [recipeId, o.formatKey, o.proteinOz, o.carbsG, o.veggiesG, o.priceCents, o.active]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Single-recipe-format lookup for findOrCreateMenu (the point a real
+// `menus.price` row actually gets set) -- returns the override price in
+// dollars if an active one exists for this exact recipe+format label,
+// otherwise null so the caller falls back to the shared standard.
+async function getOverridePriceForRecipe(recipeId, formatLabel) {
+  if (recipeId == null) return null;
+  const formats = await getPlateFormats();
+  const format = formats.find((f) => f.label === formatLabel);
+  if (!format) return null;
+  const result = await db.query(
+    `SELECT price_cents FROM recipe_format_overrides WHERE recipe_id = $1 AND format_key = $2 AND active = true`,
+    [recipeId, format.key]
+  );
+  return result.rows[0] ? result.rows[0].price_cents / 100 : null;
+}
+
+module.exports = {
+  getPlateFormats,
+  getCategoryPrices,
+  getRecipeFormatLabels,
+  getByThePoundPrices,
+  getAddonRules,
+  getOverridesForRecipes,
+  getRecipeOverrides,
+  upsertRecipeOverrides,
+  getOverridePriceForRecipe,
+};
