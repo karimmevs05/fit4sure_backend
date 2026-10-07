@@ -39,6 +39,22 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
   }
 });
 
+// GET /intake-customer-ids -- every customer who has ever submitted the
+// flyer/QR form, regardless of submission type or plan status. Backs the
+// frontend's "QR / Forms" lead-source badge -- a real, backend-driven
+// default (unlike every other lead_source value, which is a manual
+// localStorage-only tag, see the PROPOSAL-ONLY ADDITIONS comment block in
+// Customers.tsx) since this one has actual evidence behind it.
+router.get('/intake-customer-ids', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query(`SELECT DISTINCT customer_id FROM form_intakes WHERE customer_id IS NOT NULL`);
+    res.json({ data: result.rows.map((r) => r.customer_id) });
+  } catch (error) {
+    console.error('Error fetching intake customer ids:', error);
+    res.status(500).json({ error: 'Failed to fetch intake customer ids' });
+  }
+});
+
 // GET /leads-needing-plans -- the most recent full-inquiry form_intakes
 // row per customer who doesn't already have a current plan. "Full inquiry"
 // excludes grab_and_go on purpose, same distinction formIntakeService.js
