@@ -199,10 +199,12 @@ async function processSubmission({ responseId, namedValues }) {
     customerAction = existing ? 'matched_existing' : 'created';
     customerId = await findOrCreateCustomerByContact({ name, phone, email, address: null, smsConsent: marketingSmsConsent });
 
-    if (customerAction === 'matched_existing') {
-      const disagrees = await fillBlankProfileFields(customerId, answers);
-      needsReview = needsReview || disagrees;
-    }
+    // Runs for both a brand-new customer (every field is blank, so this is
+    // just the initial fill) and a returning one (only fills what's
+    // missing, flags the rest for review) -- fillBlankProfileFields' own
+    // never-overwrite check makes it safe to call either way.
+    const disagrees = await fillBlankProfileFields(customerId, answers);
+    needsReview = needsReview || disagrees;
 
     await db.query(
       `INSERT INTO customer_activities (customer_id, type, status, body, metadata)
