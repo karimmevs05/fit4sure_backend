@@ -45,7 +45,10 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
 // spreadsheet formulas that can drift from what actually happened. Tracks
 // the funnel the original campaign plan specified: submissions ->
 // contactable leads -> plans built -> plans activated -> first paid
-// orders, both overall and broken out per partner QR location.
+// orders, broken out per promo/referral code -- that's the actual
+// marketing-attribution unit (which specific flyer run/code drove this),
+// finer-grained than partner location and matching how a promo code
+// naturally ties back to a specific piece of printed material.
 router.get('/campaign-stats', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const overall = await db.query(`
@@ -77,9 +80,12 @@ router.get('/campaign-stats', requireAuth, requireRole('admin'), async (req, res
       WHERE fi.customer_id IS NOT NULL
     `);
 
-    const byLocation = await db.query(`
+    // Normalized (trimmed + uppercased) so "save10"/"Save10 "/"SAVE10" all
+    // roll up into one row -- promo codes are typed by hand on a phone
+    // keyboard, casing/whitespace drift is expected, not a real distinction.
+    const byPromoCode = await db.query(`
       SELECT
-        COALESCE(fi.source_location, 'Unknown') AS source_location,
+        COALESCE(NULLIF(UPPER(TRIM(fi.referral_code)), ''), 'No code') AS promo_code,
         COUNT(*) AS submissions,
         COUNT(*) FILTER (WHERE fi.customer_action != 'no_contact') AS contactable,
         COUNT(DISTINCT cp.source_form_intake_id) AS plans_built,
@@ -88,7 +94,7 @@ router.get('/campaign-stats', requireAuth, requireRole('admin'), async (req, res
       FROM form_intakes fi
       LEFT JOIN customer_plans cp ON cp.source_form_intake_id = fi.id
       LEFT JOIN orders o ON o.customer_id = fi.customer_id AND o.created_at >= fi.created_at
-      GROUP BY COALESCE(fi.source_location, 'Unknown')
+      GROUP BY COALESCE(NULLIF(UPPER(TRIM(fi.referral_code)), ''), 'No code')
       ORDER BY submissions DESC
     `);
 
@@ -104,7 +110,7 @@ router.get('/campaign-stats', requireAuth, requireRole('admin'), async (req, res
         ...overall.rows[0],
         ...funnel.rows[0],
         ...firstOrders.rows[0],
-        byLocation: byLocation.rows,
+        byPromoCode: byPromoCode.rows,
         byDay: byDay.rows,
       },
     });
