@@ -67,6 +67,24 @@ router.get('/leads-needing-plans', requireAuth, requireRole('admin'), async (req
   }
 });
 
+// GET /:customerId/intake -- this customer's most recent form submission,
+// full detail (every mapped field plus the raw answers), for the "resume"
+// section of their profile. Not scoped to full-inquiry/no-current-plan
+// like leads-needing-plans above -- this is "did they ever submit the
+// form at all", regardless of what's happened with their plan since.
+router.get('/:customerId/intake', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT * FROM form_intakes WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [req.params.customerId]
+    );
+    res.json({ data: result.rows[0] || null });
+  } catch (error) {
+    console.error('Error fetching customer intake:', error);
+    res.status(500).json({ error: 'Failed to fetch customer intake' });
+  }
+});
+
 // POST /from-intake/:formIntakeId -- pre-fills a draft plan from that
 // submission's answers. Always inserts a NEW draft row (never overwrites
 // an existing plan in place) so a bad pre-fill is just discarded, not a
