@@ -102,17 +102,14 @@ function normalizePhone(phone) {
 
 // Find an existing customer by phone (most reliable for repeat orders on a
 // public form -- names collide, phone numbers don't), falling back to exact
-// name. Fills in phone/email if the matched record is missing them, same
-// never-overwrite rule used everywhere else in this app. Creates a new
-// prospect if nothing matches.
-async function findOrCreateCustomerByContact({ name, phone, email, address, smsConsent }) {
+// name. Split out from findOrCreateCustomerByContact below so a caller that
+// needs to know "did this match an existing row or not" (e.g.
+// formIntakeService's created-vs-matched_existing distinction) doesn't have
+// to duplicate this matching SQL to find out.
+async function matchCustomerByContact({ name, phone }) {
   const cleanName = (name || '').trim();
-  if (!cleanName) return null;
   const normalizedPhone = normalizePhone(phone);
-  const cleanEmail = (email || '').trim() || null;
-  const cleanAddress = (address || '').trim() || null;
 
-  let existing = null;
   if (normalizedPhone) {
     // Compare the last 10 digits only, so "8137777369" and "+1 813-777-7369"
     // (stored inconsistently across manual entry / imports) still match.
@@ -123,12 +120,25 @@ async function findOrCreateCustomerByContact({ name, phone, email, address, smsC
        LIMIT 1`,
       [normalizedPhone]
     );
-    if (byPhone.rows.length > 0) existing = byPhone.rows[0];
+    if (byPhone.rows.length > 0) return byPhone.rows[0];
   }
-  if (!existing) {
+  if (cleanName) {
     const byName = await db.query(`SELECT id, phone, email, address FROM customers WHERE LOWER(name) = LOWER($1) LIMIT 1`, [cleanName]);
-    if (byName.rows.length > 0) existing = byName.rows[0];
+    if (byName.rows.length > 0) return byName.rows[0];
   }
+  return null;
+}
+
+// Fills in phone/email if the matched record is missing them, same
+// never-overwrite rule used everywhere else in this app. Creates a new
+// prospect if nothing matches.
+async function findOrCreateCustomerByContact({ name, phone, email, address, smsConsent }) {
+  const cleanName = (name || '').trim();
+  if (!cleanName) return null;
+  const cleanEmail = (email || '').trim() || null;
+  const cleanAddress = (address || '').trim() || null;
+
+  const existing = await matchCustomerByContact({ name, phone });
 
   if (existing) {
     const sets = [];
@@ -286,6 +296,7 @@ module.exports = {
   getAddonPricing,
   guessByTheLbType,
   findOrCreateMenu,
+  matchCustomerByContact,
   findOrCreateCustomerByContact,
   getWeeklyMenu,
 };
