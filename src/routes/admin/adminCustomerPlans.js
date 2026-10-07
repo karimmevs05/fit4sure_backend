@@ -39,6 +39,81 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
   }
 });
 
+// GET /campaign-stats -- real KPIs for the flyer/QR outreach campaign
+// (see fit4sure_flyer_outreach_campaign in project memory), computed live
+// from form_intakes/customer_plans/orders rather than hand-maintained
+// spreadsheet formulas that can drift from what actually happened. Tracks
+// the funnel the original campaign plan specified: submissions ->
+// contactable leads -> plans built -> plans activated -> first paid
+// orders, both overall and broken out per partner QR location.
+router.get('/campaign-stats', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const overall = await db.query(`
+      SELECT
+        COUNT(*) AS total_submissions,
+        COUNT(*) FILTER (WHERE submission_type = 'weekly_meal_prep') AS weekly_meal_prep,
+        COUNT(*) FILTER (WHERE submission_type = 'help_me_choose') AS help_me_choose,
+        COUNT(*) FILTER (WHERE submission_type = 'grab_and_go') AS grab_and_go,
+        COUNT(*) FILTER (WHERE customer_action != 'no_contact') AS contactable,
+        COUNT(*) FILTER (WHERE needs_review) AS needs_review
+      FROM form_intakes
+    `);
+
+    const funnel = await db.query(`
+      SELECT
+        COUNT(DISTINCT cp.source_form_intake_id) AS plans_built,
+        COUNT(DISTINCT cp.source_form_intake_id) FILTER (WHERE cp.activated_at IS NOT NULL) AS plans_activated
+      FROM customer_plans cp
+      WHERE cp.source_form_intake_id IS NOT NULL
+    `);
+
+    // A "first order" credits the campaign only for an order placed on or
+    // after this customer's intake -- any earlier order means they were
+    // already ordering before this submission, not a result of it.
+    const firstOrders = await db.query(`
+      SELECT COUNT(DISTINCT fi.customer_id) AS first_orders
+      FROM form_intakes fi
+      JOIN orders o ON o.customer_id = fi.customer_id AND o.created_at >= fi.created_at
+      WHERE fi.customer_id IS NOT NULL
+    `);
+
+    const byLocation = await db.query(`
+      SELECT
+        COALESCE(fi.source_location, 'Unknown') AS source_location,
+        COUNT(*) AS submissions,
+        COUNT(*) FILTER (WHERE fi.customer_action != 'no_contact') AS contactable,
+        COUNT(DISTINCT cp.source_form_intake_id) AS plans_built,
+        COUNT(DISTINCT cp.source_form_intake_id) FILTER (WHERE cp.activated_at IS NOT NULL) AS plans_activated,
+        COUNT(DISTINCT o.customer_id) AS first_orders
+      FROM form_intakes fi
+      LEFT JOIN customer_plans cp ON cp.source_form_intake_id = fi.id
+      LEFT JOIN orders o ON o.customer_id = fi.customer_id AND o.created_at >= fi.created_at
+      GROUP BY COALESCE(fi.source_location, 'Unknown')
+      ORDER BY submissions DESC
+    `);
+
+    const byDay = await db.query(`
+      SELECT date_trunc('day', created_at)::date AS day, COUNT(*) AS count
+      FROM form_intakes
+      GROUP BY 1
+      ORDER BY 1
+    `);
+
+    res.json({
+      data: {
+        ...overall.rows[0],
+        ...funnel.rows[0],
+        ...firstOrders.rows[0],
+        byLocation: byLocation.rows,
+        byDay: byDay.rows,
+      },
+    });
+  } catch (error) {
+    console.error('Error computing campaign stats:', error);
+    res.status(500).json({ error: 'Failed to compute campaign stats' });
+  }
+});
+
 // GET /intake-customer-ids -- every customer who has ever submitted the
 // flyer/QR form, regardless of submission type or plan status. Backs the
 // frontend's "QR / Forms" lead-source badge -- a real, backend-driven
