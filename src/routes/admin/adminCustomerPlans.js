@@ -51,21 +51,26 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
 // naturally ties back to a specific piece of printed material.
 router.get('/campaign-stats', requireAuth, requireRole('admin'), async (req, res) => {
   try {
+    // Every COUNT(*) is cast to ::int -- Postgres returns bigint as a
+    // string by default (node-postgres won't silently narrow it), which
+    // renders fine as plain text but breaks recharts' Bar/Line components
+    // (their scale math needs real numbers, not numeric strings -- bars
+    // silently compute to zero height instead of erroring).
     const overall = await db.query(`
       SELECT
-        COUNT(*) AS total_submissions,
-        COUNT(*) FILTER (WHERE submission_type = 'weekly_meal_prep') AS weekly_meal_prep,
-        COUNT(*) FILTER (WHERE submission_type = 'help_me_choose') AS help_me_choose,
-        COUNT(*) FILTER (WHERE submission_type = 'grab_and_go') AS grab_and_go,
-        COUNT(*) FILTER (WHERE customer_action != 'no_contact') AS contactable,
-        COUNT(*) FILTER (WHERE needs_review) AS needs_review
+        COUNT(*)::int AS total_submissions,
+        COUNT(*) FILTER (WHERE submission_type = 'weekly_meal_prep')::int AS weekly_meal_prep,
+        COUNT(*) FILTER (WHERE submission_type = 'help_me_choose')::int AS help_me_choose,
+        COUNT(*) FILTER (WHERE submission_type = 'grab_and_go')::int AS grab_and_go,
+        COUNT(*) FILTER (WHERE customer_action != 'no_contact')::int AS contactable,
+        COUNT(*) FILTER (WHERE needs_review)::int AS needs_review
       FROM form_intakes
     `);
 
     const funnel = await db.query(`
       SELECT
-        COUNT(DISTINCT cp.source_form_intake_id) AS plans_built,
-        COUNT(DISTINCT cp.source_form_intake_id) FILTER (WHERE cp.activated_at IS NOT NULL) AS plans_activated
+        COUNT(DISTINCT cp.source_form_intake_id)::int AS plans_built,
+        COUNT(DISTINCT cp.source_form_intake_id) FILTER (WHERE cp.activated_at IS NOT NULL)::int AS plans_activated
       FROM customer_plans cp
       WHERE cp.source_form_intake_id IS NOT NULL
     `);
@@ -74,7 +79,7 @@ router.get('/campaign-stats', requireAuth, requireRole('admin'), async (req, res
     // after this customer's intake -- any earlier order means they were
     // already ordering before this submission, not a result of it.
     const firstOrders = await db.query(`
-      SELECT COUNT(DISTINCT fi.customer_id) AS first_orders
+      SELECT COUNT(DISTINCT fi.customer_id)::int AS first_orders
       FROM form_intakes fi
       JOIN orders o ON o.customer_id = fi.customer_id AND o.created_at >= fi.created_at
       WHERE fi.customer_id IS NOT NULL
@@ -86,11 +91,11 @@ router.get('/campaign-stats', requireAuth, requireRole('admin'), async (req, res
     const byPromoCode = await db.query(`
       SELECT
         COALESCE(NULLIF(UPPER(TRIM(fi.referral_code)), ''), 'No code') AS promo_code,
-        COUNT(*) AS submissions,
-        COUNT(*) FILTER (WHERE fi.customer_action != 'no_contact') AS contactable,
-        COUNT(DISTINCT cp.source_form_intake_id) AS plans_built,
-        COUNT(DISTINCT cp.source_form_intake_id) FILTER (WHERE cp.activated_at IS NOT NULL) AS plans_activated,
-        COUNT(DISTINCT o.customer_id) AS first_orders
+        COUNT(*)::int AS submissions,
+        COUNT(*) FILTER (WHERE fi.customer_action != 'no_contact')::int AS contactable,
+        COUNT(DISTINCT cp.source_form_intake_id)::int AS plans_built,
+        COUNT(DISTINCT cp.source_form_intake_id) FILTER (WHERE cp.activated_at IS NOT NULL)::int AS plans_activated,
+        COUNT(DISTINCT o.customer_id)::int AS first_orders
       FROM form_intakes fi
       LEFT JOIN customer_plans cp ON cp.source_form_intake_id = fi.id
       LEFT JOIN orders o ON o.customer_id = fi.customer_id AND o.created_at >= fi.created_at
@@ -99,7 +104,7 @@ router.get('/campaign-stats', requireAuth, requireRole('admin'), async (req, res
     `);
 
     const byDay = await db.query(`
-      SELECT date_trunc('day', created_at)::date AS day, COUNT(*) AS count
+      SELECT date_trunc('day', created_at)::date AS day, COUNT(*)::int AS count
       FROM form_intakes
       GROUP BY 1
       ORDER BY 1
