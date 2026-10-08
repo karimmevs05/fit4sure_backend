@@ -311,23 +311,88 @@ function extractDriveFileId(input) {
   return null
 }
 
-// POST /api/admin/marketing/resolve-drive-link { url } -- "Create piece" ->
-// "Link from Drive": accepts a pasted Google Drive share link (or a bare
-// file ID) for a photo that lives anywhere the service account has been
-// shared access to -- not limited to the one synced Marketing folder.
-router.post('/resolve-drive-link', requireAuth, requireRole('admin'), async (req, res) => {
-  try {
-    const fileId = extractDriveFileId(req.body.url)
-    if (!fileId) return res.status(400).json({ error: "Couldn't find a Drive file ID in that link" })
+// A pasted link that isn't a Drive share link (Canva's "Download" export
+// link, any other direct image host) -- fetched and stored the same way
+// /upload-photo stores a base64 upload, so once resolved it's a durable
+// local copy, not a live dependency on the link staying up. Admin-only
+// route, but still guards against the standard SSRF shape (an internal/
+// private address passed as the "image" URL) since the fetch target is
+// fully attacker-controlled input.
+const dns = require('dns').promises
+const net = require('net')
 
-    const meta = await getFileMetadata(fileId)
-    if (!meta.mimeType || !meta.mimeType.startsWith('image/')) {
-      return res.status(400).json({ error: 'That Drive file is not an image' })
+async function assertPublicHttpUrl(rawUrl) {
+  let parsed
+  try {
+    parsed = new URL(rawUrl)
+  } catch {
+    throw new Error('Not a valid URL')
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Only http/https links are supported')
+  }
+  const { address } = await dns.lookup(parsed.hostname)
+  if (
+    net.isIP(address) &&
+    (address === '127.0.0.1' || address === '::1' ||
+      /^10\./.test(address) || /^192\.168\./.test(address) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(address) || /^169\.254\./.test(address))
+  ) {
+    throw new Error('That address is not reachable')
+  }
+  return parsed
+}
+
+async function fetchAndStoreImageUrl(rawUrl) {
+  const parsed = await assertPublicHttpUrl(rawUrl)
+  const response = await fetch(parsed.toString(), { redirect: 'follow' })
+  if (!response.ok) throw new Error(`Link returned ${response.status}`)
+  const contentType = response.headers.get('content-type') || ''
+  if (!contentType.startsWith('image/')) throw new Error('That link is not a direct image file')
+
+  const arrayBuffer = await response.arrayBuffer()
+  if (arrayBuffer.byteLength > 15 * 1024 * 1024) throw new Error('Image is too large (15MB max)')
+  const buffer = Buffer.from(arrayBuffer)
+
+  const filename = decodeURIComponent(parsed.pathname.split('/').pop() || 'linked-image')
+  const result = await db.query(
+    'INSERT INTO marketing_uploaded_photos (mime_type, data, filename) VALUES ($1, $2, $3) RETURNING id',
+    [contentType, buffer, filename]
+  )
+  return { file_id: `local:${result.rows[0].id}`, filename }
+}
+
+// POST /api/admin/marketing/resolve-drive-link { url } -- "Create piece" ->
+// "Link": accepts a pasted Google Drive share link (or a bare file ID) for
+// a photo that lives anywhere the service account has been shared access
+// to, OR any other direct image URL (Canva's "Download" export link, etc)
+// -- tries Drive first since that's the common case and needs no network
+// fetch of its own, falls back to fetching the URL directly otherwise.
+router.post('/resolve-drive-link', requireAuth, requireRole('admin'), async (req, res) => {
+  const url = req.body.url
+  const fileId = extractDriveFileId(url)
+
+  if (fileId) {
+    try {
+      const meta = await getFileMetadata(fileId)
+      if (!meta.mimeType || !meta.mimeType.startsWith('image/')) {
+        return res.status(400).json({ error: 'That Drive file is not an image' })
+      }
+      return res.json({ success: true, data: { file_id: meta.id, filename: meta.name } })
+    } catch (error) {
+      console.error('Error resolving Drive link:', error)
+      // Falls through to the generic-URL path below -- a non-Drive link
+      // that merely contains something matching the file-ID pattern
+      // shouldn't be rejected just because it obviously isn't on Drive.
     }
-    res.json({ success: true, data: { file_id: meta.id, filename: meta.name } })
+  }
+
+  try {
+    const data = await fetchAndStoreImageUrl(url)
+    res.json({ success: true, data })
   } catch (error) {
-    console.error('Error resolving Drive link:', error)
-    res.status(400).json({ error: "Couldn't access that Drive file -- make sure it's shared with fit4sure-drive-access@fit4sure.iam.gserviceaccount.com" })
+    console.error('Error resolving image link:', error)
+    res.status(400).json({ error: error.message || "Couldn't access that link -- make sure it's a direct link to an image" })
   }
 })
 
