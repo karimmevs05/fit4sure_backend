@@ -25,16 +25,24 @@ async function getNextWeekDates() {
 // Monday that's already in the past relative to what was actually clicked.
 // Thursday is always 3 days after that resolved Monday, Sunday 1 day
 // before it, same relationship getNextWeekDates/getCurrentWeekDates use.
+// Built with LOCAL date components throughout (not UTC) -- node-postgres
+// returns `date` columns as Date objects at LOCAL midnight (confirmed:
+// SELECT '2026-12-06'::date comes back as local-midnight, not
+// 2026-12-06T00:00:00Z), and reuses those same local getters when a Date
+// object is sent back as a query parameter. A UTC-constructed Date here
+// would round-trip to the WRONG calendar day the moment the server isn't
+// running in UTC -- which this one isn't.
 function getWeekDatesFor(targetDate) {
-  const picked = new Date(`${targetDate}T00:00:00Z`);
-  const day = picked.getUTCDay(); // 0=Sun..6=Sat
+  const [y, m, d] = targetDate.split('-').map(Number);
+  const picked = new Date(y, m - 1, d);
+  const day = picked.getDay(); // 0=Sun..6=Sat
   const daysUntilMonday = (1 - day + 7) % 7;
   const monday = new Date(picked);
-  monday.setUTCDate(picked.getUTCDate() + daysUntilMonday);
+  monday.setDate(picked.getDate() + daysUntilMonday);
   const sundayDate = new Date(monday);
-  sundayDate.setUTCDate(monday.getUTCDate() - 1);
+  sundayDate.setDate(monday.getDate() - 1);
   const thursday = new Date(monday);
-  thursday.setUTCDate(monday.getUTCDate() + 3);
+  thursday.setDate(monday.getDate() + 3);
   return { sunday: sundayDate, monday, thursday };
 }
 
