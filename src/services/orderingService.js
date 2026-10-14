@@ -250,6 +250,26 @@ async function getWeeklyMenu() {
   // (see adminRecipes.js / Recipes.tsx), not in this shared weekly-menu view.
   const overridesByRecipe = await plateConfig.getOverridesForRecipes(planResult.rows.map((r) => r.recipe_id));
 
+  // Staff-curated plate combos (see POST /api/admin/menu-planner/plate-options)
+  // -- a protein's featured plate, if any, pre-selects its default sides on
+  // the ordering page without taking away the customer's ability to swap
+  // format or any individual side.
+  const plateOptionsResult = await db.query(
+    `SELECT po.protein_recipe_id, po.block, po.name, po.side_recipe_ids,
+            ARRAY(SELECT r.name FROM recipes r WHERE r.recipe_id = ANY(po.side_recipe_ids)) AS side_names
+     FROM weekly_plate_options po
+     WHERE po.planned_week_start = $1`,
+    [weekStart]
+  );
+  const featuredByRecipeAndBlock = {};
+  for (const po of plateOptionsResult.rows) {
+    featuredByRecipeAndBlock[`${po.protein_recipe_id}:${po.block}`] = {
+      name: po.name,
+      defaultSideRecipeIds: po.side_recipe_ids,
+      defaultSideNames: po.side_names,
+    };
+  }
+
   const buildBlock = (block) =>
     planResult.rows
       .filter((r) => r.block === block)
@@ -266,6 +286,7 @@ async function getWeeklyMenu() {
             price: override ? override.priceCents / 100 : categoryPrices[label],
           };
         }),
+        featuredPlate: featuredByRecipeAndBlock[`${r.recipe_id}:${block}`] || null,
       }));
 
   const monday = buildBlock('monday');

@@ -1279,4 +1279,73 @@ router.put('/store-addresses/:store', requireAuth, requireRole('admin'), async (
   }
 });
 
+// Staff-curated plate combos (protein + default sides) for a week/block --
+// see getWeeklyMenu() in orderingService.js for how these surface to
+// customers as a featured, still-customizable recommendation.
+router.get('/plate-options', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { sunday } = req.query.week_start
+      ? await getWeekDatesFor(req.query.week_start)
+      : await getNextWeekDates();
+    const result = await db.query(
+      `SELECT po.id, po.block, po.name, po.side_recipe_ids, po.protein_recipe_id,
+              pr.name AS protein_name
+       FROM weekly_plate_options po
+       JOIN recipes pr ON pr.recipe_id = po.protein_recipe_id
+       WHERE po.planned_week_start = $1
+       ORDER BY po.block, po.id`,
+      [sunday]
+    );
+    const sideIds = [...new Set(result.rows.flatMap((r) => r.side_recipe_ids))];
+    const sideNamesResult = sideIds.length > 0
+      ? await db.query(`SELECT recipe_id, name FROM recipes WHERE recipe_id = ANY($1::int[])`, [sideIds])
+      : { rows: [] };
+    const sideNameById = Object.fromEntries(sideNamesResult.rows.map((r) => [r.recipe_id, r.name]));
+
+    res.json({
+      data: result.rows.map((r) => ({
+        id: r.id,
+        block: r.block,
+        name: r.name,
+        proteinRecipeId: r.protein_recipe_id,
+        proteinName: r.protein_name,
+        sides: r.side_recipe_ids.map((id) => ({ recipeId: id, name: sideNameById[id] || 'Unknown' })),
+      })),
+    });
+  } catch (error) {
+    console.error('Error fetching plate options:', error);
+    res.status(500).json({ error: 'Failed to fetch plate options' });
+  }
+});
+
+router.post('/plate-options', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { block, protein_recipe_id, side_recipe_ids, name, week_start } = req.body;
+    if (!block || !protein_recipe_id) {
+      return res.status(400).json({ error: 'block and protein_recipe_id are required' });
+    }
+    const { sunday } = week_start ? await getWeekDatesFor(week_start) : await getNextWeekDates();
+    const result = await db.query(
+      `INSERT INTO weekly_plate_options (planned_week_start, block, protein_recipe_id, name, side_recipe_ids)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [sunday, block, protein_recipe_id, name || null, side_recipe_ids || []]
+    );
+    res.status(201).json({ data: { id: result.rows[0].id } });
+  } catch (error) {
+    console.error('Error creating plate option:', error);
+    res.status(500).json({ error: 'Failed to create plate option' });
+  }
+});
+
+router.delete('/plate-options/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    await db.query('DELETE FROM weekly_plate_options WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting plate option:', error);
+    res.status(500).json({ error: 'Failed to delete plate option' });
+  }
+});
+
 module.exports = router;
