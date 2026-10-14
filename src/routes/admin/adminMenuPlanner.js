@@ -17,20 +17,24 @@ async function getNextWeekDates() {
   return { sunday: sundayDate, monday, thursday };
 }
 
-// Same Sunday-anchored boundary, but for whatever week a caller actually
-// wants to target -- normalizes any date inside that week to its Sunday,
-// same way getNextWeekDates/getCurrentWeekDates do, so a chef picking any
-// day in a date input always lands on the correct week's draft regardless
-// of which day of that week they happened to click.
-async function getWeekDatesFor(targetDate) {
-  const result = await db.query(
-    `SELECT (date_trunc('week', $1::date + interval '1 day') - interval '1 day')::date AS sunday`,
-    [targetDate]
-  );
-  const sunday = result.rows[0].sunday;
-  const sundayDate = new Date(sunday);
-  const monday = new Date(sundayDate); monday.setDate(sundayDate.getDate() + 1);
-  const thursday = new Date(sundayDate); thursday.setDate(sundayDate.getDate() + 4);
+// For whatever date a chef actually picks -- the following Mon/Thu
+// structure, not whichever Sun-Sat calendar week the picked date happens
+// to fall in. Projects FORWARD to the next Monday on/after the picked
+// date (inclusive, so picking a Monday itself targets that same Monday)
+// -- picking a date mid-week (e.g. a Wednesday) must never resolve to a
+// Monday that's already in the past relative to what was actually clicked.
+// Thursday is always 3 days after that resolved Monday, Sunday 1 day
+// before it, same relationship getNextWeekDates/getCurrentWeekDates use.
+function getWeekDatesFor(targetDate) {
+  const picked = new Date(`${targetDate}T00:00:00Z`);
+  const day = picked.getUTCDay(); // 0=Sun..6=Sat
+  const daysUntilMonday = (1 - day + 7) % 7;
+  const monday = new Date(picked);
+  monday.setUTCDate(picked.getUTCDate() + daysUntilMonday);
+  const sundayDate = new Date(monday);
+  sundayDate.setUTCDate(monday.getUTCDate() - 1);
+  const thursday = new Date(monday);
+  thursday.setUTCDate(monday.getUTCDate() + 3);
   return { sunday: sundayDate, monday, thursday };
 }
 
@@ -866,9 +870,15 @@ async function syncProcurementTask(block, sunday, ingredientsByStore) {
 // across every selected recipe in both blocks -- so "how much chicken
 // breast do I need this week" has one answer, not one per recipe. Cost is
 // computed the same way and rolled up per block for the financials view.
+// ?week_start=YYYY-MM-DD targets a specific week, same resolution as
+// GET/POST /recipe-plan and /publish -- so Shopping List/Financials below
+// the block cards reflect whichever week is actually being edited, not
+// always "next week" regardless of what's on screen above them.
 router.get('/prep-and-financials', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { sunday } = await getNextWeekDates();
+    const { sunday } = req.query.week_start
+      ? await getWeekDatesFor(req.query.week_start)
+      : await getNextWeekDates();
 
     const planResult = await db.query(
       `SELECT wrp.recipe_id, wrp.block, wrp.expected_volume, r.name AS recipe_name
@@ -938,12 +948,14 @@ router.get('/prep-and-financials', requireAuth, requireRole('admin'), async (req
             name: ing.name,
             category: ing.category,
             neededG: 0,
+            neededGByBlock: { monday: 0, thursday: 0 },
             unitPriceCents: ing.unitPriceCents,
             currentStockG: ing.currentStockG,
             store: ing.store,
           };
         }
         ingredientTotals[ing.inventoryId].neededG += ing.neededG;
+        ingredientTotals[ing.inventoryId].neededGByBlock[r.block] += ing.neededG;
       }
     }
 
@@ -970,6 +982,10 @@ router.get('/prep-and-financials', requireAuth, requireRole('admin'), async (req
         ...i,
         neededG: Math.round(i.neededG),
         shortfallG: Math.max(0, Math.round(i.neededG - i.currentStockG)),
+        neededGByBlock: {
+          monday: Math.round(i.neededGByBlock.monday),
+          thursday: Math.round(i.neededGByBlock.thursday),
+        },
       }))
       .sort((a, b) => b.neededG - a.neededG);
 
