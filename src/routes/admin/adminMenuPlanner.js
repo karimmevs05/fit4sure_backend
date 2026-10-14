@@ -17,6 +17,23 @@ async function getNextWeekDates() {
   return { sunday: sundayDate, monday, thursday };
 }
 
+// Same Sunday-anchored boundary, but for whatever week a caller actually
+// wants to target -- normalizes any date inside that week to its Sunday,
+// same way getNextWeekDates/getCurrentWeekDates do, so a chef picking any
+// day in a date input always lands on the correct week's draft regardless
+// of which day of that week they happened to click.
+async function getWeekDatesFor(targetDate) {
+  const result = await db.query(
+    `SELECT (date_trunc('week', $1::date + interval '1 day') - interval '1 day')::date AS sunday`,
+    [targetDate]
+  );
+  const sunday = result.rows[0].sunday;
+  const sundayDate = new Date(sunday);
+  const monday = new Date(sundayDate); monday.setDate(sundayDate.getDate() + 1);
+  const thursday = new Date(sundayDate); thursday.setDate(sundayDate.getDate() + 4);
+  return { sunday: sundayDate, monday, thursday };
+}
+
 // Same Sunday-anchored boundary as getNextWeekDates, minus the +7 days --
 // this is the week actually live right now (what's on the plate today),
 // not the one currently being drafted for next week.
@@ -184,13 +201,18 @@ router.patch('/weekly-plan/:id', requireAuth, requireRole('admin'), async (req, 
   }
 });
 
-// Returns every published recipe for next week's planned window, joined
+// Returns every published recipe for the targeted planned window, joined
 // against whatever's already been selected for each block -- so the UI can
 // render the full recipe list with each one's checked/unchecked state and
-// expected volume in a single call.
+// expected volume in a single call. ?week_start=YYYY-MM-DD lets a chef view/
+// edit a different week's draft than the default "next week" (e.g. planning
+// two weeks ahead, or revisiting a week already in progress) -- any date
+// inside that week resolves to the same draft via getWeekDatesFor.
 router.get('/recipe-plan', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { sunday } = await getNextWeekDates();
+    const { sunday } = req.query.week_start
+      ? await getWeekDatesFor(req.query.week_start)
+      : await getNextWeekDates();
 
     const recipesResult = await db.query(`
       SELECT recipe_id, name, category
@@ -265,14 +287,17 @@ router.get('/recipe-plan', requireAuth, requireRole('admin'), async (req, res) =
 // single call -- replace-all semantics, same pattern the plate builder uses
 // for its recipe list. Body: { block: 'monday'|'thursday', selections: [{
 // recipe_id, expected_volume } | { custom_name, expected_volume, custom_calories?,
-// custom_protein_g?, custom_carbs_g?, custom_fat_g?, custom_cost_per_pound_cents? }] }.
+// custom_protein_g?, custom_carbs_g?, custom_fat_g?, custom_cost_per_pound_cents? }],
+// week_start?: 'YYYY-MM-DD' }.
 // A selection is a custom meal when it has no recipe_id -- it's identified
 // by custom_name instead, and was never in (and never gets added to) the
 // Recipes catalog. Recipes/custom meals left out of `selections` are simply
 // not live for that block; they aren't deleted anywhere else.
+// week_start targets a specific week's draft the same way GET's query param
+// does -- omit it to keep saving to the default "next week" window.
 router.post('/recipe-plan', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { block, selections } = req.body;
+    const { block, selections, week_start } = req.body;
 
     if (!['monday', 'thursday'].includes(block)) {
       return res.status(400).json({ error: "block must be 'monday' or 'thursday'" });
@@ -281,7 +306,7 @@ router.post('/recipe-plan', requireAuth, requireRole('admin'), async (req, res) 
       return res.status(400).json({ error: 'selections must be an array' });
     }
 
-    const { sunday } = await getNextWeekDates();
+    const { sunday } = week_start ? await getWeekDatesFor(week_start) : await getNextWeekDates();
 
     await db.query(
       `DELETE FROM weekly_recipe_plan WHERE block = $1 AND planned_week_start = $2`,
