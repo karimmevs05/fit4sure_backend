@@ -909,7 +909,7 @@ router.get('/prep-and-financials', requireAuth, requireRole('admin'), async (req
     const perRecipe = await Promise.all(planResult.rows.map(async (planRow) => {
       const ingResult = await db.query(
         `SELECT ri.quantity_g, i.id AS inventory_id, i.name, i.category,
-                i.unit_price_cents, i.current_stock_g, i.store
+                i.unit_price_cents, i.current_stock_g, i.store, i.grade
          FROM recipe_ingredients ri
          LEFT JOIN inventory i ON ri.inventory_id = i.id
          WHERE ri.recipe_id = $1`,
@@ -938,6 +938,7 @@ router.get('/prep-and-financials', requireAuth, requireRole('admin'), async (req
             currentStockG: parseFloat(ing.current_stock_g) || 0,
             neededG,
             store: ing.store || null,
+            grade: ing.grade || null,
           });
         }
       }
@@ -960,6 +961,7 @@ router.get('/prep-and-financials', requireAuth, requireRole('admin'), async (req
             unitPriceCents: ing.unitPriceCents,
             currentStockG: ing.currentStockG,
             store: ing.store,
+            grade: ing.grade,
           };
         }
         ingredientTotals[ing.inventoryId].neededG += ing.neededG;
@@ -1245,6 +1247,35 @@ router.delete('/plates/:id', requireAuth, requireRole('admin'), async (req, res)
   } catch (error) {
     console.error('Error deleting plate:', error);
     res.status(500).json({ error: 'Failed to delete plate' });
+  }
+});
+
+// Store addresses for the shopping list export -- set once per store name,
+// reused on every future export rather than typed out each time.
+router.get('/store-addresses', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query('SELECT store_name, address FROM store_addresses ORDER BY store_name');
+    res.json({ data: result.rows.map((r) => ({ store: r.store_name, address: r.address })) });
+  } catch (error) {
+    console.error('Error fetching store addresses:', error);
+    res.status(500).json({ error: 'Failed to fetch store addresses' });
+  }
+});
+
+router.put('/store-addresses/:store', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { address } = req.body;
+    const result = await db.query(
+      `INSERT INTO store_addresses (store_name, address, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (store_name) DO UPDATE SET address = $2, updated_at = NOW()
+       RETURNING store_name, address`,
+      [req.params.store, address || null]
+    );
+    res.json({ data: { store: result.rows[0].store_name, address: result.rows[0].address } });
+  } catch (error) {
+    console.error('Error updating store address:', error);
+    res.status(500).json({ error: 'Failed to update store address' });
   }
 });
 
