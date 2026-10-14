@@ -48,11 +48,15 @@ async function getCurrentWeekDates() {
   return { sunday: sundayDate, monday, thursday };
 }
 
-// Whether next week's plan has been explicitly published yet -- drives the
-// "Submit Menu" button's label/state on the Menu Planner page.
+// Whether the targeted week's plan has been explicitly published yet --
+// drives the "Submit Menu" button's label/state on the Menu Planner page.
+// ?week_start=YYYY-MM-DD checks a specific week (same resolution as
+// GET /recipe-plan); omit it for the default "next week" check.
 router.get('/publish-status', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { sunday } = await getNextWeekDates();
+    const { sunday } = req.query.week_start
+      ? await getWeekDatesFor(req.query.week_start)
+      : await getNextWeekDates();
     const weekStart = sunday.toISOString().slice(0, 10);
     const result = await db.query(
       'SELECT published_at FROM weekly_menu_publish_state WHERE planned_week_start = $1',
@@ -71,13 +75,21 @@ router.get('/publish-status', requireAuth, requireRole('admin'), async (req, res
   }
 });
 
-// Go-live for next week's plan -- until this is called, getWeeklyMenu()
-// (the real customer ordering page's data source) reports menuReady:false
-// regardless of what's saved in either block, so drafting/rearranging a
-// week never briefly exposes a half-built menu to real customers.
+// Go-live for the targeted week's plan -- until this is called,
+// getWeeklyMenu() (the real customer ordering page's data source) reports
+// menuReady:false for that week regardless of what's saved in either
+// block, so drafting/rearranging a week never briefly exposes a half-built
+// menu to real customers. Optional week_start in the body targets a
+// specific week the same way GET's query param does; omit it to publish
+// the default "next week". getWeeklyMenu() itself always recomputes
+// "next week" live off the current date, so publishing a week further out
+// than that has no customer-facing effect until the calendar actually
+// reaches it -- this lets a chef pre-publish several weeks ahead safely.
 router.post('/publish', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { sunday } = await getNextWeekDates();
+    const { sunday } = req.body.week_start
+      ? await getWeekDatesFor(req.body.week_start)
+      : await getNextWeekDates();
     const weekStart = sunday.toISOString().slice(0, 10);
     const result = await db.query(
       `INSERT INTO weekly_menu_publish_state (planned_week_start)
