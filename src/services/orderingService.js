@@ -273,21 +273,28 @@ async function getWeeklyMenu() {
   const buildBlock = (block) =>
     planResult.rows
       .filter((r) => r.block === block)
-      .map((r) => ({
-        recipeId: r.recipe_id,
-        name: r.name,
-        category: r.category,
-        perPound: macrosByRecipe[r.recipe_id] || null,
-        formats: recipeFormatLabels.map((label) => {
-          const override = overridesByRecipe[`${r.recipe_id}:${label}`];
-          return {
-            id: label.toLowerCase().replace(/\s+/g, ''),
-            label,
-            price: override ? override.priceCents / 100 : categoryPrices[label],
-          };
-        }),
-        featuredPlate: featuredByRecipeAndBlock[`${r.recipe_id}:${block}`] || null,
-      }));
+      .map((r) => {
+        // A breakfast-category recipe added straight to a block (vs. the
+        // separate standing Breakfast list above) still only ever sells as
+        // one flat-priced plate, never the 5 protein formats -- same
+        // Breakfast plate_formats row the admin panel prices it from.
+        const formatLabels = (r.category || '').toLowerCase() === 'breakfast' ? ['Breakfast'] : recipeFormatLabels;
+        return {
+          recipeId: r.recipe_id,
+          name: r.name,
+          category: r.category,
+          perPound: macrosByRecipe[r.recipe_id] || null,
+          formats: formatLabels.map((label) => {
+            const override = overridesByRecipe[`${r.recipe_id}:${label}`];
+            return {
+              id: label.toLowerCase().replace(/\s+/g, ''),
+              label,
+              price: override ? override.priceCents / 100 : categoryPrices[label],
+            };
+          }),
+          featuredPlate: featuredByRecipeAndBlock[`${r.recipe_id}:${block}`] || null,
+        };
+      });
 
   const monday = buildBlock('monday');
   const thursday = buildBlock('thursday');
