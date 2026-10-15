@@ -5,6 +5,25 @@ const { requireAuth, requireRole } = require('../../middleware/auth');
 const { searchUSDANutrition } = require('../../services/usdaNutrition');
 const { detectAllergens } = require('../../utils/allergenTagger');
 
+// Snaps freeform store input to an existing store's exact spelling/casing
+// when it matches one case-insensitively -- the thing that produced
+// "Costco" / "Costco Wholesale" / "sam's club" / "Sam's Club" / "Sams Club"
+// as separate shopping-list entries for the same two real stores. Used by
+// every write path that can set `store` (create, full edit, store-only
+// patch), not just one of them -- a duplicate spelling slipping in through
+// whichever path skips this is exactly how the drift came back before.
+// Empty input clears the store (NULL, not ''), so a blank entry reads the
+// same as "no store on file" everywhere else.
+async function resolveStoreName(rawStore) {
+  const trimmed = (rawStore || '').trim();
+  if (!trimmed) return null;
+  const existing = await db.query(
+    `SELECT DISTINCT store FROM inventory WHERE store IS NOT NULL AND LOWER(store) = LOWER($1) LIMIT 1`,
+    [trimmed]
+  );
+  return existing.rows.length > 0 ? existing.rows[0].store : trimmed;
+}
+
 // GET all inventory items with macro data
 router.get('/', requireAuth, async (req, res) => {
   try {
@@ -95,12 +114,13 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
     }
 
     const allergens = detectAllergens(name);
+    const resolvedStore = await resolveStoreName(store);
 
     const result = await db.query(
       `INSERT INTO inventory (name, category, unit_price_cents, serving_size_g, current_stock_g, store, grade, protein_per_100g, carbs_per_100g, fat_per_100g, calories_per_100g, usda_fdc_id, macros_source, allergens)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING *`,
-      [name, category, unit_price_cents, serving_size_g, current_stock_g || 0, store || '', grade || '', macrosData.protein_per_100g, macrosData.carbs_per_100g, macrosData.fat_per_100g, macrosData.calories_per_100g, macrosData.usda_fdc_id, macrosData.macros_source, allergens]
+      [name, category, unit_price_cents, serving_size_g, current_stock_g || 0, resolvedStore, grade || '', macrosData.protein_per_100g, macrosData.carbs_per_100g, macrosData.fat_per_100g, macrosData.calories_per_100g, macrosData.usda_fdc_id, macrosData.macros_source, allergens]
     );
 
     res.status(201).json({
@@ -159,12 +179,14 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
       }
     }
 
+    const resolvedStore = await resolveStoreName(store);
+
     const result = await db.query(
       `UPDATE inventory
        SET name = $1, category = $2, unit_price_cents = $3, serving_size_g = $4, current_stock_g = $5, store = $6, grade = $7, protein_per_100g = $8, carbs_per_100g = $9, fat_per_100g = $10, calories_per_100g = $11, macros_source = $12, allergens = $13, usda_fdc_id = COALESCE($15, usda_fdc_id)
        WHERE id = $14
        RETURNING *`,
-      [name, category, unit_price_cents, serving_size_g, current_stock_g || 0, store || '', grade || '', macrosData.protein_per_100g, macrosData.carbs_per_100g, macrosData.fat_per_100g, macrosData.calories_per_100g, macrosData.macros_source, allergens, id, macrosData.usda_fdc_id]
+      [name, category, unit_price_cents, serving_size_g, current_stock_g || 0, resolvedStore, grade || '', macrosData.protein_per_100g, macrosData.carbs_per_100g, macrosData.fat_per_100g, macrosData.calories_per_100g, macrosData.macros_source, allergens, id, macrosData.usda_fdc_id]
     );
 
     if (result.rows.length === 0) {
@@ -187,26 +209,11 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 router.patch('/:id/store', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { id } = req.params;
-    const trimmed = (req.body.store || '').trim();
-
-    // Snap to an existing store's exact spelling/casing when the trimmed
-    // input matches one case-insensitively -- the thing that produced
-    // "Costco" / "Costco Wholesale" / "sam's club" / "Sam's Club" /
-    // "Sams Club" as four different shopping-list entries for the same
-    // two real stores. Empty input clears the store (NULL, not ''), so a
-    // blank entry reads the same as "no store on file" everywhere else.
-    let store = trimmed || null;
-    if (trimmed) {
-      const existing = await db.query(
-        `SELECT DISTINCT store FROM inventory WHERE store IS NOT NULL AND LOWER(store) = LOWER($1) LIMIT 1`,
-        [trimmed]
-      );
-      if (existing.rows.length > 0) store = existing.rows[0].store;
-    }
+    const resolvedStore = await resolveStoreName(req.body.store);
 
     const result = await db.query(
       'UPDATE inventory SET store = $1 WHERE id = $2 RETURNING id, name, store',
-      [store, id]
+      [resolvedStore, id]
     );
 
     if (result.rows.length === 0) {
