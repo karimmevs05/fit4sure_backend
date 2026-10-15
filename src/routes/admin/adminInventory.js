@@ -187,11 +187,26 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 router.patch('/:id/store', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { id } = req.params;
-    const { store } = req.body;
+    const trimmed = (req.body.store || '').trim();
+
+    // Snap to an existing store's exact spelling/casing when the trimmed
+    // input matches one case-insensitively -- the thing that produced
+    // "Costco" / "Costco Wholesale" / "sam's club" / "Sam's Club" /
+    // "Sams Club" as four different shopping-list entries for the same
+    // two real stores. Empty input clears the store (NULL, not ''), so a
+    // blank entry reads the same as "no store on file" everywhere else.
+    let store = trimmed || null;
+    if (trimmed) {
+      const existing = await db.query(
+        `SELECT DISTINCT store FROM inventory WHERE store IS NOT NULL AND LOWER(store) = LOWER($1) LIMIT 1`,
+        [trimmed]
+      );
+      if (existing.rows.length > 0) store = existing.rows[0].store;
+    }
 
     const result = await db.query(
       'UPDATE inventory SET store = $1 WHERE id = $2 RETURNING id, name, store',
-      [store || '', id]
+      [store, id]
     );
 
     if (result.rows.length === 0) {
