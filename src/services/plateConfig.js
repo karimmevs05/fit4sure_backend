@@ -120,12 +120,22 @@ async function getOverridesForRecipes(recipeIds) {
   return map;
 }
 
-// For the admin panel: every format for ONE recipe, each merged with the
-// shared standard so the UI can show what "standard" means here and
-// whether a custom value is currently active -- one row per format,
-// always present even if no override has ever been saved for it.
+// For the admin panel: every format a recipe can ACTUALLY be sold in,
+// each merged with the shared standard so the UI can show what
+// "standard" means here and whether a custom value is currently active
+// -- one row per applicable format, always present even if no override
+// has ever been saved for it. Scoped the same way getWeeklyMenu()'s
+// buildBlock() scopes a real customer-facing recipe row: a breakfast-
+// category recipe only ever sells in the one Breakfast format, never the
+// 5 standard formats; everything else is the reverse (is_recipe_format
+// formats, never Breakfast). Without this, editing e.g. a protein
+// recipe's overrides showed a Breakfast row (and a breakfast recipe
+// showed all 5 standard formats) that could never actually be charged.
 async function getRecipeOverrides(recipeId) {
-  const formats = await getPlateFormats();
+  const recipeResult = await db.query('SELECT category FROM recipes WHERE recipe_id = $1', [recipeId]);
+  const isBreakfast = (recipeResult.rows[0]?.category || '').toLowerCase() === 'breakfast';
+  const allFormats = await getPlateFormats();
+  const formats = allFormats.filter((f) => (isBreakfast ? f.key === 'breakfast' : f.isRecipeFormat));
   const result = await db.query(
     `SELECT format_key, protein_oz, carbs_g, veggies_g, price_cents, active
      FROM recipe_format_overrides WHERE recipe_id = $1`,
