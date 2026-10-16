@@ -151,31 +151,33 @@ async function getRecipeOverrides(recipeId) {
   });
 }
 
-// Upsert every format's override state for one recipe in one transaction.
-// `active: false` still keeps the row (rather than deleting it) so a
-// previously-entered custom value isn't lost if staff uncheck then recheck
-// later -- every consumer (getOverridesForRecipes, findOrCreateMenu) only
-// ever honors rows where active = true.
+// Upsert every format's override state for one recipe as a single batched
+// statement (one INSERT with multiple VALUES rows) rather than one
+// round-trip per format -- this is "Save This Plate," the single most
+// frequent write in the Portions & Pricing panel, so the save-time
+// round-trip count matters here more than almost anywhere else in this
+// file. `active: false` still keeps the row (rather than deleting it) so
+// a previously-entered custom value isn't lost if staff uncheck then
+// recheck later -- every consumer (getOverridesForRecipes,
+// findOrCreateMenu) only ever honors rows where active = true.
 async function upsertRecipeOverrides(recipeId, overrides) {
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    for (const o of overrides) {
-      await client.query(
-        `INSERT INTO recipe_format_overrides (recipe_id, format_key, protein_oz, carbs_g, veggies_g, price_cents, active)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (recipe_id, format_key)
-         DO UPDATE SET protein_oz = $3, carbs_g = $4, veggies_g = $5, price_cents = $6, active = $7, updated_at = NOW()`,
-        [recipeId, o.formatKey, o.proteinOz, o.carbsG, o.veggiesG, o.priceCents, o.active]
-      );
-    }
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
+  if (overrides.length === 0) return;
+  const values = [];
+  const params = [recipeId];
+  let i = 2;
+  for (const o of overrides) {
+    values.push(`($1, $${i}, $${i + 1}, $${i + 2}, $${i + 3}, $${i + 4}, $${i + 5})`);
+    params.push(o.formatKey, o.proteinOz, o.carbsG, o.veggiesG, o.priceCents, o.active);
+    i += 6;
   }
+  await db.query(
+    `INSERT INTO recipe_format_overrides (recipe_id, format_key, protein_oz, carbs_g, veggies_g, price_cents, active)
+     VALUES ${values.join(', ')}
+     ON CONFLICT (recipe_id, format_key)
+     DO UPDATE SET protein_oz = EXCLUDED.protein_oz, carbs_g = EXCLUDED.carbs_g, veggies_g = EXCLUDED.veggies_g,
+                    price_cents = EXCLUDED.price_cents, active = EXCLUDED.active, updated_at = NOW()`,
+    params
+  );
 }
 
 // Single-recipe-format lookup for findOrCreateMenu (the point a real

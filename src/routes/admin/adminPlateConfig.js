@@ -60,30 +60,37 @@ router.put('/formats', requireAuth, requireRole('admin'), async (req, res) => {
     }
   }
 
-  const client = await db.connect();
+  // One batched statement (UPDATE ... FROM VALUES) instead of one
+  // round-trip per format -- same reasoning as upsertRecipeOverrides in
+  // plateConfig.js. Also atomic on its own, so no explicit transaction
+  // needed.
+  const values = [];
+  const params = [];
+  let i = 1;
+  for (const f of formats) {
+    values.push(`($${i}, $${i + 1}::numeric, $${i + 2}::numeric, $${i + 3}::numeric, $${i + 4}::integer, $${i + 5}::boolean, $${i + 6}::boolean)`);
+    params.push(f.key, f.protein_oz, f.carbs_g, f.veggies_g, f.price_cents, !!f.is_recipe_format, f.active !== false);
+    i += 7;
+  }
   try {
-    await client.query('BEGIN');
-    for (const f of formats) {
-      const result = await client.query(
-        `UPDATE plate_formats
-         SET protein_oz = $1, carbs_g = $2, veggies_g = $3, price_cents = $4,
-             is_recipe_format = $5, active = $6, updated_at = NOW()
-         WHERE key = $7`,
-        [f.protein_oz, f.carbs_g, f.veggies_g, f.price_cents, !!f.is_recipe_format, f.active !== false, f.key]
-      );
-      if (result.rowCount === 0) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ error: `Unknown format key: ${f.key}` });
-      }
+    const result = await db.query(
+      `UPDATE plate_formats AS pf
+       SET protein_oz = v.protein_oz, carbs_g = v.carbs_g, veggies_g = v.veggies_g,
+           price_cents = v.price_cents, is_recipe_format = v.is_recipe_format, active = v.active, updated_at = NOW()
+       FROM (VALUES ${values.join(', ')}) AS v(key, protein_oz, carbs_g, veggies_g, price_cents, is_recipe_format, active)
+       WHERE pf.key = v.key
+       RETURNING pf.key`,
+      params
+    );
+    if (result.rowCount !== formats.length) {
+      const updatedKeys = new Set(result.rows.map((r) => r.key));
+      const unknown = formats.find((f) => !updatedKeys.has(f.key));
+      return res.status(404).json({ error: `Unknown format key: ${unknown.key}` });
     }
-    await client.query('COMMIT');
     res.json({ data: { updated: formats.length } });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error('Error updating plate formats:', error);
     res.status(500).json({ error: 'Failed to update plate formats' });
-  } finally {
-    client.release();
   }
 });
 
@@ -99,27 +106,32 @@ router.put('/by-the-pound', requireAuth, requireRole('admin'), async (req, res) 
     }
   }
 
-  const client = await db.connect();
+  const values = [];
+  const params = [];
+  let i = 1;
+  for (const p of prices) {
+    values.push(`($${i}, $${i + 1}::integer)`);
+    params.push(p.category, p.price_cents);
+    i += 2;
+  }
   try {
-    await client.query('BEGIN');
-    for (const p of prices) {
-      const result = await client.query(
-        `UPDATE by_the_pound_prices SET price_cents = $1, updated_at = NOW() WHERE category = $2`,
-        [p.price_cents, p.category]
-      );
-      if (result.rowCount === 0) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ error: `Unknown category: ${p.category}` });
-      }
+    const result = await db.query(
+      `UPDATE by_the_pound_prices AS b
+       SET price_cents = v.price_cents, updated_at = NOW()
+       FROM (VALUES ${values.join(', ')}) AS v(category, price_cents)
+       WHERE b.category = v.category
+       RETURNING b.category`,
+      params
+    );
+    if (result.rowCount !== prices.length) {
+      const updatedCategories = new Set(result.rows.map((r) => r.category));
+      const unknown = prices.find((p) => !updatedCategories.has(p.category));
+      return res.status(404).json({ error: `Unknown category: ${unknown.category}` });
     }
-    await client.query('COMMIT');
     res.json({ data: { updated: prices.length } });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error('Error updating by-the-pound prices:', error);
     res.status(500).json({ error: 'Failed to update by-the-pound prices' });
-  } finally {
-    client.release();
   }
 });
 
@@ -138,27 +150,32 @@ router.put('/addons', requireAuth, requireRole('admin'), async (req, res) => {
     }
   }
 
-  const client = await db.connect();
+  const values = [];
+  const params = [];
+  let i = 1;
+  for (const r of rules) {
+    values.push(`($${i}, $${i + 1}::integer, $${i + 2}::integer)`);
+    params.push(r.key, r.free_count, r.extra_price_cents);
+    i += 3;
+  }
   try {
-    await client.query('BEGIN');
-    for (const r of rules) {
-      const result = await client.query(
-        `UPDATE addon_rules SET free_count = $1, extra_price_cents = $2, updated_at = NOW() WHERE key = $3`,
-        [r.free_count, r.extra_price_cents, r.key]
-      );
-      if (result.rowCount === 0) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ error: `Unknown addon key: ${r.key}` });
-      }
+    const result = await db.query(
+      `UPDATE addon_rules AS a
+       SET free_count = v.free_count, extra_price_cents = v.extra_price_cents, updated_at = NOW()
+       FROM (VALUES ${values.join(', ')}) AS v(key, free_count, extra_price_cents)
+       WHERE a.key = v.key
+       RETURNING a.key`,
+      params
+    );
+    if (result.rowCount !== rules.length) {
+      const updatedKeys = new Set(result.rows.map((r) => r.key));
+      const unknown = rules.find((r) => !updatedKeys.has(r.key));
+      return res.status(404).json({ error: `Unknown addon key: ${unknown.key}` });
     }
-    await client.query('COMMIT');
     res.json({ data: { updated: rules.length } });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error('Error updating addon rules:', error);
     res.status(500).json({ error: 'Failed to update addon rules' });
-  } finally {
-    client.release();
   }
 });
 
