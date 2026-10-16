@@ -7,6 +7,7 @@
 
 const db = require('../config/db');
 const plateConfig = require('./plateConfig');
+const { resolveExtraIngredients } = require('./plateExtraIngredients');
 
 // Real prices and portion sizes live in the plate_formats / by_the_pound_prices
 // / addon_rules tables now (see migrations/create_plate_config.sql and
@@ -255,7 +256,7 @@ async function getWeeklyMenu() {
   // the ordering page without taking away the customer's ability to swap
   // format or any individual side.
   const plateOptionsResult = await db.query(
-    `SELECT po.protein_recipe_id, po.block, po.name, po.side_recipe_ids,
+    `SELECT po.protein_recipe_id, po.block, po.name, po.side_recipe_ids, po.extra_ingredients,
             ARRAY(SELECT r.name FROM recipes r WHERE r.recipe_id = ANY(po.side_recipe_ids)) AS side_names
      FROM weekly_plate_options po
      WHERE po.planned_week_start = $1`,
@@ -263,10 +264,23 @@ async function getWeeklyMenu() {
   );
   const featuredByRecipeAndBlock = {};
   for (const po of plateOptionsResult.rows) {
+    // Flat extras (e.g. maple syrup on a breakfast plate, parmesan on a
+    // pasta plate) -- always included as curated, never a swappable side
+    // or a separate customer-facing add-on charge, so their macros/cost
+    // are resolved once here and just added into the plate's totals.
+    const extraIngredients = await resolveExtraIngredients(po.extra_ingredients);
     featuredByRecipeAndBlock[`${po.protein_recipe_id}:${po.block}`] = {
       name: po.name,
       defaultSideRecipeIds: po.side_recipe_ids,
       defaultSideNames: po.side_names,
+      extraIngredients: extraIngredients.map((i) => ({
+        name: i.name,
+        grams: i.grams,
+        calories: i.calories,
+        protein_g: i.protein_g,
+        carbs_g: i.carbs_g,
+        fat_g: i.fat_g,
+      })),
     };
   }
 

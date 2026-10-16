@@ -5,6 +5,7 @@ const { requireAuth, requireRole } = require('../../middleware/auth');
 const { computeYieldCorrectedRecipe } = require('./adminCookingMethods');
 const { getReceiptFallbackPriceCents } = require('../../utils/recipeCost');
 const { getCategoryPrices } = require('../../services/plateConfig');
+const { resolveExtraIngredients } = require('../../services/plateExtraIngredients');
 
 async function getNextWeekDates() {
   const result = await db.query(`
@@ -1279,16 +1280,27 @@ router.put('/store-addresses/:store', requireAuth, requireRole('admin'), async (
   }
 });
 
-// Staff-curated plate combos (protein + default sides) for a week/block --
-// see getWeeklyMenu() in orderingService.js for how these surface to
-// customers as a featured, still-customizable recommendation.
+// Keeps only well-formed { inventoryId, grams } entries -- a stray/garbled
+// item from the client silently drops rather than corrupting the whole
+// plate's extra_ingredients array or 500ing the request.
+function sanitizeExtraIngredients(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => ({ inventoryId: Number(item?.inventoryId), grams: Number(item?.grams) }))
+    .filter((item) => Number.isInteger(item.inventoryId) && item.inventoryId > 0 && item.grams > 0);
+}
+
+// Staff-curated plate combos (protein + default sides + optional flat
+// extra ingredients, e.g. maple syrup on a breakfast plate) for a
+// week/block -- see getWeeklyMenu() in orderingService.js for how these
+// surface to customers as a featured, still-customizable recommendation.
 router.get('/plate-options', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { sunday } = req.query.week_start
       ? await getWeekDatesFor(req.query.week_start)
       : await getNextWeekDates();
     const result = await db.query(
-      `SELECT po.id, po.block, po.name, po.side_recipe_ids, po.protein_recipe_id,
+      `SELECT po.id, po.block, po.name, po.side_recipe_ids, po.protein_recipe_id, po.extra_ingredients,
               pr.name AS protein_name
        FROM weekly_plate_options po
        JOIN recipes pr ON pr.recipe_id = po.protein_recipe_id
@@ -1303,14 +1315,15 @@ router.get('/plate-options', requireAuth, requireRole('admin'), async (req, res)
     const sideNameById = Object.fromEntries(sideNamesResult.rows.map((r) => [r.recipe_id, r.name]));
 
     res.json({
-      data: result.rows.map((r) => ({
+      data: await Promise.all(result.rows.map(async (r) => ({
         id: r.id,
         block: r.block,
         name: r.name,
         proteinRecipeId: r.protein_recipe_id,
         proteinName: r.protein_name,
         sides: r.side_recipe_ids.map((id) => ({ recipeId: id, name: sideNameById[id] || 'Unknown' })),
-      })),
+        extraIngredients: await resolveExtraIngredients(r.extra_ingredients),
+      }))),
     });
   } catch (error) {
     console.error('Error fetching plate options:', error);
@@ -1320,21 +1333,49 @@ router.get('/plate-options', requireAuth, requireRole('admin'), async (req, res)
 
 router.post('/plate-options', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { block, protein_recipe_id, side_recipe_ids, name, week_start } = req.body;
+    const { block, protein_recipe_id, side_recipe_ids, extra_ingredients, name, week_start } = req.body;
     if (!block || !protein_recipe_id) {
       return res.status(400).json({ error: 'block and protein_recipe_id are required' });
     }
     const { sunday } = week_start ? await getWeekDatesFor(week_start) : await getNextWeekDates();
     const result = await db.query(
-      `INSERT INTO weekly_plate_options (planned_week_start, block, protein_recipe_id, name, side_recipe_ids)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO weekly_plate_options (planned_week_start, block, protein_recipe_id, name, side_recipe_ids, extra_ingredients)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id`,
-      [sunday, block, protein_recipe_id, name || null, side_recipe_ids || []]
+      [sunday, block, protein_recipe_id, name || null, side_recipe_ids || [], JSON.stringify(sanitizeExtraIngredients(extra_ingredients))]
     );
     res.status(201).json({ data: { id: result.rows[0].id } });
   } catch (error) {
     console.error('Error creating plate option:', error);
     res.status(500).json({ error: 'Failed to create plate option' });
+  }
+});
+
+// Edits an already-saved plate in place -- same fields as creation, plus
+// the id in the URL. A customer who already added this plate to a
+// previous order isn't affected (orders snapshot what they picked at the
+// time); this only changes what the plate offers going forward.
+router.put('/plate-options/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { block, protein_recipe_id, side_recipe_ids, extra_ingredients, name } = req.body;
+    if (!block || !protein_recipe_id) {
+      return res.status(400).json({ error: 'block and protein_recipe_id are required' });
+    }
+    const result = await db.query(
+      `UPDATE weekly_plate_options
+       SET block = $1, protein_recipe_id = $2, side_recipe_ids = $3, extra_ingredients = $4, name = $5
+       WHERE id = $6
+       RETURNING id`,
+      [block, protein_recipe_id, side_recipe_ids || [], JSON.stringify(sanitizeExtraIngredients(extra_ingredients)), name || null, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Plate not found' });
+    }
+    res.json({ data: { id: result.rows[0].id } });
+  } catch (error) {
+    console.error('Error updating plate option:', error);
+    res.status(500).json({ error: 'Failed to update plate option' });
   }
 });
 
