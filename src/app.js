@@ -46,6 +46,8 @@ const publicAssetShareRoutes = require('./routes/publicAssetShare')
 const twilioRoutes = require('./routes/twilio')
 const formIntakeRoutes = require('./routes/formIntake')
 const adminCustomerPlansRoutes = require('./routes/admin/adminCustomerPlans')
+const goalsRoutes = require('./routes/admin/goals')
+const mobileOverviewRoutes = require('./routes/admin/mobileOverview')
 
 const app = express()
 
@@ -100,6 +102,8 @@ app.use('/s', publicAssetShareRoutes)
 app.use('/api/twilio', twilioRoutes)
 app.use('/api/integrations/form-intake', formIntakeRoutes)
 app.use('/api/admin/customer-plans', adminCustomerPlansRoutes)
+app.use('/api/admin/goals', goalsRoutes)
+app.use('/api/admin/mobile-overview', mobileOverviewRoutes)
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }))
 
