@@ -168,7 +168,7 @@ router.post('/scan-receipt', requireAuth, requireRole('admin'), async (req, res)
 // and always forces status='pending' + date=NOW())
 router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    const { date, vendor, category, description, amount, status, sourceType } = req.body;
+    const { date, vendor, category, description, amount, status, sourceType, taskId } = req.body;
     const validStatuses = ['pending', 'approved', 'reconciled', 'rejected'];
     const validSourceTypes = ['manual', 'scan', 'gdrive'];
 
@@ -179,11 +179,15 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
     const finalStatus = validStatuses.includes(status) ? status : 'pending';
     const finalSourceType = validSourceTypes.includes(sourceType) ? sourceType : 'manual';
 
+    // taskId is optional -- most expenses (receipt scans, Drive sync) have
+    // no task behind them. When set (the mobile quick-add cost block),
+    // this is what lets the Tasks screen show a real cost total per task
+    // instead of a free-text guess.
     const result = await db.query(
-      `INSERT INTO expenses (date, vendor, category, description, amount, status, source_type)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, date, vendor, category, description, amount, status, source_type`,
-      [date || new Date().toISOString().split('T')[0], vendor, category || 'other', description || '', amount, finalStatus, finalSourceType]
+      `INSERT INTO expenses (date, vendor, category, description, amount, status, source_type, task_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, date, vendor, category, description, amount, status, source_type, task_id`,
+      [date || new Date().toISOString().split('T')[0], vendor, category || 'other', description || '', amount, finalStatus, finalSourceType, taskId || null]
     );
 
     res.status(201).json({ success: true, data: result.rows[0] });
@@ -258,6 +262,33 @@ router.get('/receipts', requireAuth, requireRole('admin'), async (req, res) => {
   } catch (error) {
     console.error('Error fetching receipt summary:', error);
     res.status(500).json({ error: error.message || 'Failed to fetch receipts' });
+  }
+});
+
+// GET /api/admin/expenses/by-task - one row per task that has at least one
+// linked expense, with a total/paid/pending breakdown -- lets the mobile
+// Tasks screen show a real "cost + paid" pill per task in one request
+// instead of N+1 lookups. "Paid" = approved or reconciled (the same
+// values the existing Financials approve/reject flow already sets);
+// "pending" = logged but not yet approved. Note amount is dollars here
+// (expenses.amount, numeric), not cents like task_expenses/tasks --
+// matching this table's own existing convention, not converting it.
+router.get('/by-task', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT task_id,
+              COALESCE(SUM(amount), 0) AS total,
+              COALESCE(SUM(amount) FILTER (WHERE status IN ('approved', 'reconciled')), 0) AS paid_total,
+              COALESCE(SUM(amount) FILTER (WHERE status = 'pending'), 0) AS pending_total,
+              COUNT(*) AS expense_count
+       FROM expenses
+       WHERE task_id IS NOT NULL
+       GROUP BY task_id`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Error fetching expenses by task:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch expenses by task' });
   }
 });
 

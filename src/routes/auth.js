@@ -10,7 +10,7 @@ const router = express.Router()
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID)
 
 function sanitizeUser(user) {
-  const { password_hash, ...safe } = user
+  const { password_hash, pin_hash, ...safe } = user
   return safe
 }
 
@@ -101,6 +101,48 @@ router.post('/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.password_hash)
     if (!valid) {
       return res.status(401).json({ error: 'Invalid email or password' })
+    }
+    res.json({ user: sanitizeUser(user), token: signToken(user) })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /api/auth/pin-members -- the small, unauthenticated "who are you"
+// picker the mobile PM tool's login screen shows before a PIN is typed.
+// Intentionally not behind requireAuth (there's no token yet at this
+// point) and intentionally minimal (id + name only, nothing else) -- only
+// lists accounts that actually have a PIN set, so this can't be used to
+// enumerate the full user table.
+router.get('/pin-members', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT user_id, display_name FROM users WHERE pin_hash IS NOT NULL AND is_active = true ORDER BY display_name`
+    )
+    res.json({ data: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /api/auth/pin-login -- mobile PM tool's login. Not a parallel auth
+// system: a successful PIN check mints the exact same JWT signToken()
+// issues for email+password login, so every existing requireAuth/
+// requireRole endpoint works for a PIN session with zero changes.
+router.post('/pin-login', async (req, res) => {
+  const { user_id, pin } = req.body
+  if (!user_id || !pin) {
+    return res.status(400).json({ error: 'user_id and pin are required' })
+  }
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE user_id = $1', [user_id])
+    const user = result.rows[0]
+    if (!user || !user.pin_hash) {
+      return res.status(401).json({ error: 'Invalid PIN' })
+    }
+    const valid = await bcrypt.compare(String(pin), user.pin_hash)
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid PIN' })
     }
     res.json({ user: sanitizeUser(user), token: signToken(user) })
   } catch (err) {
