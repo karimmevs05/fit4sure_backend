@@ -218,11 +218,40 @@ async function getPerPoundMacrosByRecipe(recipeIds) {
   return byRecipe;
 }
 
-async function getWeeklyMenu() {
-  const weekResult = await db.query(`
+// Resolves the delivery week to actually show customers: the soonest
+// explicitly-published week on or after the week that's currently live
+// (today's own delivery week) -- not a rigid "always exactly 7 days from
+// today" formula. That formula only matched reality when a chef published
+// on schedule exactly one week ahead; it silently ignored a week published
+// late (e.g. covering THIS week) or pre-published further out, since
+// /menu-planner/publish now accepts an explicit week_start for either case.
+// Falls back to the plain next-week formula (unpublished) when nothing is
+// published yet, so the existing "menuReady: false" empty state is unchanged.
+async function resolveCustomerFacingWeekStart() {
+  const currentWeekResult = await db.query(`
+    SELECT (date_trunc('week', NOW() + interval '1 day') - interval '1 day')::date AS sunday
+  `);
+  const currentWeekStart = currentWeekResult.rows[0].sunday.toISOString().slice(0, 10);
+
+  const publishedResult = await db.query(
+    `SELECT planned_week_start FROM weekly_menu_publish_state
+     WHERE planned_week_start >= $1
+     ORDER BY planned_week_start ASC
+     LIMIT 1`,
+    [currentWeekStart]
+  );
+  if (publishedResult.rows.length > 0) {
+    return publishedResult.rows[0].planned_week_start.toISOString().slice(0, 10);
+  }
+
+  const nextWeekResult = await db.query(`
     SELECT (date_trunc('week', NOW() + interval '1 day') - interval '1 day' + interval '7 days')::date AS sunday
   `);
-  const weekStart = weekResult.rows[0].sunday.toISOString().slice(0, 10);
+  return nextWeekResult.rows[0].sunday.toISOString().slice(0, 10);
+}
+
+async function getWeeklyMenu() {
+  const weekStart = await resolveCustomerFacingWeekStart();
 
   const planResult = await db.query(
     `SELECT wrp.block, r.recipe_id, r.name, r.category
